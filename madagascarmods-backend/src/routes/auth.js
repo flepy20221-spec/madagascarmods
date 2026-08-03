@@ -33,6 +33,7 @@ const db = require('../models/db');
 const { generateTokens, authenticateToken, JWT_REFRESH_SECRET } = require('../middleware/auth');
 const { authLimiter } = require('../middleware/rateLimits');
 const { clientIp } = require('../middleware/antiFraud');
+const { loginBotDetection } = require('../middleware/botDetection');
 const jwt = require('jsonwebtoken');
 
 const router = express.Router();
@@ -83,7 +84,7 @@ async function accountHasValue(userId) {
 }
 
 // POST /api/auth/register
-router.post('/register', authLimiter, async (req, res) => {
+router.post('/register', authLimiter, loginBotDetection, async (req, res) => {
   try {
     const { email, device_id, device_model, app_version } = req.body;
 
@@ -168,7 +169,7 @@ router.post('/register', authLimiter, async (req, res) => {
 //
 // Mantem a experiencia de entrar apenas com o e-mail, mas com o vinculo de dispositivo
 // descrito no topo do arquivo. Ver VULN-05.
-router.post('/login', authLimiter, async (req, res) => {
+router.post('/login', authLimiter, loginBotDetection, async (req, res) => {
   try {
     const { email, device_id, device_model, app_version } = req.body;
 

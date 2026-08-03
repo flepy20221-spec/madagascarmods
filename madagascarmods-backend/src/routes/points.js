@@ -3,6 +3,7 @@ const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware, rewardFraudDetection, clientIp } = require('../middleware/antiFraud');
+const { botDetectionMiddleware } = require('../middleware/botDetection');
 const { rewardLimiter, rewardStatusLimiter } = require('../middleware/rateLimits');
 const {
   getRewardDistribution,
@@ -26,6 +27,7 @@ router.get(
   '/reward-status/:sessionId',
   rewardStatusLimiter,
   authenticateToken,
+  botDetectionMiddleware,
   antifraudMiddleware,
   async (req, res) => {
     try {
@@ -145,6 +147,7 @@ router.post(
   '/reward',
   rewardLimiter,
   authenticateToken,
+  botDetectionMiddleware,
   antifraudMiddleware,
   rewardFraudDetection,
   async (req, res) => {
