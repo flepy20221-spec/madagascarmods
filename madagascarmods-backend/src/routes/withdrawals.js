@@ -2,7 +2,14 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const { antifraudMiddleware } = require('../middleware/antiFraud');
+const { withdrawalLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
+
+// Namespace do advisory lock de saque. Precisa ser o MESMO valor usado em
+// pix_withdrawals.js: os dois fluxos consomem o mesmo saldo de pontos e por isso
+// precisam ser mutuamente exclusivos por usuario.
+const WITHDRAWAL_LOCK_NAMESPACE = 8471;
 
 const router = express.Router();
 
@@ -45,7 +52,7 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 // POST /api/withdrawals/request - Request a withdrawal
-router.post('/request', authenticateToken, async (req, res) => {
+router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddleware, async (req, res) => {
   const client = await db.getClient();
   
   try {
@@ -68,6 +75,47 @@ router.post('/request', authenticateToken, async (req, res) => {
     }
 
     await client.query('BEGIN');
+
+    // ========================================================================
+    // TRAVA DE CONCORRENCIA POR USUARIO (auditoria VULN-06)
+    //
+    // O fluxo original era: ler o saldo -> verificar se ha saque pendente ->
+    // inserir a reserva negativa. Sem trava, duas requisicoes simultaneas leem o
+    // MESMO saldo, e nenhuma das duas ve o saque pendente da outra (nenhuma commitou
+    // ainda). As duas passam em todas as validacoes e as duas inserem a reserva.
+    // Resultado: saldo final negativo e dois saques PENDING — ou seja, saque acima
+    // do saldo real. Bastava disparar duas chamadas em paralelo com idempotency_key
+    // diferentes (a constraint UNIQUE nao protege nesse caso).
+    //
+    // pg_advisory_xact_lock serializa por usuario: a segunda requisicao fica em espera
+    // e so prossegue quando a primeira encerra a transacao, ja podendo enxergar a
+    // reserva e o saque pendente criados. O lock e liberado automaticamente no
+    // COMMIT ou ROLLBACK, sem risco de trava orfa.
+    //
+    // hashtext() converte o UUID do usuario em inteiro, formato exigido pela funcao.
+    // O namespace fixo evita colisao com locks de outras finalidades.
+    // ========================================================================
+    await client.query(
+      'SELECT pg_advisory_xact_lock($1, hashtext($2))',
+      [WITHDRAWAL_LOCK_NAMESPACE, userId]
+    );
+
+    // Revalidacao dentro do lock: se outra requisicao acabou de criar um saque com esta
+    // mesma chave, a checagem otimista feita antes do BEGIN pode ter passado.
+    if (idempotency_key) {
+      const raceCheck = await client.query(
+        'SELECT id, status FROM withdrawals WHERE idempotency_key = $1',
+        [idempotency_key]
+      );
+      if (raceCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'Duplicate withdrawal request',
+          code: 'DUPLICATE',
+          withdrawal: raceCheck.rows[0]
+        });
+      }
+    }
 
     // Get system config
     const configResult = await client.query(

@@ -2,11 +2,19 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const { antifraudMiddleware } = require('../middleware/antiFraud');
+const { withdrawalLimiter } = require('../middleware/rateLimits');
+
+// Mesmo namespace usado em withdrawals.js (FaucetPay).
+// Os dois fluxos debitam o mesmo saldo de pontos, portanto precisam compartilhar o lock:
+// se cada um usasse um namespace proprio, um saque PIX e um saque FaucetPay simultaneos
+// ainda poderiam gastar o mesmo saldo duas vezes.
+const WITHDRAWAL_LOCK_NAMESPACE = 8471;
 
 const router = express.Router();
 
 // POST /api/pix-withdrawals/request - Request a PIX withdrawal (manual processing)
-router.post('/request', authenticateToken, async (req, res) => {
+router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddleware, async (req, res) => {
   const client = await db.getClient();
 
   try {
@@ -29,6 +37,31 @@ router.post('/request', authenticateToken, async (req, res) => {
     }
 
     await client.query('BEGIN');
+
+    // Trava de concorrencia por usuario (auditoria VULN-06). Ver explicacao detalhada
+    // em src/routes/withdrawals.js. Sem ela, duas requisicoes simultaneas leem o mesmo
+    // saldo, nenhuma ve o saque pendente da outra, e ambas criam a reserva negativa —
+    // resultando em saque acima do saldo real.
+    await client.query(
+      'SELECT pg_advisory_xact_lock($1, hashtext($2))',
+      [WITHDRAWAL_LOCK_NAMESPACE, userId]
+    );
+
+    // Revalidacao da idempotencia dentro do lock
+    if (idempotency_key) {
+      const raceCheck = await client.query(
+        'SELECT id, status FROM withdrawals WHERE idempotency_key = $1',
+        [idempotency_key]
+      );
+      if (raceCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'Solicitacao de saque duplicada',
+          code: 'DUPLICATE',
+          withdrawal: raceCheck.rows[0]
+        });
+      }
+    }
 
     // Get system config
     const configResult = await client.query(
@@ -112,6 +145,18 @@ router.post('/request', authenticateToken, async (req, res) => {
       pointsToDebit = balance;
     }
 
+    // Guarda final: o fluxo PIX nao tinha esta verificacao (o FaucetPay tinha).
+    // Protege contra qualquer caminho que resulte em debito acima do saldo.
+    if (pointsToDebit > balance || pointsToDebit <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Saldo insuficiente para o valor solicitado',
+        code: 'INSUFFICIENT_BALANCE',
+        requested: pointsToDebit,
+        current: balance
+      });
+    }
+
     const amountInReal = parseFloat((pointsToDebit / pointsPerReal).toFixed(2));
 
     // Create ledger reservation (debit)
@@ -129,9 +174,9 @@ router.post('/request', authenticateToken, async (req, res) => {
     await client.query(
       `INSERT INTO withdrawals (id, user_id, payout_destination_id, amount, points_debited, 
        payment_method, crypto_address, crypto_currency, status, idempotency_key, ledger_reservation_id, created_at)
-       VALUES ($1, $2, NULL, $3, $4, 'pix', $5, 'BRL', 'PENDING', $6, $7, NOW())`,
-      [withdrawalId, userId, amountInReal, pointsToDebit,
-       JSON.stringify({ pix_account_id: pixAccount.id, cpf: pixAccount.cpf, full_name: pixAccount.full_name, pix_key_type: pixAccount.pix_key_type, pix_key_value: pixAccount.pix_key_value }),
+       VALUES ($1, $2, $3, $4, $5, 'pix', $6, 'BRL', 'PENDING', $7, $8, NOW())`,
+      [withdrawalId, userId, pixAccount.id, amountInReal, pointsToDebit,
+       JSON.stringify({ cpf: pixAccount.cpf, full_name: pixAccount.full_name, pix_key_type: pixAccount.pix_key_type, pix_key_value: pixAccount.pix_key_value }),
        idemKey, reservationId]
     );
 

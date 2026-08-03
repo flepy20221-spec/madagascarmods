@@ -2,6 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const { payoutSetupLimiter } = require('../middleware/rateLimits');
 const { encrypt, hashValue, maskEmail } = require('../utils/crypto');
 
 const router = express.Router();
@@ -46,7 +47,8 @@ router.get('/status', authenticateToken, async (req, res) => {
 });
 
 // POST /api/payout-destinations/submit - Submit FaucetPay email for approval
-router.post('/submit', authenticateToken, async (req, res) => {
+// payoutSetupLimiter: 10 tentativas/hora por usuario. (auditoria VULN-10)
+router.post('/submit', payoutSetupLimiter, authenticateToken, async (req, res) => {
   try {
     const { email } = req.body;
 

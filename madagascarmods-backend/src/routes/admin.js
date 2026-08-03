@@ -1,16 +1,34 @@
 const express = require('express');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
-const { authenticateAdmin, JWT_SECRET } = require('../middleware/auth');
+const { authenticateAdmin, requireRole, JWT_SECRET } = require('../middleware/auth');
+const { adminLoginLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
 const faucetpay = require('../utils/faucetpay');
 
 const router = express.Router();
 
+// Registra tentativas de acesso administrativo negadas, para investigacao posterior.
+async function logSecurityEvent(action, detail, req) {
+  try {
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
+       VALUES (NULL, 'system', $1, 'security', $2, $3)`,
+      [action, JSON.stringify(detail), req.ip || req.socket.remoteAddress]
+    );
+  } catch (e) {
+    console.error('[Security] Falha ao registrar evento:', e.message);
+  }
+}
+
 // POST /api/admin/login
-router.post('/login', async (req, res) => {
+// adminLoginLimiter: 5 tentativas por 15 min, contando apenas as que falham
+// (skipSuccessfulRequests), para barrar forca bruta na senha do painel sem atrapalhar
+// o admin legitimo. (auditoria VULN-10)
+router.post('/login', adminLoginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -35,6 +53,7 @@ router.post('/login', async (req, res) => {
 
     const validPassword = await bcrypt.compare(password, adminUser.password_hash);
     if (!validPassword) {
+      await logSecurityEvent('ADMIN_LOGIN_FAILED', { email: adminUser.email }, req);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -43,6 +62,8 @@ router.post('/login', async (req, res) => {
       JWT_SECRET,
       { expiresIn: '8h' }
     );
+
+    await logSecurityEvent('ADMIN_LOGIN_SUCCESS', { email: adminUser.email, role: adminUser.role }, req);
 
     res.json({
       success: true,
@@ -55,9 +76,42 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// POST /api/admin/setup - Initial admin setup (only works if no admins exist)
-router.post('/setup', async (req, res) => {
+// POST /api/admin/setup - Initial admin setup
+//
+// ==========================================================================================
+// CORRECAO DE SETUP ABERTO (auditoria VULN-08)
+//
+// A rota era publica e a unica barreira era "nenhum admin existe ainda". Isso cria uma
+// corrida perigosa: em um banco novo, em um reset, ou se a tabela admin_users for esvaziada
+// por qualquer motivo, o primeiro a chamar esta rota se torna super_admin do sistema —
+// com poder de aprovar saques e ler CPF e chaves PIX.
+//
+// Agora exige o segredo ADMIN_SETUP_TOKEN, comparado em tempo constante. Se a variavel
+// nao estiver definida, a rota fica permanentemente desativada (fail-closed): melhor
+// exigir um deploy com a variavel do que deixar uma porta aberta.
+// ==========================================================================================
+router.post('/setup', adminLoginLimiter, async (req, res) => {
   try {
+    const setupToken = process.env.ADMIN_SETUP_TOKEN;
+
+    if (!setupToken || setupToken.length < 24) {
+      await logSecurityEvent('ADMIN_SETUP_DISABLED_ATTEMPT', {}, req);
+      return res.status(403).json({
+        error: 'Setup desabilitado. Defina ADMIN_SETUP_TOKEN (min. 24 caracteres) no ambiente.',
+        code: 'SETUP_DISABLED'
+      });
+    }
+
+    const provided = req.headers['x-setup-token'] || req.body.setup_token || '';
+    const a = Buffer.from(String(provided));
+    const b = Buffer.from(setupToken);
+    // timingSafeEqual exige buffers do mesmo tamanho; a checagem de length evita a excecao
+    // e ao mesmo tempo nao vaza informacao util (o tamanho do token nao e segredo).
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      await logSecurityEvent('ADMIN_SETUP_INVALID_TOKEN', {}, req);
+      return res.status(403).json({ error: 'Token de setup invalido', code: 'INVALID_SETUP_TOKEN' });
+    }
+
     const existing = await db.query('SELECT COUNT(*) as count FROM admin_users');
     if (parseInt(existing.rows[0].count) > 0) {
       return res.status(403).json({ error: 'Admin already configured' });
@@ -66,6 +120,14 @@ router.post('/setup', async (req, res) => {
     const { email, password, name } = req.body;
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
+    }
+
+    // Senha forte obrigatoria para a conta mais poderosa do sistema.
+    if (String(password).length < 12) {
+      return res.status(400).json({
+        error: 'A senha do administrador deve ter no minimo 12 caracteres',
+        code: 'WEAK_PASSWORD'
+      });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
@@ -135,7 +197,7 @@ router.get('/payout-destinations', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/payout-destinations/:id/review - Approve or reject
-router.post('/payout-destinations/:id/review', authenticateAdmin, async (req, res) => {
+router.post('/payout-destinations/:id/review', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
     const { id } = req.params;
     const { action, reason } = req.body; // action: 'approve' or 'reject'
@@ -250,30 +312,56 @@ router.get('/withdrawals', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/withdrawals/:id/approve - Approve withdrawal AND process FaucetPay payment
-router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
+//
+// ==========================================================================================
+// CORRECAO DE DUPLO PAGAMENTO (auditoria VULN-07)
+//
+// Comportamento anterior: SELECT sem lock -> checagem de status -> UPDATE -> sendPayment.
+// Entre a leitura do status e a escrita havia uma janela aberta. Dois cliques rapidos no
+// painel (ou duas abas, ou um retry do navegador) faziam as duas requisicoes lerem
+// status = 'PENDING', ambas passarem na validacao e ambas chamarem faucetpay.sendPayment
+// para o MESMO saque — enviando LTC duas vezes, com dinheiro real.
+//
+// Agravante: o cliente FaucetPay nao envia chave de idempotencia, portanto o provedor
+// tambem nao deduplica. Nao havia nenhuma barreira em nenhuma camada.
+//
+// Agora a transicao PENDING -> PROCESSING acontece de forma atomica e condicional:
+// o UPDATE ... WHERE status = 'PENDING' RETURNING so afeta linha se o saque ainda estiver
+// pendente. A segunda requisicao concorrente recebe zero linhas e para antes de pagar.
+// O status PROCESSING funciona como reserva: nenhuma outra rota o aceita como ponto de
+// partida para um novo envio.
+// ==========================================================================================
+router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const withdrawal = await db.query(
-      'SELECT id, user_id, status, amount, points_debited, crypto_address, crypto_currency FROM withdrawals WHERE id = $1',
-      [id]
-    );
-
-    if (withdrawal.rows.length === 0) {
-      return res.status(404).json({ error: 'Saque não encontrado' });
-    }
-
-    const w = withdrawal.rows[0];
-
-    if (w.status !== 'PENDING') {
-      return res.status(400).json({ error: `Não é possível aprovar saque com status: ${w.status}` });
-    }
-
-    // Mark as APPROVED first
-    await db.query(
-      `UPDATE withdrawals SET status = 'APPROVED', approved_by = $1, approved_at = NOW(), updated_at = NOW() WHERE id = $2`,
+    // Transicao atomica: reserva o saque para este admin.
+    // Se outra requisicao chegou primeiro, esta retorna 0 linhas.
+    const claimed = await db.query(
+      `UPDATE withdrawals
+          SET status = 'PROCESSING',
+              approved_by = $1,
+              approved_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $2 AND status = 'PENDING'
+        RETURNING id, user_id, status, amount, points_debited, crypto_address, crypto_currency`,
       [req.admin.id, id]
     );
+
+    if (claimed.rows.length === 0) {
+      // Distingue "nao existe" de "ja foi processado" para dar uma mensagem util ao admin.
+      const current = await db.query('SELECT status FROM withdrawals WHERE id = $1', [id]);
+      if (current.rows.length === 0) {
+        return res.status(404).json({ error: 'Saque nao encontrado' });
+      }
+      return res.status(409).json({
+        error: `Este saque ja esta sendo processado ou foi finalizado (status: ${current.rows[0].status}).`,
+        code: 'ALREADY_PROCESSED',
+        status: current.rows[0].status
+      });
+    }
+
+    const w = claimed.rows[0];
 
     // Now process FaucetPay payment automatically
     const amountBRL = parseFloat(w.amount);
@@ -281,12 +369,6 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
     let finalStatus = 'APPROVED';
 
     try {
-      // Mark as PROCESSING
-      await db.query(
-        `UPDATE withdrawals SET status = 'PROCESSING', updated_at = NOW() WHERE id = $1`,
-        [id]
-      );
-
       paymentResult = await faucetpay.sendPayment({
         to: w.crypto_address,
         amountBRL: amountBRL,
@@ -294,7 +376,7 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
       });
 
       if (paymentResult.success) {
-        // Payment successful - mark as PAID
+        // Pagamento confirmado: PROCESSING -> PAID
         finalStatus = 'PAID';
         await db.query(
           `UPDATE withdrawals SET 
@@ -305,7 +387,7 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
             gateway_response = $4, 
             processed_at = NOW(), 
             updated_at = NOW() 
-          WHERE id = $5`,
+          WHERE id = $5 AND status = 'PROCESSING'`,
           [
             paymentResult.ltcAmount,
             paymentResult.exchangeRate,
@@ -315,20 +397,28 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
           ]
         );
       } else {
-        // Payment failed - keep as APPROVED (admin can retry with process-faucetpay)
+        // O provedor recusou de forma explicita (saldo insuficiente, e-mail invalido...).
+        // Nao houve envio de valor, entao o saque volta para APPROVED e o admin pode
+        // reprocessar por /process-faucetpay.
         finalStatus = 'APPROVED';
         await db.query(
-          `UPDATE withdrawals SET status = 'APPROVED', gateway_response = $1, updated_at = NOW() WHERE id = $2`,
+          `UPDATE withdrawals SET status = 'APPROVED', gateway_response = $1, updated_at = NOW()
+            WHERE id = $2 AND status = 'PROCESSING'`,
           [JSON.stringify(paymentResult), id]
         );
       }
     } catch (payErr) {
-      // FaucetPay error - keep as APPROVED
+      // ATENCAO: aqui a resposta do provedor e DESCONHECIDA (timeout, queda de conexao).
+      // O pagamento pode ter sido efetivado sem que a confirmacao chegasse. Liberar o saque
+      // para reprocessamento automatico neste estado e justamente o que causa pagamento em
+      // duplicidade. Por isso o saque fica em PAYMENT_UNCONFIRMED, exigindo que o admin
+      // confira o extrato da FaucetPay antes de decidir.
       console.error('[Approve] FaucetPay payment error:', payErr.message);
-      finalStatus = 'APPROVED';
+      finalStatus = 'PAYMENT_UNCONFIRMED';
       await db.query(
-        `UPDATE withdrawals SET status = 'APPROVED', gateway_response = $1, updated_at = NOW() WHERE id = $2`,
-        [JSON.stringify({ error: payErr.message }), id]
+        `UPDATE withdrawals SET status = 'PAYMENT_UNCONFIRMED', gateway_response = $1, updated_at = NOW()
+          WHERE id = $2 AND status = 'PROCESSING'`,
+        [JSON.stringify({ error: payErr.message, requiresManualCheck: true }), id]
       );
     }
 
@@ -358,12 +448,21 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
         exchangeRate: paymentResult.exchangeRate,
         txHash: paymentResult.tx_hash || paymentResult.payout_hash
       });
+    } else if (finalStatus === 'PAYMENT_UNCONFIRMED') {
+      res.json({
+        success: false,
+        message: 'A conexao com a FaucetPay falhou e nao foi possivel confirmar o pagamento. ' +
+                 'VERIFIQUE O EXTRATO DA FAUCETPAY antes de reenviar: o valor pode ter sido pago. ' +
+                 'O saque ficou marcado como PAYMENT_UNCONFIRMED.',
+        status: 'PAYMENT_UNCONFIRMED',
+        requiresManualCheck: true
+      });
     } else {
       res.json({
         success: true,
-        message: `Saque aprovado, mas pagamento FaucetPay falhou: ${paymentResult ? paymentResult.message : 'Erro de conexão'}. Use "Enviar FaucetPay" para tentar novamente.`,
+        message: `Saque aprovado, mas a FaucetPay recusou o pagamento: ${paymentResult ? paymentResult.message : 'erro desconhecido'}. Use "Enviar FaucetPay" para tentar novamente.`,
         status: 'APPROVED',
-        paymentError: paymentResult ? paymentResult.message : 'Erro de conexão'
+        paymentError: paymentResult ? paymentResult.message : 'Erro de conexao'
       });
     }
   } catch (error) {
@@ -373,15 +472,15 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/withdrawals/:id/reject - Reject withdrawal
-router.post('/withdrawals/:id/reject', authenticateAdmin, async (req, res) => {
+router.post('/withdrawals/:id/reject', authenticateAdmin, requireRole('finance'), async (req, res) => {
   const client = await db.getClient();
   
   try {
     const { id } = req.params;
     const { reason } = req.body;
 
-    if (!reason) {
-      return res.status(400).json({ error: 'Rejection reason is required' });
+    if (!reason || String(reason).trim().length < 3) {
+      return res.status(400).json({ error: 'Informe o motivo da rejeicao (min. 3 caracteres)' });
     }
 
     await client.query('BEGIN');
@@ -396,24 +495,50 @@ router.post('/withdrawals/:id/reject', authenticateAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Withdrawal not found' });
     }
 
-    if (withdrawal.rows[0].status !== 'PENDING') {
+    // PAYMENT_UNCONFIRMED tambem pode ser rejeitado: e o caminho para quando o admin conferiu
+    // o extrato e constatou que o pagamento NAO saiu, devolvendo os pontos ao usuario.
+    if (!['PENDING', 'APPROVED', 'PAYMENT_UNCONFIRMED'].includes(withdrawal.rows[0].status)) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: `Cannot reject withdrawal with status: ${withdrawal.rows[0].status}` });
+      return res.status(409).json({
+        error: `Nao e possivel rejeitar saque com status: ${withdrawal.rows[0].status}`,
+        code: 'INVALID_STATUS'
+      });
     }
 
-    // Refund points
-    const refundId = uuidv4();
-    await client.query(
-      `INSERT INTO points_ledger (id, user_id, amount, transaction_type, reference_id, description)
-       VALUES ($1, $2, $3, 'WITHDRAWAL_REFUND', $4, 'Withdrawal rejected - points refunded')`,
-      [refundId, withdrawal.rows[0].user_id, withdrawal.rows[0].points_debited, id]
-    );
-
-    // Update withdrawal status
-    await client.query(
-      `UPDATE withdrawals SET status = 'REJECTED', rejection_reason = $1, updated_at = NOW() WHERE id = $2`,
+    // Update withdrawal status — condicional, para que apenas uma requisicao concorrente
+    // consiga efetuar a rejeicao e, consequentemente, apenas um refund seja gerado.
+    const rejected = await client.query(
+      `UPDATE withdrawals SET status = 'REJECTED', rejection_reason = $1, updated_at = NOW()
+        WHERE id = $2 AND status IN ('PENDING', 'APPROVED', 'PAYMENT_UNCONFIRMED')
+        RETURNING id`,
       [reason, id]
     );
+
+    if (rejected.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Saque ja processado por outra requisicao', code: 'ALREADY_PROCESSED' });
+    }
+
+    // Refund points.
+    // Guarda de duplicidade: se ja existe um refund lancado para este saque, nao lanca outro.
+    // Sem isso, duas rejeicoes (ou uma rejeicao apos um refund manual) creditariam os pontos
+    // duas vezes, criando saldo do nada.
+    const existingRefund = await client.query(
+      `SELECT id FROM points_ledger
+        WHERE reference_id = $1 AND transaction_type = 'WITHDRAWAL_REFUND'`,
+      [id]
+    );
+
+    if (existingRefund.rows.length === 0) {
+      const refundId = uuidv4();
+      await client.query(
+        `INSERT INTO points_ledger (id, user_id, amount, transaction_type, reference_id, description)
+         VALUES ($1, $2, $3, 'WITHDRAWAL_REFUND', $4, 'Withdrawal rejected - points refunded')`,
+        [refundId, withdrawal.rows[0].user_id, withdrawal.rows[0].points_debited, id]
+      );
+    } else {
+      console.warn(`[Reject] Refund ja existia para o saque ${id}; nao foi lancado novamente.`);
+    }
 
     // Audit log
     await client.query(
@@ -435,7 +560,7 @@ router.post('/withdrawals/:id/reject', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/withdrawals/:id/process-faucetpay - Process FaucetPay payment (LTC)
-router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, async (req, res) => {
+router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole('finance'), async (req, res) => {
   const client = await db.getClient();
   
   try {
@@ -456,16 +581,38 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, async (req,
 
     const w = withdrawal.rows[0];
 
+    // PAYMENT_UNCONFIRMED foi deliberadamente deixado fora desta lista: nesse estado o
+    // pagamento pode ja ter sido efetivado do lado da FaucetPay, e reenviar sem conferir
+    // o extrato e exatamente o que gera pagamento em duplicidade. A saida desse estado e
+    // pela rota mark-paid (confirmando) ou reject (confirmando que nao houve envio).
     if (!['PENDING', 'APPROVED'].includes(w.status)) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: `Não é possível processar saque com status: ${w.status}` });
+      return res.status(409).json({
+        error: w.status === 'PAYMENT_UNCONFIRMED'
+          ? 'Este saque teve um envio sem confirmacao. Verifique o extrato da FaucetPay: se o pagamento saiu, use "Marcar como pago"; se nao saiu, rejeite e refaca.'
+          : `Nao e possivel processar saque com status: ${w.status}`,
+        code: 'INVALID_STATUS',
+        status: w.status
+      });
     }
 
-    // Mark as processing
-    await client.query(
-      `UPDATE withdrawals SET status = 'PROCESSING', updated_at = NOW() WHERE id = $1`,
+    // Mark as processing.
+    // O FOR UPDATE acima ja serializa o acesso a linha, e a condicao de status torna a
+    // transicao idempotente: uma segunda requisicao concorrente encontra PROCESSING e para.
+    const claimed = await client.query(
+      `UPDATE withdrawals SET status = 'PROCESSING', updated_at = NOW()
+        WHERE id = $1 AND status IN ('PENDING', 'APPROVED')
+        RETURNING id`,
       [id]
     );
+
+    if (claimed.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Este saque ja esta sendo processado por outra requisicao',
+        code: 'ALREADY_PROCESSING'
+      });
+    }
 
     await client.query('COMMIT');
 
@@ -488,7 +635,7 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, async (req,
           gateway_response = $4, 
           processed_at = NOW(), 
           updated_at = NOW() 
-        WHERE id = $5`,
+        WHERE id = $5 AND status = 'PROCESSING'`,
         [
           paymentResult.ltcAmount,
           paymentResult.exchangeRate,
@@ -526,9 +673,10 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, async (req,
         exchange_rate: paymentResult.exchangeRate,
       });
     } else {
-      // Payment failed - revert to PENDING
+      // Recusa explicita do provedor: nao houve envio de valor, pode voltar para PENDING.
       await db.query(
-        `UPDATE withdrawals SET status = 'PENDING', gateway_response = $1, updated_at = NOW() WHERE id = $2`,
+        `UPDATE withdrawals SET status = 'PENDING', gateway_response = $1, updated_at = NOW()
+          WHERE id = $2 AND status = 'PROCESSING'`,
         [JSON.stringify(paymentResult), id]
       );
 
@@ -551,21 +699,38 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, async (req,
       });
     }
   } catch (error) {
-    // On any error, try to revert status to PENDING
+    // ATENCAO: o comportamento anterior era devolver o saque para PENDING aqui.
+    // Isso e perigoso: uma excecao neste ponto normalmente e timeout ou queda de conexao,
+    // situacao em que NAO se sabe se a FaucetPay executou o pagamento. Voltando para
+    // PENDING, o saque reaparecia na fila e um novo envio pagava de novo o mesmo valor.
+    //
+    // Agora o saque fica em PAYMENT_UNCONFIRMED e sai da fila automatica, exigindo que um
+    // humano confira o extrato. Perder alguns minutos de conferencia e melhor que pagar duas vezes.
     try {
       await db.query(
-        `UPDATE withdrawals SET status = 'PENDING', updated_at = NOW() WHERE id = $1 AND status = 'PROCESSING'`,
-        [req.params.id]
+        `UPDATE withdrawals SET status = 'PAYMENT_UNCONFIRMED',
+                gateway_response = $2, updated_at = NOW()
+          WHERE id = $1 AND status = 'PROCESSING'`,
+        [req.params.id, JSON.stringify({ error: error.message, requiresManualCheck: true })]
+      );
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ($1, 'admin', 'FAUCETPAY_PAYMENT_UNCONFIRMED', 'withdrawal', $2, $3, $4)`,
+        [req.admin.id, req.params.id,
+         JSON.stringify({ error: error.message, requiresManualCheck: true }),
+         req.ip || req.socket.remoteAddress]
       );
     } catch (revertErr) {
-      console.error('Failed to revert withdrawal status:', revertErr);
+      console.error('Failed to mark withdrawal as unconfirmed:', revertErr);
     }
 
     console.error('Process FaucetPay error:', error);
     res.status(500).json({ 
       success: false,
-      error: error.message || 'Falha ao processar pagamento FaucetPay',
-      message: error.message || 'Erro de conexão com FaucetPay'
+      error: 'Erro de comunicacao com a FaucetPay',
+      message: 'Nao foi possivel confirmar o pagamento. O saque foi marcado como PAYMENT_UNCONFIRMED. ' +
+               'VERIFIQUE O EXTRATO DA FAUCETPAY antes de reenviar.',
+      requiresManualCheck: true
     });
   } finally {
     client.release();
@@ -679,7 +844,11 @@ router.get('/users', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/users/:id/points - Update user points (add, subtract, or set)
-router.post('/users/:id/points', authenticateAdmin, async (req, res) => {
+//
+// Esta rota cria saldo do nada, portanto e a mais sensivel do painel depois da aprovacao
+// de saque: e o caminho direto para transformar pontos em dinheiro. Passa a exigir role
+// 'finance' (ou super_admin) e um motivo escrito, sempre registrado em auditoria.
+router.post('/users/:id/points', authenticateAdmin, requireRole('finance'), async (req, res) => {
   const client = await db.getClient();
   
   try {
@@ -691,6 +860,27 @@ router.post('/users/:id/points', authenticateAdmin, async (req, res) => {
 
     if (!amount || !Number.isFinite(Number(amount)) || Number(amount) < 0) {
       return res.status(400).json({ error: 'Valor de pontos inválido' });
+    }
+
+    // Teto por operacao: limita o estrago de um erro de digitacao ou de uma sessao
+    // administrativa roubada. Ajustes maiores devem ser feitos em etapas, deixando
+    // varios registros de auditoria.
+    const MAX_MANUAL_ADJUSTMENT = parseInt(process.env.MAX_MANUAL_POINTS_ADJUSTMENT || '500000', 10);
+    if (Number(amount) > MAX_MANUAL_ADJUSTMENT) {
+      await logSecurityEvent('ADMIN_POINTS_LIMIT_EXCEEDED',
+        { adminId: req.admin.id, targetUser: id, amount: Number(amount) }, req);
+      return res.status(400).json({
+        error: `Ajuste manual acima do limite permitido (${MAX_MANUAL_ADJUSTMENT} pontos por operacao)`,
+        code: 'ADJUSTMENT_TOO_LARGE'
+      });
+    }
+
+    // Motivo obrigatorio: sem ele o log de auditoria nao permite reconstruir a intencao.
+    if (!reason || String(reason).trim().length < 5) {
+      return res.status(400).json({
+        error: 'Informe um motivo com no minimo 5 caracteres para o ajuste manual',
+        code: 'REASON_REQUIRED'
+      });
     }
 
     const op = operation || 'set';
@@ -707,6 +897,10 @@ router.post('/users/:id/points', authenticateAdmin, async (req, res) => {
     const user = userResult.rows[0];
 
     await client.query('BEGIN');
+
+    // Mesmo lock dos saques: impede que um ajuste manual rode em paralelo com um saque
+    // do proprio usuario, o que poderia fazer o saque enxergar um saldo intermediario.
+    await client.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [8471, id]);
 
     // Get current balance
     const balanceResult = await client.query(
@@ -786,7 +980,7 @@ router.post('/users/:id/points', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/users/:id/ban - Ban/unban user
-router.post('/users/:id/ban', authenticateAdmin, async (req, res) => {
+router.post('/users/:id/ban', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
     const { id } = req.params;
     const { banned, reason } = req.body;
@@ -883,7 +1077,7 @@ router.get('/pix-accounts', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/pix-accounts/:id/review - Approve or reject PIX account
-router.post('/pix-accounts/:id/review', authenticateAdmin, async (req, res) => {
+router.post('/pix-accounts/:id/review', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
     const { id } = req.params;
     const { action, reason } = req.body;
@@ -945,31 +1139,44 @@ router.post('/pix-accounts/:id/review', authenticateAdmin, async (req, res) => {
 // ============ PIX WITHDRAWALS (MANUAL) ============
 
 // POST /api/admin/withdrawals/:id/mark-paid - Mark PIX withdrawal as paid (manual)
-router.post('/withdrawals/:id/mark-paid', authenticateAdmin, async (req, res) => {
+//
+// Transicao atomica (auditoria VULN-07). Antes: SELECT sem lock, checagem de status e
+// UPDATE incondicional. Dois cliques marcavam o mesmo saque como pago duas vezes, gerando
+// dois registros de auditoria e mascarando um possivel pagamento manual duplicado no PIX.
+//
+// PAYMENT_UNCONFIRMED e aceito aqui de proposito: e justamente o caminho para o admin
+// confirmar, depois de conferir o extrato, que o pagamento realmente saiu.
+router.post('/withdrawals/:id/mark-paid', authenticateAdmin, requireRole('finance'), async (req, res) => {
   try {
     const { id } = req.params;
     const { tx_reference } = req.body;
 
-    const withdrawal = await db.query(
-      'SELECT id, user_id, status, amount, payment_method FROM withdrawals WHERE id = $1',
-      [id]
-    );
-
-    if (withdrawal.rows.length === 0) {
-      return res.status(404).json({ error: 'Saque não encontrado' });
-    }
-
-    const w = withdrawal.rows[0];
-
-    if (!['PENDING', 'APPROVED'].includes(w.status)) {
-      return res.status(400).json({ error: `Não é possível marcar como pago saque com status: ${w.status}` });
-    }
-
-    await db.query(
-      `UPDATE withdrawals SET status = 'PAID', tx_hash = $1, processed_at = NOW(), 
-       approved_by = $2, approved_at = NOW(), updated_at = NOW() WHERE id = $3`,
+    const claimed = await db.query(
+      `UPDATE withdrawals
+          SET status = 'PAID',
+              tx_hash = $1,
+              processed_at = NOW(),
+              approved_by = $2,
+              approved_at = COALESCE(approved_at, NOW()),
+              updated_at = NOW()
+        WHERE id = $3 AND status IN ('PENDING', 'APPROVED', 'PAYMENT_UNCONFIRMED')
+        RETURNING id, user_id, amount, payment_method`,
       [tx_reference || 'PIX_MANUAL', req.admin.id, id]
     );
+
+    if (claimed.rows.length === 0) {
+      const current = await db.query('SELECT status FROM withdrawals WHERE id = $1', [id]);
+      if (current.rows.length === 0) {
+        return res.status(404).json({ error: 'Saque nao encontrado' });
+      }
+      return res.status(409).json({
+        error: `Nao e possivel marcar como pago um saque com status: ${current.rows[0].status}`,
+        code: 'INVALID_STATUS',
+        status: current.rows[0].status
+      });
+    }
+
+    const w = claimed.rows[0];
 
     // Audit log
     await db.query(
@@ -995,7 +1202,7 @@ router.post('/withdrawals/:id/mark-paid', authenticateAdmin, async (req, res) =>
 // ============ USER MANAGEMENT (EDIT DATA) ============
 
 // PUT /api/admin/users/:id - Edit user data
-router.put('/users/:id', authenticateAdmin, async (req, res) => {
+router.put('/users/:id', authenticateAdmin, requireRole('finance'), async (req, res) => {
   try {
     const { id } = req.params;
     const { email, is_active } = req.body;
@@ -1057,6 +1264,65 @@ router.put('/users/:id', authenticateAdmin, async (req, res) => {
       return res.status(409).json({ error: 'E-mail já está em uso por outro usuário' });
     }
     res.status(500).json({ error: 'Falha ao editar dados do usuário' });
+  }
+});
+
+// POST /api/admin/users/:id/allow-device-change
+//
+// Valvula de escape operacional do vinculo de dispositivo (auditoria VULN-05).
+//
+// Como o login do app usa apenas o e-mail, a conta e protegida pelo vinculo ao aparelho:
+// quem tenta entrar de um celular diferente e recusado quando a conta tem saldo. Isso
+// impede o roubo de conta, mas cria um caso legitimo de suporte: o usuario que trocou de
+// aparelho ou reinstalou o app (o device_id e regerado quando os dados sao apagados).
+//
+// Esta rota libera UMA troca. A flag e consumida no proximo login bem-sucedido, portanto
+// uma liberacao esquecida nao deixa a conta desprotegida para sempre.
+router.post('/users/:id/allow-device-change', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || String(reason).trim().length < 3) {
+      return res.status(400).json({
+        error: 'Informe o motivo da liberacao (min. 3 caracteres)',
+        code: 'REASON_REQUIRED'
+      });
+    }
+
+    const updated = await db.query(
+      `UPDATE users SET device_migration_allowed = true, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, device_id`,
+      [id]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'admin', 'DEVICE_CHANGE_ALLOWED', 'user', $2, $3, $4)`,
+      [
+        req.admin.id,
+        id,
+        JSON.stringify({
+          reason: String(reason).trim(),
+          email: updated.rows[0].email,
+          previous_device_id: updated.rows[0].device_id
+        }),
+        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: 'Troca de aparelho liberada. Valida para o proximo login do usuario.'
+    });
+  } catch (error) {
+    console.error('Allow device change error:', error);
+    res.status(500).json({ error: 'Falha ao liberar a troca de aparelho' });
   }
 });
 

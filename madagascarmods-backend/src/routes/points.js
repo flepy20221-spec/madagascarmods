@@ -2,41 +2,165 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
-const { rewardFraudDetection } = require('../middleware/antiFraud');
+const { antifraudMiddleware, rewardFraudDetection, clientIp } = require('../middleware/antiFraud');
+const { rewardLimiter } = require('../middleware/rateLimits');
 const {
-  drawRewardPoints,
   getRewardDistribution,
   POINT_VALUES
 } = require('../utils/pointsRandom');
-const { validateSsvToken } = require('../utils/admobSsv');
+// Nota: drawRewardPoints e validateSsvToken NAO sao mais usados aqui.
+// O sorteio de pontos de anuncios rewarded e a validacao criptografica do Google passaram a
+// viver exclusivamente em src/routes/ssv.js, que e o unico caminho autorizado a creditar
+// esse tipo de recompensa (ver auditoria VULN-01).
 
 const router = express.Router();
 
-// POST /api/points/reward - Credit points for ad view (server-validated)
-// Middleware chain: auth -> fraud detection -> handler
-router.post('/reward', authenticateToken, rewardFraudDetection, async (req, res) => {
+// ============================================================================================
+// POST /api/points/reward
+//
+// CORRECAO DA VULNERABILIDADE MAIS GRAVE (auditoria VULN-01)
+//
+// Comportamento anterior: esta rota creditava pontos com base apenas no que o cliente
+// afirmava. O campo ssv_token era opcional; quando ausente, a validacao era ignorada e os
+// pontos entravam do mesmo jeito. Quando o token vinha invalido, o codigo so registrava um
+// aviso — a linha de bloqueio estava comentada com a observacao "Nao bloquear por enquanto".
+// Resultado pratico: com um proxy HTTP (HTTPCanary e afins), bastava repetir
+// POST /api/points/reward {"ad_type":"rewarded"} para gerar pontos infinitos sem assistir
+// anuncio nenhum, e depois converter em saque real.
+//
+// Por que a "correcao obvia" nao serve:
+// Exigir o ssv_token do aplicativo e impossivel. No SSV do AdMob o token NUNCA passa pelo
+// dispositivo — o Google chama o servidor diretamente:
+//
+//     usuario assiste -> Google --(GET assinado)--> /api/ssv/callback   (o token existe aqui)
+//                     -> App    --(POST)---------> /api/points/reward   (nunca tem o token)
+//
+// Essa e precisamente a razao de existir do SSV: o cliente nao participa da prova, logo nao
+// ha o que adulterar no aparelho. Exigir do app um dado que so trafega no canal
+// servidor-a-servidor faria toda requisicao legitima retornar 403, e o usuario veria
+// "nao foi possivel confirmar a exibicao" depois de assistir o anuncio inteiro.
+//
+// Correcao adotada: retirar desta rota o poder de creditar anuncios rewarded.
+//   - 'rewarded'  -> a rota NAO credita. Apenas consulta o que o callback do Google ja
+//                    confirmou e devolve o saldo. Chamar isso mil vezes por um proxy nao
+//                    gera um unico ponto, porque nao existe caminho de escrita aqui.
+//   - 'interstitial' / 'banner' -> nao possuem SSV no AdMob (o formato nao preve
+//                    verificacao servidor-a-servidor). Seguem creditando por esta rota,
+//                    contidos por HMAC, limite por usuario, intervalo minimo e teto diario.
+//                    O valor por exibicao e baixo por definicao de produto, o que torna o
+//                    abuso pouco atrativo; ainda assim, o risco residual esta documentado.
+//
+// O credito legitimo de rewarded acontece integralmente em src/routes/ssv.js, que valida a
+// assinatura do Google com as chaves publicas do AdMob, confere replay por transaction_id e
+// associa o usuario pelo custom_data.
+// ============================================================================================
+router.post(
+  '/reward',
+  rewardLimiter,
+  authenticateToken,
+  antifraudMiddleware,
+  rewardFraudDetection,
+  async (req, res) => {
   try {
-    const { ad_type, ad_unit_id, ad_network, ssv_token } = req.body;
+    const { ad_type, ad_unit_id, ad_network } = req.body;
 
     if (!ad_type) {
       return res.status(400).json({ error: 'ad_type is required' });
     }
 
     const userId = req.user.userId;
+    const ip = clientIp(req);
+
+    if (!['rewarded', 'interstitial', 'banner'].includes(ad_type)) {
+      return res.status(400).json({ error: 'Invalid ad_type. Must be: rewarded, interstitial, or banner' });
+    }
 
     // Bloquear se fraud score é muito alto (detectado pelo middleware)
     if (req.fraudScore && req.fraudScore >= 3) {
       console.warn(`[Reward] Blocked reward for user ${userId} - fraud score: ${req.fraudScore}`);
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Atividade suspeita detectada. Aguarde alguns minutos.',
         code: 'FRAUD_DETECTED'
       });
     }
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-    // Get reward config from system
+    // ==========================================================================================
+    // CAMINHO 'rewarded': CONSULTA, NUNCA CREDITO
+    //
+    // O app chama este endpoint ao terminar de assistir o anuncio. A resposta informa se o
+    // Google ja confirmou a exibicao pelo callback SSV. Como o callback e assincrono e chega
+    // em poucos segundos, o app deve tolerar o estado "pendente" e consultar novamente.
+    // ==========================================================================================
+    if (ad_type === 'rewarded') {
+      // Janela de correlacao: eventos SSV confirmados para este usuario nos ultimos minutos.
+      // Nao ha como amarrar a chamada do app a uma exibicao especifica (o app nao conhece o
+      // transaction_id do Google), por isso a correlacao e temporal.
+      const recentSsv = await db.query(
+        `SELECT id, points_awarded, created_at
+           FROM reward_events
+          WHERE user_id = $1
+            AND ad_type = 'rewarded'
+            AND ssv_verified = true
+            AND created_at > NOW() - INTERVAL '5 minutes'
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [userId]
+      );
+
+      const balanceResult = await db.query(
+        'SELECT COALESCE(SUM(amount), 0) as balance FROM points_ledger WHERE user_id = $1',
+        [userId]
+      );
+      const balance = parseInt(balanceResult.rows[0].balance, 10);
+
+      const dailyCount = await db.query(
+        `SELECT COUNT(*) as count FROM reward_events
+          WHERE user_id = $1 AND ad_type = 'rewarded' AND ssv_verified = true
+            AND created_at > NOW() - INTERVAL '24 hours'`,
+        [userId]
+      );
+
+      if (recentSsv.rows.length === 0) {
+        // Ainda sem confirmacao do Google. Nao e erro: o callback pode estar a caminho.
+        // Registrar ajuda a diagnosticar SSV mal configurado no painel do AdMob, situacao em
+        // que NENHUM credito acontece e o sintoma aparece exatamente aqui.
+        console.log(`[Reward] Aguardando callback SSV do Google para user ${userId} (ip ${ip})`);
+        return res.status(202).json({
+          success: false,
+          pending: true,
+          code: 'SSV_PENDING',
+          message: 'Aguardando confirmacao do anuncio. O saldo sera atualizado em instantes.',
+          newBalance: balance,
+          pointValues: POINT_VALUES,
+          dailyLimit: 100,
+          dailyCount: parseInt(dailyCount.rows[0].count, 10)
+        });
+      }
+
+      const confirmed = recentSsv.rows[0];
+      return res.json({
+        success: true,
+        verifiedBy: 'admob_ssv',
+        pointsAwarded: confirmed.points_awarded,
+        newBalance: balance,
+        eventId: confirmed.id,
+        pointValues: POINT_VALUES,
+        dailyLimit: 100,
+        dailyCount: parseInt(dailyCount.rows[0].count, 10)
+      });
+    }
+
+    // ==========================================================================================
+    // CAMINHO 'interstitial' / 'banner': credito pelo servidor, sem prova criptografica
+    //
+    // Estes formatos nao possuem SSV no AdMob. O credito depende da palavra do cliente, o que
+    // nao pode ser eliminado — apenas contido. As barreiras aplicadas sao: assinatura HMAC do
+    // corpo, limite por usuario, intervalo minimo entre eventos, teto diario e valor baixo por
+    // exibicao. Se estes formatos passarem a valer mais pontos, o abuso volta a compensar; a
+    // recomendacao registrada no relatorio e mante-los com valor simbolico.
+    // ==========================================================================================
     const configResult = await db.query(
-      "SELECT key, value FROM system_config WHERE key IN ('reward_points_multiplier', 'reward_points_interstitial', 'reward_points_banner')"
+      "SELECT key, value FROM system_config WHERE key IN ('reward_points_interstitial', 'reward_points_banner')"
     );
 
     const config = {};
@@ -48,88 +172,45 @@ router.post('/reward', authenticateToken, rewardFraudDetection, async (req, res)
       }
     });
 
-    // Determine points based on ad type.
-    // Para 'rewarded' o valor NAO e fixo: aplicamos o sorteio ponderado que
-    // reproduz a logica original do app, na qual pontuacoes altas sao raras.
-    let pointsToAward = 0;
-    let rewardRoll = null;
-    let rewardTier = null;
-
-    switch (ad_type) {
-      case 'rewarded': {
-        const multiplier = Number(config.reward_points_multiplier) || 1;
-        const draw = drawRewardPoints({ multiplier });
-        pointsToAward = draw.points;
-        rewardRoll = draw.roll;
-        rewardTier = draw.tier;
-        break;
-      }
-      case 'interstitial':
-        pointsToAward = Number(config.reward_points_interstitial) || 0;
-        break;
-      case 'banner':
-        pointsToAward = Number(config.reward_points_banner) || 0;
-        break;
-      default:
-        return res.status(400).json({ error: 'Invalid ad_type. Must be: rewarded, interstitial, or banner' });
-    }
+    const pointsToAward = ad_type === 'interstitial'
+      ? Number(config.reward_points_interstitial) || 0
+      : Number(config.reward_points_banner) || 0;
 
     if (pointsToAward <= 0) {
       return res.status(400).json({ error: 'This ad type does not award points' });
     }
 
-    // SSV Validation: se o app enviou ssv_token, validar antes de creditar
-    let ssvVerified = false;
-    let ssvTransactionId = null;
-    if (ssv_token && ad_type === 'rewarded') {
-      const ssvResult = await validateSsvToken(ssv_token);
-      if (ssvResult.valid) {
-        ssvVerified = true;
-        ssvTransactionId = ssvResult.data?.transactionId || null;
-        console.log(`[SSV-Inline] Valid SSV for user ${userId}, tx: ${ssvTransactionId}`);
-      } else {
-        console.warn(`[SSV-Inline] Invalid SSV for user ${userId}: ${ssvResult.error}`);
-        // Não bloquear por enquanto - apenas logar. Quando SSV estiver 100% ativo,
-        // descomentar a linha abaixo para rejeitar rewards sem SSV válido:
-        // return res.status(403).json({ error: 'Verificação de anúncio falhou', code: 'SSV_INVALID' });
-      }
-    }
-
-    // Rate limiting: check last reward time for this user
+    // Intervalo minimo entre exibicoes do mesmo tipo.
     const lastReward = await db.query(
-      `SELECT created_at FROM reward_events 
-       WHERE user_id = $1 AND ad_type = $2 
-       ORDER BY created_at DESC LIMIT 1`,
+      `SELECT created_at FROM reward_events
+        WHERE user_id = $1 AND ad_type = $2
+        ORDER BY created_at DESC LIMIT 1`,
       [userId, ad_type]
     );
 
     if (lastReward.rows.length > 0) {
-      const lastTime = new Date(lastReward.rows[0].created_at);
-      const now = new Date();
-      const diffSeconds = (now - lastTime) / 1000;
-      
-      // Minimum 10 seconds between rewarded ads, 30 seconds for others
-      const minInterval = ad_type === 'rewarded' ? 10 : 30;
+      const diffSeconds = (Date.now() - new Date(lastReward.rows[0].created_at).getTime()) / 1000;
+      const minInterval = 30;
       if (diffSeconds < minInterval) {
-        return res.status(429).json({ 
-          error: 'Too soon since last reward', 
-          retryAfter: Math.ceil(minInterval - diffSeconds) 
+        return res.status(429).json({
+          error: 'Too soon since last reward',
+          retryAfter: Math.ceil(minInterval - diffSeconds)
         });
       }
     }
 
-    // Daily limit check
+    // Teto diario.
     const dailyCount = await db.query(
-      `SELECT COUNT(*) as count FROM reward_events 
-       WHERE user_id = $1 AND ad_type = $2 AND created_at > NOW() - INTERVAL '24 hours'`,
+      `SELECT COUNT(*) as count FROM reward_events
+        WHERE user_id = $1 AND ad_type = $2 AND created_at > NOW() - INTERVAL '24 hours'`,
       [userId, ad_type]
     );
 
-    const dailyLimit = ad_type === 'rewarded' ? 100 : 50;
-    const currentDailyCount = parseInt(dailyCount.rows[0].count);
+    const dailyLimit = 50;
+    const currentDailyCount = parseInt(dailyCount.rows[0].count, 10);
     if (currentDailyCount >= dailyLimit) {
-      return res.status(429).json({ 
-        error: 'Limite diário atingido. Volte amanhã!', 
+      return res.status(429).json({
+        error: 'Limite diário atingido. Volte amanhã!',
         code: 'DAILY_LIMIT',
         dailyLimit,
         dailyCount: currentDailyCount
@@ -140,15 +221,34 @@ router.post('/reward', authenticateToken, rewardFraudDetection, async (req, res)
     try {
       await client.query('BEGIN');
 
-      // Record reward event
+      // Serializa os creditos deste usuario. Sem o lock, varias requisicoes simultaneas
+      // passariam juntas pelas checagens de intervalo e de teto diario acima (todas leem o
+      // estado antes de qualquer escrita) e o limite seria ultrapassado.
+      await client.query('SELECT pg_advisory_xact_lock(9412, hashtext($1))', [userId]);
+
+      // Revalidacao do teto diario DENTRO do lock.
+      const recheck = await client.query(
+        `SELECT COUNT(*) as count FROM reward_events
+          WHERE user_id = $1 AND ad_type = $2 AND created_at > NOW() - INTERVAL '24 hours'`,
+        [userId, ad_type]
+      );
+      if (parseInt(recheck.rows[0].count, 10) >= dailyLimit) {
+        await client.query('ROLLBACK');
+        return res.status(429).json({
+          error: 'Limite diário atingido. Volte amanhã!',
+          code: 'DAILY_LIMIT',
+          dailyLimit,
+          dailyCount: parseInt(recheck.rows[0].count, 10)
+        });
+      }
+
       const eventId = uuidv4();
       await client.query(
-        `INSERT INTO reward_events (id, user_id, ad_type, ad_network, ad_unit_id, points_awarded, ssv_token, ssv_verified, ssv_transaction_id, device_id, ip_address)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [eventId, userId, ad_type, ad_network || 'admob', ad_unit_id || null, pointsToAward, ssv_token || null, ssvVerified, ssvTransactionId, req.body.device_id || null, ip]
+        `INSERT INTO reward_events (id, user_id, ad_type, ad_network, ad_unit_id, points_awarded, ssv_verified, device_id, ip_address)
+         VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)`,
+        [eventId, userId, ad_type, ad_network || 'admob', ad_unit_id || null, pointsToAward, req.body.device_id || null, ip]
       );
 
-      // Credit points in ledger
       const ledgerId = uuidv4();
       await client.query(
         `INSERT INTO points_ledger (id, user_id, amount, transaction_type, reference_id, description)
@@ -158,7 +258,6 @@ router.post('/reward', authenticateToken, rewardFraudDetection, async (req, res)
 
       await client.query('COMMIT');
 
-      // Get updated balance
       const balanceResult = await db.query(
         'SELECT COALESCE(SUM(amount), 0) as balance FROM points_ledger WHERE user_id = $1',
         [userId]
@@ -166,12 +265,11 @@ router.post('/reward', authenticateToken, rewardFraudDetection, async (req, res)
 
       res.json({
         success: true,
+        verifiedBy: 'server_limits',
         pointsAwarded: pointsToAward,
-        newBalance: parseInt(balanceResult.rows[0].balance),
+        newBalance: parseInt(balanceResult.rows[0].balance, 10),
         eventId,
         pointValues: POINT_VALUES,
-        rewardTier,
-        rewardRoll: rewardRoll === null ? null : Number(rewardRoll.toFixed(4)),
         dailyLimit,
         dailyCount: currentDailyCount + 1
       });

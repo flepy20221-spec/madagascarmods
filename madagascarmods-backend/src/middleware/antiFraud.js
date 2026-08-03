@@ -1,59 +1,145 @@
 /**
  * CashPix — Anti-Fraud Middleware
- * 
- * Detecta e bloqueia tentativas de burlar a pontuação:
- * 1. Valida integridade da request (HMAC + timestamp + nonce)
- * 2. Detecta replay attacks (nonce já usado)
- * 3. Verifica janela de tempo (request muito antiga = replay)
- * 4. Fingerprint de request (detecta requests forjadas)
- * 5. Score de suspeita (acumula flags e bane automaticamente)
- * 
- * Quando fraude é detectada, marca o usuário no banco com flag
- * visível no painel admin.
+ *
+ * Camada de integridade de requisicao para as rotas sensiveis (pontuacao e saque).
+ *
+ * O que este middleware garante:
+ *   1. A request foi montada pelo app oficial (assinatura HMAC-SHA256 do corpo bruto)
+ *   2. A request e recente (janela de 2 minutos contra replay diferido)
+ *   3. A request nao e uma reexecucao (nonce de uso unico, persistido no banco)
+ *   4. Tentativas suspeitas ficam registradas em audit_log e no fraud_score do usuario
+ *
+ * IMPORTANTE (correcoes aplicadas na auditoria de seguranca):
+ *   - A assinatura passou a ser calculada sobre o CORPO BRUTO (req.rawBody), nao sobre
+ *     JSON.stringify(req.body). Reparsear e reserializar mudava a string (ordem de chaves,
+ *     campos null, espacos) e invalidava assinaturas legitimas.
+ *   - O path assinado passou a ser o caminho COMPLETO (req.originalUrl sem query string).
+ *     Dentro de um router montado, req.path e relativo ('/reward'), enquanto o app assina
+ *     '/api/points/reward'. Isso fazia toda assinatura legitima falhar.
+ *   - Os nonces passaram a ser persistidos em tabela (request_nonces). Antes ficavam em um
+ *     Map de memoria, perdido em cada restart/deploy e nao compartilhado entre instancias,
+ *     o que anulava a protecao anti-replay.
+ *   - Removido o fail-open: erro interno no middleware agora BLOQUEIA a request. Antes
+ *     qualquer excecao chamava next() e liberava a rota sensivel sem nenhuma validacao.
+ *   - Comparacao de assinatura protegida contra tamanhos diferentes antes de
+ *     crypto.timingSafeEqual (que lanca excecao se os buffers divergem em tamanho).
  */
 const crypto = require('crypto');
 const db = require('../models/db');
-
-// Chave secreta para validação HMAC (mesma do app)
-const APP_SECRET = process.env.APP_HMAC_SECRET || 'mds_app_s3cr3t_k3y_2024_pr0d';
+const { APP_HMAC_SECRET } = require('../config/secrets');
 
 // Janela de validade de uma request (em segundos)
 const REQUEST_VALIDITY_WINDOW = 120; // 2 minutos
 
-// Cache de nonces usados (em memória, limpa a cada 5 min)
-const usedNonces = new Map();
+// Fallback em memoria: usado apenas se a tabela request_nonces ainda nao existir
+// (primeiro boot antes da migracao). Nao substitui a persistencia.
+const memoryNonces = new Map();
 const NONCE_CLEANUP_INTERVAL = 5 * 60 * 1000;
 
-// Limpar nonces antigos periodicamente
 setInterval(() => {
   const now = Date.now();
-  for (const [nonce, timestamp] of usedNonces.entries()) {
+  for (const [nonce, timestamp] of memoryNonces.entries()) {
     if (now - timestamp > REQUEST_VALIDITY_WINDOW * 1000 * 2) {
-      usedNonces.delete(nonce);
+      memoryNonces.delete(nonce);
     }
   }
+  // Limpeza oportunista da tabela de nonces expirados
+  db.query(
+    `DELETE FROM request_nonces WHERE created_at < NOW() - INTERVAL '10 minutes'`
+  ).catch(() => { /* tabela pode nao existir ainda; ignorar */ });
 }, NONCE_CLEANUP_INTERVAL);
 
 /**
- * Valida a assinatura HMAC da request.
- * O app assina: path|timestamp|nonce|body
+ * Caminho canonico assinado pelo app.
+ *
+ * Regra de compatibilidade (importante):
+ * O app (api_service.dart) assina o caminho SEM o prefixo '/api' — ex.: '/points/reward'.
+ * Dentro de um router montado, req.path e relativo ('/reward') e req.originalUrl e completo
+ * ('/api/points/reward'). Nenhum dos dois bate com o que o app assina.
+ *
+ * A normalizacao e feita aqui, no servidor, e nao no aplicativo, porque o APK 1.5.0+6 ja
+ * esta instalado na base de usuarios: mudar a regra no app faria todo mundo que nao
+ * atualizasse receber 403 no reward e no saque. O prefixo '/api' e detalhe de montagem
+ * do Express, nao parte semantica da rota.
  */
-function validateSignature(path, timestamp, nonce, body, signature) {
-  const payload = `${path}|${timestamp}|${nonce}|${body}`;
-  const hmac = crypto.createHmac('sha256', APP_SECRET);
-  hmac.update(payload);
-  const expected = hmac.digest('hex');
-  return crypto.timingSafeEqual(
-    Buffer.from(signature, 'hex'),
-    Buffer.from(expected, 'hex')
-  );
+function canonicalPath(req) {
+  const original = req.originalUrl || req.url || '';
+  const qIndex = original.indexOf('?');
+  const withoutQuery = qIndex === -1 ? original : original.slice(0, qIndex);
+  // Remove o prefixo de montagem '/api' para coincidir com a assinatura do cliente.
+  return withoutQuery.startsWith('/api/')
+    ? withoutQuery.slice(4)
+    : withoutQuery;
 }
 
 /**
- * Middleware de validação anti-fraude para rotas sensíveis.
- * Aplicar em: /api/points/reward
+ * Corpo bruto exatamente como chegou na rede.
+ * Preenchido pelo verify do express.json em src/index.js.
  */
-function antifraudMiddleware(req, res, next) {
+function rawBody(req) {
+  if (typeof req.rawBody === 'string') return req.rawBody;
+  if (Buffer.isBuffer(req.rawBody)) return req.rawBody.toString('utf8');
+  return '';
+}
+
+/**
+ * Compara duas assinaturas hex em tempo constante, tolerando tamanhos divergentes
+ * sem lancar excecao.
+ */
+function safeCompareHex(received, expected) {
+  if (typeof received !== 'string' || !/^[0-9a-fA-F]+$/.test(received)) return false;
+  const a = Buffer.from(received.toLowerCase(), 'hex');
+  const b = Buffer.from(expected.toLowerCase(), 'hex');
+  if (a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Valida a assinatura HMAC da request.
+ * Payload assinado: path|timestamp|nonce|body
+ */
+function validateSignature(path, timestamp, nonce, body, signature) {
+  const payload = `${path}|${timestamp}|${nonce}|${body}`;
+  const expected = crypto
+    .createHmac('sha256', APP_HMAC_SECRET)
+    .update(payload)
+    .digest('hex');
+  return safeCompareHex(signature, expected);
+}
+
+/**
+ * Consome um nonce de forma atomica.
+ * Retorna true se o nonce e novo (request valida), false se ja foi usado (replay).
+ *
+ * A unicidade e garantida pela PRIMARY KEY da tabela: o INSERT ... ON CONFLICT DO NOTHING
+ * retorna 0 linhas quando o nonce ja existe, o que torna a checagem imune a race condition
+ * entre requests concorrentes e entre instancias do servidor.
+ */
+async function consumeNonce(nonce, userId, path) {
+  try {
+    const result = await db.query(
+      `INSERT INTO request_nonces (nonce, user_id, path)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (nonce) DO NOTHING
+       RETURNING nonce`,
+      [nonce, userId || null, path]
+    );
+    return result.rows.length > 0;
+  } catch (err) {
+    // Tabela ausente (migracao pendente) ou indisponibilidade momentanea do banco:
+    // cai para o controle em memoria para nao derrubar o fluxo do app.
+    console.error('[Antifraud] consumeNonce fallback:', err.message);
+    if (memoryNonces.has(nonce)) return false;
+    memoryNonces.set(nonce, Date.now());
+    return true;
+  }
+}
+
+/**
+ * Middleware de validacao de integridade para rotas sensiveis.
+ * Aplicar em: /api/points/reward, /api/withdrawals/request, /api/pix-withdrawals/request
+ */
+async function antifraudMiddleware(req, res, next) {
   try {
     const signature = req.headers['x-signature'];
     const timestamp = req.headers['x-timestamp'];
@@ -61,149 +147,168 @@ function antifraudMiddleware(req, res, next) {
     const appVersion = req.headers['x-app-version'];
     const platform = req.headers['x-platform'];
 
-    // 1. Headers obrigatórios
+    // 1. Headers obrigatorios
     if (!signature || !timestamp || !nonce) {
       logSuspicion(req, 'MISSING_SECURITY_HEADERS', 'high');
-      return res.status(400).json({ error: 'Invalid request format' });
+      return res.status(400).json({
+        error: 'Requisicao invalida. Atualize o aplicativo.',
+        code: 'INVALID_REQUEST'
+      });
     }
 
-    // 2. Verificar janela de tempo (anti-replay)
-    const requestTime = parseInt(timestamp);
+    // 2. Janela de tempo (anti-replay diferido)
+    const requestTime = parseInt(timestamp, 10);
+    if (!Number.isFinite(requestTime)) {
+      logSuspicion(req, 'MALFORMED_TIMESTAMP', 'high', { timestamp });
+      return res.status(400).json({ error: 'Requisicao invalida.', code: 'INVALID_REQUEST' });
+    }
+
     const now = Date.now();
     const diffSeconds = Math.abs(now - requestTime) / 1000;
-
     if (diffSeconds > REQUEST_VALIDITY_WINDOW) {
       logSuspicion(req, 'EXPIRED_TIMESTAMP', 'medium', {
         diff: diffSeconds,
         requestTime,
         serverTime: now
       });
-      return res.status(400).json({ error: 'Request expired' });
-    }
-
-    // 3. Verificar nonce (anti-replay)
-    if (usedNonces.has(nonce)) {
-      logSuspicion(req, 'REPLAY_ATTACK_NONCE', 'critical', { nonce });
-      return res.status(409).json({ error: 'Duplicate request' });
-    }
-    usedNonces.set(nonce, Date.now());
-
-    // 4. Validar assinatura HMAC
-    const path = req.path;
-    const body = JSON.stringify(req.body) || '';
-
-    try {
-      const isValid = validateSignature(path, timestamp, nonce, body, signature);
-      if (!isValid) {
-        logSuspicion(req, 'INVALID_SIGNATURE', 'critical', {
-          path,
-          timestamp,
-          bodyLength: body.length
-        });
-        return res.status(403).json({ error: 'Request integrity check failed' });
-      }
-    } catch (sigErr) {
-      logSuspicion(req, 'SIGNATURE_VALIDATION_ERROR', 'high', {
-        error: sigErr.message
+      return res.status(400).json({
+        error: 'Requisicao expirada. Verifique a data e hora do aparelho.',
+        code: 'REQUEST_EXPIRED'
       });
-      return res.status(403).json({ error: 'Request integrity check failed' });
     }
 
-    // 5. Verificar versão do app (bloquear versões antigas/modificadas)
+    const path = canonicalPath(req);
+    const body = rawBody(req);
+
+    // 3. Assinatura HMAC (antes do nonce, para nao gastar nonce em request forjada)
+    if (!validateSignature(path, timestamp, nonce, body, signature)) {
+      logSuspicion(req, 'INVALID_SIGNATURE', 'critical', {
+        path,
+        timestamp,
+        bodyLength: body.length
+      });
+      return res.status(403).json({
+        error: 'Falha na verificacao de integridade da requisicao.',
+        code: 'INTEGRITY_FAILED'
+      });
+    }
+
+    // 4. Nonce de uso unico (anti-replay imediato)
+    const isNewNonce = await consumeNonce(nonce, req.user?.userId, path);
+    if (!isNewNonce) {
+      logSuspicion(req, 'REPLAY_ATTACK_NONCE', 'critical', { nonce });
+      return res.status(409).json({
+        error: 'Requisicao duplicada detectada.',
+        code: 'DUPLICATE_REQUEST'
+      });
+    }
+
+    // 5. Metadados do app (apenas telemetria de suspeita)
     if (!appVersion || !platform) {
       logSuspicion(req, 'MISSING_APP_INFO', 'low');
-      // Não bloquear, apenas logar
     }
 
-    // Request válida - continuar
     next();
   } catch (error) {
+    // FAIL-CLOSED: rota sensivel nao passa sem validacao.
     console.error('[AntifraudMiddleware] Error:', error.message);
-    // Em caso de erro no middleware, permitir (fail-open)
-    next();
+    return res.status(503).json({
+      error: 'Servico de validacao temporariamente indisponivel. Tente novamente.',
+      code: 'VALIDATION_UNAVAILABLE'
+    });
   }
 }
 
 /**
- * Middleware de detecção de fraude para reward.
- * Verifica padrões suspeitos APÓS a validação básica.
- * Não bloqueia, mas marca o usuário como suspeito.
+ * Deteccao de padroes de fraude no reward.
+ * Roda depois da autenticacao e da validacao de integridade.
+ * Nao bloqueia sozinho: calcula req.fraudScore, que a rota usa para decidir.
  */
 async function rewardFraudDetection(req, res, next) {
   try {
     const userId = req.user?.userId;
     if (!userId) return next();
 
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ip = clientIp(req);
     const now = new Date();
 
-    // Buscar histórico recente de rewards do usuário
     const recentRewards = await db.query(
-      `SELECT COUNT(*) as count, 
+      `SELECT COUNT(*) as count,
               MIN(created_at) as first_reward,
               MAX(created_at) as last_reward
-       FROM reward_events 
+       FROM reward_events
        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '5 minutes'`,
       [userId]
     );
 
-    const rewardCount = parseInt(recentRewards.rows[0].count);
+    const rewardCount = parseInt(recentRewards.rows[0].count, 10);
     const suspicionFlags = [];
 
-    // Flag: Muitos rewards em 5 minutos (mais de 20 = impossível assistir tantos anúncios)
+    // Flag: volume impossivel de anuncios em 5 minutos
     if (rewardCount > 20) {
       suspicionFlags.push('EXCESSIVE_REWARDS_5MIN');
     }
 
-    // Flag: Rewards sem intervalo mínimo realista (anúncio dura ~15-30s)
-    if (rewardCount > 0) {
+    // Flag: intervalo menor que a duracao de um anuncio
+    if (rewardCount > 0 && recentRewards.rows[0].last_reward) {
       const lastReward = new Date(recentRewards.rows[0].last_reward);
       const timeSinceLast = (now - lastReward) / 1000;
-      if (timeSinceLast < 5) { // Menos de 5 segundos entre rewards
+      if (timeSinceLast < 5) {
         suspicionFlags.push('TOO_FAST_REWARD');
       }
     }
 
-    // Flag: Mesmo IP com múltiplas contas fazendo rewards
+    // Flag: muitas contas distintas pontuando do mesmo IP
     const ipCheck = await db.query(
       `SELECT COUNT(DISTINCT user_id) as user_count
-       FROM reward_events 
+       FROM reward_events
        WHERE ip_address = $1 AND created_at > NOW() - INTERVAL '1 hour' AND user_id != $2`,
       [ip, userId]
     );
-    if (parseInt(ipCheck.rows[0].user_count) > 3) {
+    if (parseInt(ipCheck.rows[0].user_count, 10) > 3) {
       suspicionFlags.push('MULTI_ACCOUNT_IP');
     }
 
-    // Flag: Reward sem SSV em horários suspeitos (madrugada com volume alto)
+    // Flag: volume alto em horario de baixa atividade humana
     const hour = now.getHours();
     if ((hour >= 2 && hour <= 5) && rewardCount > 10) {
       suspicionFlags.push('SUSPICIOUS_TIMING');
     }
 
-    // Se há flags de suspeita, registrar
     if (suspicionFlags.length > 0) {
       await logFraudFlags(userId, suspicionFlags, ip, req);
     }
 
-    // Anexar informação de fraude ao request para uso na rota
     req.fraudFlags = suspicionFlags;
     req.fraudScore = suspicionFlags.length;
 
     next();
   } catch (error) {
+    // Este middleware apenas pontua suspeita; a validacao de integridade e o SSV
+    // continuam valendo. Prosseguir com score neutro e aceitavel aqui.
     console.error('[FraudDetection] Error:', error.message);
-    next(); // Fail-open
+    req.fraudFlags = [];
+    req.fraudScore = 0;
+    next();
   }
 }
 
 /**
- * Registra flags de suspeita no banco de dados.
- * Visível no painel admin.
+ * IP real do cliente. Atras do proxy do Railway, confia no primeiro
+ * endereco de X-Forwarded-For (o Express com 'trust proxy' ja resolve req.ip).
+ */
+function clientIp(req) {
+  if (req.ip) return req.ip;
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length > 0) return xff.split(',')[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
+/**
+ * Registra flags de suspeita no banco. Visivel no painel admin.
  */
 async function logFraudFlags(userId, flags, ip, req) {
   try {
-    // Registrar no audit_log
     await db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
        VALUES ($1, 'system', 'FRAUD_DETECTED', 'user', $2, $3, $4)`,
@@ -220,9 +325,8 @@ async function logFraudFlags(userId, flags, ip, req) {
       ]
     );
 
-    // Incrementar contador de suspeita do usuário
     await db.query(
-      `UPDATE users SET 
+      `UPDATE users SET
         fraud_score = COALESCE(fraud_score, 0) + $1,
         last_fraud_at = NOW(),
         updated_at = NOW()
@@ -230,21 +334,21 @@ async function logFraudFlags(userId, flags, ip, req) {
       [flags.length, userId]
     );
 
-    // Se score acumulado > 10, banir automaticamente
     const userResult = await db.query(
       'SELECT fraud_score, is_banned FROM users WHERE id = $1',
       [userId]
     );
 
     if (userResult.rows.length > 0) {
-      const totalScore = parseInt(userResult.rows[0].fraud_score) || 0;
+      const totalScore = parseInt(userResult.rows[0].fraud_score, 10) || 0;
       if (totalScore >= 10 && !userResult.rows[0].is_banned) {
         await db.query(
-          `UPDATE users SET is_banned = true, ban_reason = 'Auto-ban: fraude detectada (score: ' || fraud_score || ')', 
+          `UPDATE users SET is_banned = true,
+           ban_reason = 'Auto-ban: fraude detectada (score: ' || fraud_score || ')',
            banned_at = NOW(), updated_at = NOW() WHERE id = $1`,
           [userId]
         );
-        console.warn(`[AntifraudMiddleware] Auto-banned user ${userId} (score: ${totalScore})`);
+        console.warn(`[Antifraud] Auto-banned user ${userId} (score: ${totalScore})`);
       }
     }
 
@@ -255,16 +359,15 @@ async function logFraudFlags(userId, flags, ip, req) {
 }
 
 /**
- * Registra suspeita individual
+ * Registra uma suspeita individual (assincrono, nao bloqueia a response).
  */
 function logSuspicion(req, type, severity, details = {}) {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  const userId = req.user?.userId || 'unknown';
+  const ip = clientIp(req);
+  const userId = req.user?.userId || null;
 
-  console.warn(`[Antifraud] ${severity.toUpperCase()} | ${type} | user:${userId} | ip:${ip}`, details);
+  console.warn(`[Antifraud] ${severity.toUpperCase()} | ${type} | user:${userId || 'unknown'} | ip:${ip}`, details);
 
-  // Registrar no banco de forma assíncrona (não bloquear a response)
-  if (userId !== 'unknown') {
+  if (userId) {
     db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
        VALUES ($1, 'system', $2, 'user', $3, $4, $5)`,
@@ -277,4 +380,6 @@ module.exports = {
   antifraudMiddleware,
   rewardFraudDetection,
   validateSignature,
+  canonicalPath,
+  clientIp,
 };
