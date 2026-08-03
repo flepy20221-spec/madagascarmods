@@ -1,75 +1,40 @@
 /**
- * CashPix — Bot/Automation Detection Middleware
+ * CashPix — Bot/Automation Detection Middleware v2
  *
- * Detecta e bloqueia contas que apresentam comportamento de automação.
+ * Detecta e bloqueia contas com comportamento de automação.
  *
- * Diferença do antiFraud.js:
- *   - antiFraud.js valida integridade de requests individuais (HMAC, nonce, timestamp)
- *   - rewardFraudDetection analisa padrões em reward_events JÁ CREDITADOS
- *   - ESTE middleware analisa o PADRÃO DE REQUESTS em si, mesmo que nenhum ponto
- *     tenha sido creditado. Detecta bots que fazem requests válidas (com HMAC correto)
- *     mas em padrões impossíveis para um humano.
+ * DIFERENÇA DA v1: a detecção principal agora é PERSISTIDA NO BANCO,
+ * não depende de cache em memória. Isso significa que:
+ *   - Reiniciar o servidor não reseta os contadores
+ *   - Atacante usando sleep(30s+) entre requests ainda é detectado
+ *   - A métrica principal é: QUANTAS REQUESTS DE REWARD O USUÁRIO FEZ
+ *     SEM NENHUM SSV CONFIRMADO PELO GOOGLE (em janela de 1 hora)
  *
- * Flags detectadas:
- *   - PHANTOM_REWARDS: muitas requests de reward sem nenhum SSV confirmado
- *   - BURST_REQUESTS: muitas requests em intervalo muito curto
- *   - ZERO_SUCCESS_RATIO: dezenas de tentativas sem nenhum sucesso
- *   - SUSPICIOUS_SESSION_PATTERN: sessões UUID sequenciais ou padrão de geração
- *   - NO_AD_LOADED: requests de reward sem ter carregado anúncio (fingerprint vazio)
+ * Lógica:
+ *   Um usuário legítimo faz POST /reward → Google envia SSV → reward_event criado.
+ *   Um bot faz POST /reward → Google NUNCA envia SSV → nenhum reward_event.
+ *   Se o usuário fez muitos POST /reward mas tem 0 reward_events com ssv_verified,
+ *   é automação — independente do intervalo entre requests.
  *
  * Ações:
- *   - Score 3+: rate limit agressivo (1 request por 30s)
- *   - Score 5+: bloqueio temporário (15 min)
- *   - Score 8+: auto-ban permanente
+ *   - 5+ phantom rewards (sem SSV) em 1h → rate limit (1 req/60s)
+ *   - 10+ phantom rewards em 1h → auto-ban permanente
+ *   - 5+ logins do mesmo IP em 10 min → bloqueio de login
  */
 const db = require('../models/db');
 
-// Cache em memória para tracking de requests (por userId)
-// Formato: { userId: { requests: [timestamp, ...], phantomCount: N, lastReset: Date } }
-const requestTracker = new Map();
-
-// Limpar cache a cada 10 minutos
-const TRACKER_CLEANUP_INTERVAL = 10 * 60 * 1000;
-const TRACKER_WINDOW = 5 * 60 * 1000; // Janela de 5 minutos
-const PHANTOM_THRESHOLD = 5; // 5+ rewards sem SSV = suspeito
-const BURST_THRESHOLD = 8; // 8+ requests em 60 segundos = burst
-const AUTO_BAN_SCORE = 8;
-const TEMP_BLOCK_SCORE = 5;
-const RATE_LIMIT_SCORE = 3;
+// Cache em memória para burst detection (complementar ao banco)
+const burstTracker = new Map();
+const BURST_CLEANUP_INTERVAL = 5 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
-  for (const [userId, data] of requestTracker.entries()) {
-    if (now - data.lastActivity > TRACKER_WINDOW * 2) {
-      requestTracker.delete(userId);
+  for (const [userId, data] of burstTracker.entries()) {
+    if (now - data.lastActivity > 10 * 60 * 1000) {
+      burstTracker.delete(userId);
     }
   }
-}, TRACKER_CLEANUP_INTERVAL);
-
-/**
- * Obtém ou cria o tracker de um usuário.
- */
-function getTracker(userId) {
-  if (!requestTracker.has(userId)) {
-    requestTracker.set(userId, {
-      requests: [],
-      phantomRewards: 0,
-      confirmedRewards: 0,
-      lastActivity: Date.now(),
-      blocked: false,
-      blockedUntil: null,
-      botScore: 0,
-    });
-  }
-  const tracker = requestTracker.get(userId);
-  tracker.lastActivity = Date.now();
-
-  // Limpar requests antigas (fora da janela)
-  const cutoff = Date.now() - TRACKER_WINDOW;
-  tracker.requests = tracker.requests.filter(t => t > cutoff);
-
-  return tracker;
-}
+}, BURST_CLEANUP_INTERVAL);
 
 /**
  * IP real do cliente.
@@ -82,177 +47,217 @@ function clientIp(req) {
 }
 
 /**
+ * Conta quantas requests de reward o usuário fez na última hora
+ * que NÃO resultaram em SSV confirmado.
+ *
+ * Usa a tabela audit_log como registro de tentativas (BOT_REWARD_ATTEMPT).
+ * Compara com reward_events (ssv_verified = true) no mesmo período.
+ */
+async function getPhantomRewardCount(userId) {
+  try {
+    // Contar tentativas de reward registradas na última hora
+    const attempts = await db.query(
+      `SELECT COUNT(*) as count FROM audit_log
+       WHERE actor_id = $1
+         AND action = 'BOT_REWARD_ATTEMPT'
+         AND created_at > NOW() - INTERVAL '1 hour'`,
+      [userId]
+    );
+
+    // Contar SSVs confirmados na última hora
+    const confirmed = await db.query(
+      `SELECT COUNT(*) as count FROM reward_events
+       WHERE user_id = $1
+         AND ssv_verified = true
+         AND created_at > NOW() - INTERVAL '1 hour'`,
+      [userId]
+    );
+
+    const attemptCount = parseInt(attempts.rows[0].count, 10);
+    const confirmedCount = parseInt(confirmed.rows[0].count, 10);
+
+    // Phantom = tentativas que não resultaram em SSV
+    return {
+      attempts: attemptCount,
+      confirmed: confirmedCount,
+      phantom: Math.max(0, attemptCount - confirmedCount),
+    };
+  } catch (err) {
+    console.error('[BotDetection] getPhantomRewardCount error:', err.message);
+    return { attempts: 0, confirmed: 0, phantom: 0 };
+  }
+}
+
+/**
+ * Registra uma tentativa de reward no audit_log.
+ */
+async function logRewardAttempt(userId, ip) {
+  try {
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'user', 'BOT_REWARD_ATTEMPT', 'user', $1, $2, $3)`,
+      [userId, JSON.stringify({ timestamp: new Date().toISOString() }), ip]
+    );
+  } catch (err) {
+    // Não bloquear por falha de log
+    console.error('[BotDetection] logRewardAttempt error:', err.message);
+  }
+}
+
+/**
+ * Auto-ban por automação detectada.
+ */
+async function autoBanUser(userId, reason, phantomCount, ip) {
+  try {
+    await db.query(
+      `UPDATE users SET
+        is_banned = true,
+        ban_reason = $2,
+        fraud_score = COALESCE(fraud_score, 0) + $3,
+        last_fraud_at = NOW(),
+        banned_at = NOW(),
+        updated_at = NOW()
+       WHERE id = $1 AND is_banned = false`,
+      [userId, reason, phantomCount]
+    );
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'system', 'BOT_AUTO_BAN', 'user', $1, $2, $3)`,
+      [userId, JSON.stringify({ reason, phantomCount }), ip]
+    );
+
+    console.warn(`[BotDetection] AUTO-BANNED user ${userId} | Reason: ${reason} | Phantom: ${phantomCount}`);
+  } catch (err) {
+    console.error('[BotDetection] autoBanUser error:', err.message);
+  }
+}
+
+/**
  * Middleware de detecção de bots para rotas de reward.
- * Aplicar ANTES do antifraudMiddleware nas rotas /points/reward e /points/reward-status.
  */
 async function botDetectionMiddleware(req, res, next) {
   try {
     const userId = req.user?.userId;
     if (!userId) return next();
 
-    const tracker = getTracker(userId);
-    const now = Date.now();
     const ip = clientIp(req);
+    const now = Date.now();
 
-    // Verificar se está temporariamente bloqueado
-    if (tracker.blocked && tracker.blockedUntil) {
-      if (now < tracker.blockedUntil) {
-        const remainingSeconds = Math.ceil((tracker.blockedUntil - now) / 1000);
-        console.warn(`[BotDetection] Blocked request from user ${userId} (${remainingSeconds}s remaining)`);
-        return res.status(429).json({
-          error: 'Muitas tentativas. Aguarde antes de tentar novamente.',
-          code: 'BOT_DETECTED',
-          retryAfter: remainingSeconds,
-        });
-      }
-      // Bloqueio expirou
-      tracker.blocked = false;
-      tracker.blockedUntil = null;
+    // ===== VERIFICAR SE JÁ ESTÁ BANIDO =====
+    const userCheck = await db.query(
+      'SELECT is_banned FROM users WHERE id = $1',
+      [userId]
+    );
+    if (userCheck.rows.length > 0 && userCheck.rows[0].is_banned) {
+      return res.status(403).json({
+        error: 'Conta suspensa.',
+        code: 'ACCOUNT_BANNED',
+      });
     }
 
-    // Registrar esta request
-    tracker.requests.push(now);
+    // ===== BURST DETECTION (em memória - para rajadas rápidas) =====
+    if (!burstTracker.has(userId)) {
+      burstTracker.set(userId, { requests: [], lastActivity: now });
+    }
+    const burst = burstTracker.get(userId);
+    burst.lastActivity = now;
+    burst.requests.push(now);
+    // Limpar requests antigas (>60s)
+    burst.requests = burst.requests.filter(t => t > now - 60000);
 
-    // ===== DETECÇÃO DE PADRÕES =====
-    const flags = [];
-
-    // 1. BURST: muitas requests em 60 segundos
-    const last60s = tracker.requests.filter(t => t > now - 60000);
-    if (last60s.length >= BURST_THRESHOLD) {
-      flags.push('BURST_REQUESTS');
+    if (burst.requests.length >= 8) {
+      console.warn(`[BotDetection] BURST detected for user ${userId} (${burst.requests.length} reqs in 60s)`);
+      await autoBanUser(userId, `Auto-ban: burst de requests (${burst.requests.length} em 60s)`, burst.requests.length, ip);
+      return res.status(403).json({
+        error: 'Conta suspensa por atividade automatizada.',
+        code: 'ACCOUNT_BANNED',
+      });
     }
 
-    // 2. PHANTOM REWARDS: muitas requests de reward sem SSV confirmado
-    // Verificar no banco quantos SSV foram confirmados vs quantos rewards foram pedidos
-    if (req.path.includes('reward') && req.method === 'POST') {
-      tracker.phantomRewards++;
+    // ===== PHANTOM REWARD DETECTION (persistido no banco) =====
+    if (req.method === 'POST' && req.path.includes('reward')) {
+      // Registrar tentativa
+      await logRewardAttempt(userId, ip);
 
-      // A cada 5 phantom rewards, verificar se algum foi confirmado
-      if (tracker.phantomRewards % 5 === 0) {
-        const confirmed = await db.query(
-          `SELECT COUNT(*) as count FROM reward_events
-           WHERE user_id = $1 AND ssv_verified = true
-             AND created_at > NOW() - INTERVAL '10 minutes'`,
-          [userId]
+      // Verificar contagem de phantoms
+      const { phantom, attempts, confirmed } = await getPhantomRewardCount(userId);
+
+      // 10+ phantom rewards na última hora → AUTO-BAN
+      if (phantom >= 10) {
+        await autoBanUser(
+          userId,
+          `Auto-ban: automação detectada (${phantom} rewards sem confirmação SSV em 1h)`,
+          phantom,
+          ip
         );
-        const confirmedCount = parseInt(confirmed.rows[0].count, 10);
-        tracker.confirmedRewards = confirmedCount;
-
-        // Se tem 5+ pedidos sem nenhuma confirmação, é bot
-        if (tracker.phantomRewards >= PHANTOM_THRESHOLD && confirmedCount === 0) {
-          flags.push('PHANTOM_REWARDS');
-        }
-
-        // Ratio muito baixo (menos de 10% de sucesso com muitas tentativas)
-        if (tracker.phantomRewards >= 10 && confirmedCount / tracker.phantomRewards < 0.1) {
-          flags.push('ZERO_SUCCESS_RATIO');
-        }
-      }
-    }
-
-    // 3. Rate limit para requests GET de reward-status em rajada
-    if (req.path.includes('reward-status')) {
-      const statusRequests = tracker.requests.filter(t => t > now - 30000);
-      if (statusRequests.length > 15) {
-        flags.push('EXCESSIVE_POLLING');
-      }
-    }
-
-    // ===== CALCULAR SCORE E AGIR =====
-    if (flags.length > 0) {
-      tracker.botScore += flags.length;
-
-      console.warn(`[BotDetection] User ${userId} | Flags: ${flags.join(', ')} | Score: ${tracker.botScore} | IP: ${ip}`);
-
-      // Registrar no audit_log
-      try {
-        await db.query(
-          `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
-           VALUES ($1, 'system', 'BOT_DETECTED', 'user', $2, $3, $4)`,
-          [userId, userId, JSON.stringify({
-            flags,
-            totalScore: tracker.botScore,
-            phantomRewards: tracker.phantomRewards,
-            confirmedRewards: tracker.confirmedRewards,
-            requestsInWindow: tracker.requests.length,
-            timestamp: new Date().toISOString(),
-          }), ip]
-        );
-      } catch (err) {
-        console.error('[BotDetection] Audit log error:', err.message);
-      }
-
-      // AUTO-BAN: score >= 8
-      if (tracker.botScore >= AUTO_BAN_SCORE) {
-        try {
-          await db.query(
-            `UPDATE users SET
-              is_banned = true,
-              ban_reason = 'Auto-ban: automação detectada (bot score: ' || $2 || ')',
-              fraud_score = COALESCE(fraud_score, 0) + $2,
-              last_fraud_at = NOW(),
-              banned_at = NOW(),
-              updated_at = NOW()
-             WHERE id = $1 AND is_banned = false`,
-            [userId, tracker.botScore]
-          );
-          console.warn(`[BotDetection] AUTO-BANNED user ${userId} (score: ${tracker.botScore})`);
-        } catch (err) {
-          console.error('[BotDetection] Ban error:', err.message);
-        }
-
         return res.status(403).json({
           error: 'Conta suspensa por atividade automatizada.',
           code: 'ACCOUNT_BANNED',
         });
       }
 
-      // BLOQUEIO TEMPORÁRIO: score >= 5
-      if (tracker.botScore >= TEMP_BLOCK_SCORE) {
-        tracker.blocked = true;
-        tracker.blockedUntil = now + (15 * 60 * 1000); // 15 minutos
+      // 5+ phantom rewards → rate limit agressivo (bloqueia se <60s desde a última)
+      if (phantom >= 5) {
+        const lastAttempt = await db.query(
+          `SELECT created_at FROM audit_log
+           WHERE actor_id = $1 AND action = 'BOT_REWARD_ATTEMPT'
+           ORDER BY created_at DESC OFFSET 1 LIMIT 1`,
+          [userId]
+        );
 
-        // Incrementar fraud_score no banco
-        await db.query(
-          `UPDATE users SET
-            fraud_score = COALESCE(fraud_score, 0) + $2,
-            last_fraud_at = NOW(),
-            updated_at = NOW()
-           WHERE id = $1`,
-          [userId, flags.length]
-        ).catch(() => {});
+        if (lastAttempt.rows.length > 0) {
+          const lastTime = new Date(lastAttempt.rows[0].created_at).getTime();
+          const diffSeconds = (now - lastTime) / 1000;
 
-        return res.status(429).json({
-          error: 'Atividade suspeita detectada. Tente novamente em 15 minutos.',
-          code: 'TEMP_BLOCKED',
-          retryAfter: 900,
-        });
-      }
+          if (diffSeconds < 60) {
+            console.warn(`[BotDetection] Rate limited user ${userId} | Phantom: ${phantom} | Interval: ${diffSeconds.toFixed(1)}s`);
 
-      // RATE LIMIT AGRESSIVO: score >= 3
-      if (tracker.botScore >= RATE_LIMIT_SCORE) {
-        const lastRequest = tracker.requests[tracker.requests.length - 2] || 0;
-        if (now - lastRequest < 30000) { // Menos de 30s desde a última
-          return res.status(429).json({
-            error: 'Aguarde antes de tentar novamente.',
-            code: 'RATE_LIMITED',
-            retryAfter: 30,
-          });
+            // Incrementar fraud_score
+            await db.query(
+              `UPDATE users SET fraud_score = COALESCE(fraud_score, 0) + 1, last_fraud_at = NOW(), updated_at = NOW() WHERE id = $1`,
+              [userId]
+            ).catch(() => {});
+
+            return res.status(429).json({
+              error: 'Aguarde antes de tentar novamente.',
+              code: 'RATE_LIMITED',
+              retryAfter: 60,
+            });
+          }
         }
+      }
+    }
+
+    // ===== EXCESSIVE POLLING (reward-status) =====
+    if (req.path.includes('reward-status')) {
+      const recentPolling = await db.query(
+        `SELECT COUNT(*) as count FROM audit_log
+         WHERE actor_id = $1 AND action = 'BOT_REWARD_ATTEMPT'
+           AND created_at > NOW() - INTERVAL '5 minutes'`,
+        [userId]
+      );
+      const pollingCount = parseInt(recentPolling.rows[0].count, 10);
+
+      if (pollingCount >= 15) {
+        return res.status(429).json({
+          error: 'Muitas consultas. Aguarde.',
+          code: 'EXCESSIVE_POLLING',
+          retryAfter: 300,
+        });
       }
     }
 
     next();
   } catch (error) {
-    // Fail-open apenas para este middleware de detecção. O antifraudMiddleware
-    // (que é fail-closed) ainda protege a rota.
+    // Fail-open para não travar usuários legítimos por erro interno
     console.error('[BotDetection] Error:', error.message);
     next();
   }
 }
 
 /**
- * Middleware leve para detecção de bots no LOGIN.
+ * Middleware de detecção de bots no LOGIN.
  * Detecta criação em massa de contas do mesmo IP.
  */
 async function loginBotDetection(req, res, next) {
@@ -273,7 +278,6 @@ async function loginBotDetection(req, res, next) {
     if (count >= 5) {
       console.warn(`[BotDetection] Login rate limit for IP ${ip} (${count} logins in 10min)`);
 
-      // Registrar no audit
       await db.query(
         `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
          VALUES ('system', 'system', 'LOGIN_RATE_LIMIT', 'ip', $1, $2, $1)`,
