@@ -22,11 +22,21 @@ router.get('/callback', async (req, res) => {
   try {
     const queryParams = req.query;
 
-    // Log para debug (remover em produção estável)
-    console.log('[SSV] Callback received:', JSON.stringify(queryParams));
+    // Registrar somente metadados operacionais; a assinatura completa e os dados
+    // do usuário não devem aparecer nos logs de produção.
+    console.log('[SSV] Callback received', {
+      adUnit: queryParams.ad_unit || null,
+      transactionId: queryParams.transaction_id || null,
+      keyId: queryParams.key_id || null,
+      hasUserData: Boolean(queryParams.custom_data || queryParams.user_id)
+    });
 
-    // Validar assinatura
-    const validation = await validateSsvCallback(queryParams);
+    // A verificação criptográfica precisa dos bytes exatos da query antes de
+    // `&signature=`. `req.query` já foi decodificado pelo Express e não serve
+    // como fonte canônica quando há percent-encoding em custom_data/user_id.
+    const queryStart = req.originalUrl.indexOf('?');
+    const rawQueryString = queryStart >= 0 ? req.originalUrl.slice(queryStart + 1) : '';
+    const validation = await validateSsvCallback(queryParams, rawQueryString);
 
     if (!validation.valid) {
       console.warn('[SSV] Invalid callback:', validation.error);

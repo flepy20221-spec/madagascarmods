@@ -54,11 +54,27 @@ async function fetchGoogleKeys() {
 }
 
 /**
- * Converte uma chave pública base64 do Google para formato PEM.
+ * Constrói uma KeyObject a partir da entrada oficial do Google.
+ *
+ * O campo `pem` já contém cabeçalho e rodapé completos. Embrulhá-lo novamente
+ * produz um PEM inválido e faz o OpenSSL retornar DECODER routines::unsupported.
+ * O campo `base64` é mantido somente como fallback DER/SPKI.
  */
-function base64ToPem(base64Key) {
-  const lines = base64Key.match(/.{1,64}/g) || [];
-  return `-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----`;
+function publicKeyFromEntry(keyEntry) {
+  if (typeof keyEntry?.pem === 'string' &&
+      keyEntry.pem.includes('-----BEGIN PUBLIC KEY-----')) {
+    return crypto.createPublicKey(keyEntry.pem);
+  }
+
+  if (typeof keyEntry?.base64 === 'string' && keyEntry.base64.length > 0) {
+    return crypto.createPublicKey({
+      key: Buffer.from(keyEntry.base64, 'base64'),
+      format: 'der',
+      type: 'spki'
+    });
+  }
+
+  throw new Error('Google SSV key has no usable pem or base64 value');
 }
 
 /**
@@ -71,7 +87,7 @@ function base64ToPem(base64Key) {
  * @param {Object} queryParams - Parâmetros do callback (req.query)
  * @returns {Object} { valid: boolean, data: object, error?: string }
  */
-async function validateSsvCallback(queryParams) {
+async function validateSsvCallback(queryParams, rawQueryString = null) {
   try {
     const { signature, key_id, ...params } = queryParams;
 
@@ -89,20 +105,9 @@ async function validateSsvCallback(queryParams) {
 
     // Construir a mensagem que foi assinada (todos os params exceto signature e key_id, na ordem da URL)
     // O Google assina a query string completa antes de signature e key_id
-    const message = buildVerificationMessage(queryParams);
+    const message = buildVerificationMessage(queryParams, rawQueryString);
 
-    // Decodificar a assinatura (base64url -> buffer)
-    const signatureBuffer = Buffer.from(
-      signature.replace(/-/g, '+').replace(/_/g, '/'),
-      'base64'
-    );
-
-    // Verificar assinatura ECDSA
-    const pem = base64ToPem(keyEntry.pem || keyEntry.base64);
-    const verifier = crypto.createVerify('SHA256');
-    verifier.update(message);
-
-    const isValid = verifier.verify(pem, signatureBuffer);
+    const isValid = verifySsvSignature(message, signature, keyEntry);
 
     if (isValid) {
       return {
@@ -127,12 +132,48 @@ async function validateSsvCallback(queryParams) {
 }
 
 /**
+ * Verifica uma assinatura ECDSA SHA-256 do AdMob.
+ */
+function verifySsvSignature(message, signature, keyEntry) {
+  if (typeof message !== 'string' || !message) {
+    throw new Error('SSV verification message is empty');
+  }
+  if (typeof signature !== 'string' || !signature) {
+    throw new Error('SSV signature is empty');
+  }
+
+  // A assinatura usa Base64 URL-safe e codificação ECDSA DER.
+  const signatureBuffer = Buffer.from(signature, 'base64url');
+  const publicKey = publicKeyFromEntry(keyEntry);
+  const verifier = crypto.createVerify('SHA256');
+  verifier.update(message, 'utf8');
+  verifier.end();
+  return verifier.verify(publicKey, signatureBuffer);
+}
+
+/**
  * Constrói a mensagem de verificação a partir dos query params.
  * O Google assina a query string na ordem em que aparece na URL,
  * excluindo signature e key_id.
  */
-function buildVerificationMessage(queryParams) {
-  // A mensagem é a query string completa sem signature e key_id
+function buildVerificationMessage(queryParams, rawQueryString = null) {
+  // O Google exige os bytes exatos recebidos antes de `&signature=`. Usar a
+  // query crua evita alterar ordem, percent-encoding, espaços ou caracteres
+  // especiais de custom_data/user_id durante o parse do Express.
+  if (typeof rawQueryString === 'string' && rawQueryString.length > 0) {
+    const signatureMarker = '&signature=';
+    const signatureIndex = rawQueryString.lastIndexOf(signatureMarker);
+
+    if (signatureIndex <= 0) {
+      throw new Error('Raw SSV query has no signature marker');
+    }
+
+    return rawQueryString.slice(0, signatureIndex);
+  }
+
+  // Fallback para chamadas internas/testes antigos que fornecem apenas objeto.
+  // Os callbacks oficiais são enviados em ordem e o objeto preserva a ordem de
+  // inserção em Node.js, mas a rota HTTP sempre deve passar a query crua.
   const parts = [];
   const excludeKeys = ['signature', 'key_id'];
 
@@ -164,7 +205,7 @@ async function validateSsvToken(ssvUrl) {
     const url = new URL(ssvUrl);
     const params = Object.fromEntries(url.searchParams.entries());
 
-    return await validateSsvCallback(params);
+    return await validateSsvCallback(params, url.search.slice(1));
   } catch (err) {
     return { valid: false, error: `SSV token parse error: ${err.message}` };
   }
@@ -193,4 +234,8 @@ module.exports = {
   validateSsvToken,
   isTransactionUsed,
   fetchGoogleKeys,
+  // Exportações pequenas e determinísticas para testes criptográficos locais.
+  buildVerificationMessage,
+  publicKeyFromEntry,
+  verifySsvSignature,
 };
