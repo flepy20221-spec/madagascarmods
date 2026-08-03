@@ -8,6 +8,7 @@
  * URL a configurar no AdMob: 
  * https://madagascarmods-production.up.railway.app/api/ssv/callback
  */
+const crypto = require('crypto');
 const express = require('express');
 const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
@@ -86,6 +87,51 @@ function redactRawQuery(rawQueryString) {
   };
 }
 
+/**
+ * Descreve a MENSAGEM CANÔNICA que foi submetida à verificação ECDSA e testa
+ * variantes de normalização comuns de proxy. Objetivo: descobrir se algum byte
+ * de `req.originalUrl` difere do que o Google assinou.
+ *
+ * Não expõe a mensagem completa. Expõe o SHA-256 dela (permite comparar sem
+ * revelar conteúdo) e sinalizadores de normalização.
+ */
+function describeCanonicalMessage(rawQueryString) {
+  if (typeof rawQueryString !== 'string' || rawQueryString.length === 0) {
+    return { present: false };
+  }
+
+  const marker = '&signature=';
+  const idx = rawQueryString.lastIndexOf(marker);
+  if (idx <= 0) {
+    return { present: true, hasSignatureMarker: false };
+  }
+
+  const message = rawQueryString.slice(0, idx);
+
+  // Percent-encodings encontrados, com o caso original preservado. O Google
+  // assina os bytes exatos; se o proxy trocar %3A por %3a a assinatura quebra.
+  const escapes = message.match(/%[0-9A-Fa-f]{2}/g) || [];
+  const uniqueEscapes = Array.from(new Set(escapes));
+
+  return {
+    present: true,
+    hasSignatureMarker: true,
+    messageLength: message.length,
+    // Hash permite comparar mensagens entre tentativas sem expor conteúdo.
+    sha256: crypto.createHash('sha256').update(message, 'utf8').digest('hex'),
+    // Detecção de normalização de caixa no percent-encoding.
+    escapes: uniqueEscapes,
+    hasLowercaseEscape: uniqueEscapes.some((e) => /%[0-9a-f]*[a-f]/.test(e)),
+    hasUppercaseEscape: uniqueEscapes.some((e) => /%[0-9A-F]*[A-F]/.test(e)),
+    // Caracteres fora do ASCII imprimível indicariam corrupção de encoding.
+    hasNonAscii: /[^\x20-\x7E]/.test(message),
+    hasSpace: message.includes(' '),
+    // Primeiros e últimos bytes ajudam a detectar prefixo/sufixo inesperado.
+    head: message.slice(0, 24),
+    tail: message.slice(-24),
+  };
+}
+
 // GET /api/ssv/callback - AdMob SSV callback (chamado pelo Google)
 // O Google envia via GET com query params assinados
 router.get('/callback', async (req, res) => {
@@ -114,6 +160,7 @@ router.get('/callback', async (req, res) => {
       // dados é impossível distinguir ordem de parâmetros de normalização do proxy.
       if (validation.error === 'Signature verification failed') {
         console.warn('[SSV] Diagnostic', JSON.stringify(redactRawQuery(rawQueryString)));
+        console.warn('[SSV] Canonical', JSON.stringify(describeCanonicalMessage(rawQueryString)));
       }
       // Retornar 200 mesmo em caso de erro para o Google não retentar
       return res.status(200).json({ success: false, error: validation.error });
