@@ -241,134 +241,42 @@ router.post(
     }
 
     // ==========================================================================================
-    // CAMINHO 'interstitial' / 'banner': credito pelo servidor, sem prova criptografica
+    // CAMINHO 'interstitial' / 'banner': SEM CREDITO DE PONTOS
     //
-    // Estes formatos nao possuem SSV no AdMob. O credito depende da palavra do cliente, o que
-    // nao pode ser eliminado — apenas contido. As barreiras aplicadas sao: assinatura HMAC do
-    // corpo, limite por usuario, intervalo minimo entre eventos, teto diario e valor baixo por
-    // exibicao. Se estes formatos passarem a valer mais pontos, o abuso volta a compensar; a
-    // recomendacao registrada no relatorio e mante-los com valor simbolico.
+    // Estes formatos NAO possuem SSV no AdMob, portanto nao ha como provar que o anuncio
+    // foi realmente assistido. Qualquer credito aqui seria exploravel por automacao.
+    //
+    // Decisao: interstitial e banner geram receita para o app (AdMob paga por impressao)
+    // mas NAO creditam pontos ao usuario. Apenas anuncios rewarded (com SSV do Google)
+    // geram pontos. Isso elimina 100% da superficie de ataque por automacao.
+    //
+    // O app continua chamando esta rota normalmente (para tracking), mas o servidor
+    // responde com pointsAwarded: 0 sem tocar no ledger.
     // ==========================================================================================
-    const configResult = await db.query(
-      "SELECT key, value FROM system_config WHERE key IN ('reward_points_interstitial', 'reward_points_banner')"
+    const balanceResult = await db.query(
+      'SELECT COALESCE(SUM(amount), 0) as balance FROM points_ledger WHERE user_id = $1',
+      [userId]
     );
+    const currentBalance = parseInt(balanceResult.rows[0].balance, 10);
 
-    const config = {};
-    configResult.rows.forEach(row => {
-      try {
-        config[row.key] = JSON.parse(row.value);
-      } catch (err) {
-        config[row.key] = row.value;
-      }
-    });
-
-    const pointsToAward = ad_type === 'interstitial'
-      ? Number(config.reward_points_interstitial) || 0
-      : Number(config.reward_points_banner) || 0;
-
-    if (pointsToAward <= 0) {
-      return res.status(400).json({ error: 'This ad type does not award points' });
-    }
-
-    // Intervalo minimo entre exibicoes do mesmo tipo.
-    const lastReward = await db.query(
-      `SELECT created_at FROM reward_events
-        WHERE user_id = $1 AND ad_type = $2
-        ORDER BY created_at DESC LIMIT 1`,
-      [userId, ad_type]
-    );
-
-    if (lastReward.rows.length > 0) {
-      const diffSeconds = (Date.now() - new Date(lastReward.rows[0].created_at).getTime()) / 1000;
-      const minInterval = 30;
-      if (diffSeconds < minInterval) {
-        return res.status(429).json({
-          error: 'Too soon since last reward',
-          retryAfter: Math.ceil(minInterval - diffSeconds)
-        });
-      }
-    }
-
-    // Teto diario.
     const dailyCount = await db.query(
       `SELECT COUNT(*) as count FROM reward_events
-        WHERE user_id = $1 AND ad_type = $2 AND created_at > NOW() - INTERVAL '24 hours'`,
-      [userId, ad_type]
+        WHERE user_id = $1 AND ad_type = 'rewarded' AND ssv_verified = true
+          AND created_at > NOW() - INTERVAL '24 hours'`,
+      [userId]
     );
 
-    const dailyLimit = 50;
-    const currentDailyCount = parseInt(dailyCount.rows[0].count, 10);
-    if (currentDailyCount >= dailyLimit) {
-      return res.status(429).json({
-        error: 'Limite diário atingido. Volte amanhã!',
-        code: 'DAILY_LIMIT',
-        dailyLimit,
-        dailyCount: currentDailyCount
-      });
-    }
-
-    const client = await db.getClient();
-    try {
-      await client.query('BEGIN');
-
-      // Serializa os creditos deste usuario. Sem o lock, varias requisicoes simultaneas
-      // passariam juntas pelas checagens de intervalo e de teto diario acima (todas leem o
-      // estado antes de qualquer escrita) e o limite seria ultrapassado.
-      await client.query('SELECT pg_advisory_xact_lock(9412, hashtext($1))', [userId]);
-
-      // Revalidacao do teto diario DENTRO do lock.
-      const recheck = await client.query(
-        `SELECT COUNT(*) as count FROM reward_events
-          WHERE user_id = $1 AND ad_type = $2 AND created_at > NOW() - INTERVAL '24 hours'`,
-        [userId, ad_type]
-      );
-      if (parseInt(recheck.rows[0].count, 10) >= dailyLimit) {
-        await client.query('ROLLBACK');
-        return res.status(429).json({
-          error: 'Limite diário atingido. Volte amanhã!',
-          code: 'DAILY_LIMIT',
-          dailyLimit,
-          dailyCount: parseInt(recheck.rows[0].count, 10)
-        });
-      }
-
-      const eventId = uuidv4();
-      await client.query(
-        `INSERT INTO reward_events (id, user_id, ad_type, ad_network, ad_unit_id, points_awarded, ssv_verified, device_id, ip_address)
-         VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8)`,
-        [eventId, userId, ad_type, ad_network || 'admob', ad_unit_id || null, pointsToAward, req.body.device_id || null, ip]
-      );
-
-      const ledgerId = uuidv4();
-      await client.query(
-        `INSERT INTO points_ledger (id, user_id, amount, transaction_type, reference_id, description)
-         VALUES ($1, $2, $3, 'REWARD', $4, $5)`,
-        [ledgerId, userId, pointsToAward, eventId, `${ad_type} ad reward`]
-      );
-
-      await client.query('COMMIT');
-
-      const balanceResult = await db.query(
-        'SELECT COALESCE(SUM(amount), 0) as balance FROM points_ledger WHERE user_id = $1',
-        [userId]
-      );
-
-      res.json({
-        success: true,
-        verifiedBy: 'server_limits',
-        pointsAwarded: pointsToAward,
-        newBalance: parseInt(balanceResult.rows[0].balance, 10),
-        eventId,
-        pointValues: POINT_VALUES,
-        dailyLimit,
-        dailyCount: currentDailyCount + 1
-      });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    // Responde sucesso (o app nao precisa saber que nao creditou)
+    // Isso evita que o app mostre erro ao usuario apos assistir interstitial
+    res.json({
+      success: true,
+      verifiedBy: 'no_credit',
+      pointsAwarded: 0,
+      newBalance: currentBalance,
+      pointValues: POINT_VALUES,
+      dailyLimit: 100,
+      dailyCount: parseInt(dailyCount.rows[0].count, 10)
+    });
   } catch (error) {
     console.error('Reward error:', error);
     res.status(500).json({ error: 'Failed to process reward' });
