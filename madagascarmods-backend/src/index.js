@@ -21,6 +21,7 @@ const configRoutes = require('./routes/config');
 const pixRoutes = require('./routes/pix');
 const pixWithdrawalRoutes = require('./routes/pix_withdrawals');
 const ssvRoutes = require('./routes/ssv');
+const adminPayoutKeysRoutes = require('./routes/admin_payout_keys');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -120,6 +121,7 @@ app.use('/api/points', pointsRoutes);
 app.use('/api/payout-destinations', payoutRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/admin', adminPayoutKeysRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/pix', pixRoutes);
 app.use('/api/pix-withdrawals', pixWithdrawalRoutes);
