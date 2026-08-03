@@ -12,7 +12,11 @@ const crypto = require('crypto');
 const express = require('express');
 const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
-const { validateSsvCallback } = require('../utils/admobSsv');
+const {
+  validateSsvCallback,
+  fetchGoogleKeys,
+  verifySsvSignature,
+} = require('../utils/admobSsv');
 const { drawRewardPoints, POINT_VALUES } = require('../utils/pointsRandom');
 
 const router = express.Router();
@@ -132,6 +136,92 @@ function describeCanonicalMessage(rawQueryString) {
   };
 }
 
+/**
+ * TESTE DEFINITIVO: tenta verificar a assinatura real contra VARIANTES da
+ * mensagem canônica, direto no servidor.
+ *
+ * Estado do diagnóstico que motiva esta função: chave (`key_id=3335741209`,
+ * P-256), digest (SHA-256), formato da assinatura (DER base64url), ordem dos
+ * parâmetros e o corte antes de `&signature=` foram TODOS verificados e estão
+ * corretos — o comprimento da canônica (244) e o total (368) conferem
+ * aritmeticamente com a soma dos campos. Ainda assim a verificação falha.
+ *
+ * Logo, a assinatura não corresponde à string que reconstruímos. Esta função
+ * enumera as variações plausíveis e reporta qual delas (se alguma) valida.
+ * Roda apenas no caminho de falha, e não expõe a assinatura nem `custom_data`.
+ */
+
+/**
+ * Cache do keyset resolvido, populado no caminho de falha. Evita tornar o probe
+ * assíncrono e manter o keyset em memória por requisição.
+ */
+let probeKeysCache = null;
+
+function verifyWithKeyId(message, signature, keyId) {
+  if (!probeKeysCache) return 'keys unavailable';
+  const entry = probeKeysCache.find((k) => String(k.keyId) === String(keyId));
+  if (!entry) return `key ${keyId} not in keyset`;
+  return verifySsvSignature(message, signature, entry);
+}
+
+function probeSignatureVariants(rawQueryString, queryParams) {
+  try {
+    const marker = '&signature=';
+    const idx = rawQueryString.lastIndexOf(marker);
+    if (idx <= 0) return { probed: false, reason: 'no signature marker' };
+
+    const base = rawQueryString.slice(0, idx);
+    const signature = queryParams.signature;
+    const keyId = queryParams.key_id;
+    if (!signature || !keyId) return { probed: false, reason: 'missing signature/key_id' };
+
+    const variants = {
+      // 1. Exatamente como recebido (o que falha hoje).
+      asReceived: base,
+      // 2. `user_id` vazio anexado: o Google pode assinar o par mesmo sem valor.
+      userIdEmptyAppended: `${base}&user_id=`,
+      // 3. `user_id` vazio na posição canônica (após transaction_id, antes de signature).
+      //    A ordem documentada é alfabética, e `user_id` viria depois de `transaction_id`.
+      userIdEmptyCanonical: base.replace(
+        /(&transaction_id=[^&]*)/,
+        '$1&user_id='
+      ),
+      // 4. Percent-encoding em minúsculas (caso algum proxy intermediário normalize).
+      lowercaseEscapes: base.replace(/%[0-9A-Fa-f]{2}/g, (m) => m.toLowerCase()),
+      // 5. Percent-encoding em maiúsculas.
+      uppercaseEscapes: base.replace(/%[0-9A-Fa-f]{2}/g, (m) => m.toUpperCase()),
+      // 6. `custom_data` decodificado (`%3A` -> `:`), caso o Google assine o valor cru.
+      decodedCustomData: base.replace(/%3A/gi, ':'),
+      // 7. Query inteira decodificada.
+      fullyDecoded: (() => {
+        try { return decodeURIComponent(base); } catch { return base; }
+      })(),
+      // 8. Prefixada com o caminho, caso a assinatura cubra mais que a query.
+      withPathPrefix: `/api/ssv/callback?${base}`,
+    };
+
+    const results = {};
+    for (const [name, message] of Object.entries(variants)) {
+      try {
+        // Reaproveita o verificador real do módulo para evitar divergência de
+        // implementação entre o diagnóstico e o caminho de produção.
+        results[name] = verifyWithKeyId(message, signature, keyId);
+      } catch (err) {
+        results[name] = `error: ${err.message}`;
+      }
+    }
+
+    const winner = Object.entries(results).find(([, v]) => v === true);
+    return {
+      probed: true,
+      results,
+      matchingVariant: winner ? winner[0] : null,
+    };
+  } catch (err) {
+    return { probed: false, reason: err.message };
+  }
+}
+
 // GET /api/ssv/callback - AdMob SSV callback (chamado pelo Google)
 // O Google envia via GET com query params assinados
 router.get('/callback', async (req, res) => {
@@ -161,6 +251,19 @@ router.get('/callback', async (req, res) => {
       if (validation.error === 'Signature verification failed') {
         console.warn('[SSV] Diagnostic', JSON.stringify(redactRawQuery(rawQueryString)));
         console.warn('[SSV] Canonical', JSON.stringify(describeCanonicalMessage(rawQueryString)));
+        // Teste de variantes: revela se ALGUMA forma da mensagem valida com a
+        // assinatura recebida. Se nenhuma validar, o problema não está na
+        // construção da mensagem e sim na origem do callback.
+        try {
+          probeKeysCache = await fetchGoogleKeys();
+        } catch (err) {
+          probeKeysCache = null;
+          console.warn('[SSV] Probe keyset fetch failed:', err.message);
+        }
+        console.warn(
+          '[SSV] Probe',
+          JSON.stringify(probeSignatureVariants(rawQueryString, queryParams))
+        );
       }
       // Retornar 200 mesmo em caso de erro para o Google não retentar
       return res.status(200).json({ success: false, error: validation.error });
