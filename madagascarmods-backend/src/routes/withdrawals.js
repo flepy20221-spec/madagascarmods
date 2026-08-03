@@ -1,5 +1,5 @@
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
@@ -59,19 +59,31 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     const { idempotency_key, points_amount } = req.body;
     const userId = req.user.userId;
 
-    // Check idempotency
-    if (idempotency_key) {
-      const existingWithdrawal = await db.query(
-        'SELECT id, status FROM withdrawals WHERE idempotency_key = $1',
-        [idempotency_key]
-      );
-      if (existingWithdrawal.rows.length > 0) {
-        return res.status(409).json({ 
-          error: 'Duplicate withdrawal request',
-          code: 'DUPLICATE',
-          withdrawal: existingWithdrawal.rows[0]
-        });
-      }
+    if (typeof idempotency_key !== 'string' || !uuidValidate(idempotency_key)) {
+      return res.status(400).json({
+        error: 'Valid idempotency_key is required',
+        code: 'INVALID_IDEMPOTENCY_KEY'
+      });
+    }
+
+    if (!Number.isSafeInteger(points_amount) || points_amount <= 0) {
+      return res.status(400).json({
+        error: 'points_amount must be a positive integer',
+        code: 'INVALID_POINTS_AMOUNT'
+      });
+    }
+
+    // A chave e globalmente unica, mas a resposta nunca devolve id/status de outro
+    // usuario. Conhecer ou adivinhar uma chave nao pode funcionar como enumeracao.
+    const existingWithdrawal = await db.query(
+      'SELECT 1 FROM withdrawals WHERE idempotency_key = $1 LIMIT 1',
+      [idempotency_key]
+    );
+    if (existingWithdrawal.rows.length > 0) {
+      return res.status(409).json({
+        error: 'Duplicate withdrawal request',
+        code: 'DUPLICATE'
+      });
     }
 
     await client.query('BEGIN');
@@ -102,19 +114,16 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
 
     // Revalidacao dentro do lock: se outra requisicao acabou de criar um saque com esta
     // mesma chave, a checagem otimista feita antes do BEGIN pode ter passado.
-    if (idempotency_key) {
-      const raceCheck = await client.query(
-        'SELECT id, status FROM withdrawals WHERE idempotency_key = $1',
-        [idempotency_key]
-      );
-      if (raceCheck.rows.length > 0) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: 'Duplicate withdrawal request',
-          code: 'DUPLICATE',
-          withdrawal: raceCheck.rows[0]
-        });
-      }
+    const raceCheck = await client.query(
+      'SELECT 1 FROM withdrawals WHERE idempotency_key = $1 LIMIT 1',
+      [idempotency_key]
+    );
+    if (raceCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Duplicate withdrawal request',
+        code: 'DUPLICATE'
+      });
     }
 
     // Get system config
@@ -178,23 +187,17 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       });
     }
 
-    // Calculate withdrawal amount
-    // Se o usuário enviou points_amount, usa esse valor (permite valores quebrados)
-    // Senão, saca tudo que tem disponível
-    let pointsToDebit;
-    if (points_amount && Number.isFinite(Number(points_amount)) && Number(points_amount) >= minPoints) {
-      pointsToDebit = Math.min(parseInt(points_amount), balance);
-    } else if (points_amount && Number(points_amount) > 0 && Number(points_amount) < minPoints) {
+    // O valor e obrigatorio e inteiro. Nunca converter payload ausente, texto,
+    // NaN, zero ou negativo em "sacar todo o saldo".
+    const pointsToDebit = points_amount;
+    if (pointsToDebit < minPoints) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: `Mínimo para saque: ${minPoints} pontos`,
         code: 'BELOW_MINIMUM',
         required: minPoints,
-        requested: Number(points_amount)
+        requested: pointsToDebit
       });
-    } else {
-      // Sem valor específico: saca tudo (sem arredondamento, aceita valores quebrados)
-      pointsToDebit = balance;
     }
 
     if (pointsToDebit > balance) {
@@ -223,13 +226,12 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
 
     // Create withdrawal with LTC as crypto currency
     const withdrawalId = uuidv4();
-    const idemKey = idempotency_key || uuidv4();
 
     await client.query(
       `INSERT INTO withdrawals (id, user_id, payout_destination_id, amount, points_debited, 
        payment_method, crypto_address, crypto_currency, status, idempotency_key, ledger_reservation_id, created_at)
        VALUES ($1, $2, $3, $4, $5, 'faucetpay', $6, 'LTC', 'PENDING', $7, $8, NOW())`,
-      [withdrawalId, userId, destination.id, amountInReal, pointsToDebit, faucetPayEmail, idemKey, reservationId]
+      [withdrawalId, userId, destination.id, amountInReal, pointsToDebit, faucetPayEmail, idempotency_key, reservationId]
     );
 
     // Audit log
@@ -255,6 +257,12 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      return res.status(409).json({
+        error: 'Duplicate withdrawal request',
+        code: 'DUPLICATE'
+      });
+    }
     console.error('Withdrawal request error:', error);
     res.status(500).json({ error: 'Failed to process withdrawal request' });
   } finally {

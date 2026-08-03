@@ -1,9 +1,9 @@
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware, rewardFraudDetection, clientIp } = require('../middleware/antiFraud');
-const { rewardLimiter } = require('../middleware/rateLimits');
+const { rewardLimiter, rewardStatusLimiter } = require('../middleware/rateLimits');
 const {
   getRewardDistribution,
   POINT_VALUES
@@ -14,6 +14,93 @@ const {
 // esse tipo de recompensa (ver auditoria VULN-01).
 
 const router = express.Router();
+
+// ============================================================================================
+// GET /api/points/reward-status/:sessionId
+//
+// Consulta somente leitura de uma exibicao rewarded especifica. O UUID da sessao e criado no
+// aparelho antes de `show()` e viaja ao Google dentro do custom_data assinado pelo SSV. A rota
+// nunca credita pontos; ela apenas observa o evento que o callback servidor-a-servidor gravou.
+// ============================================================================================
+router.get(
+  '/reward-status/:sessionId',
+  rewardStatusLimiter,
+  authenticateToken,
+  antifraudMiddleware,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      if (!uuidValidate(sessionId)) {
+        return res.status(400).json({
+          error: 'Invalid reward session',
+          code: 'INVALID_REWARD_SESSION'
+        });
+      }
+
+      const userId = req.user.userId;
+      const [eventResult, balanceResult, dailyResult] = await Promise.all([
+        db.query(
+          `SELECT id, points_awarded, created_at
+             FROM reward_events
+            WHERE user_id = $1
+              AND reward_session_id = $2
+              AND ad_type = 'rewarded'
+              AND ssv_verified = true
+            LIMIT 1`,
+          [userId, sessionId]
+        ),
+        db.query(
+          `SELECT COALESCE(SUM(amount), 0) AS balance
+             FROM points_ledger
+            WHERE user_id = $1`,
+          [userId]
+        ),
+        db.query(
+          `SELECT COUNT(*) AS count
+             FROM reward_events
+            WHERE user_id = $1
+              AND ad_type = 'rewarded'
+              AND ssv_verified = true
+              AND created_at > NOW() - INTERVAL '24 hours'`,
+          [userId]
+        )
+      ]);
+
+      const balance = parseInt(balanceResult.rows[0].balance, 10);
+      const dailyCount = parseInt(dailyResult.rows[0].count, 10);
+
+      if (eventResult.rows.length === 0) {
+        return res.status(202).json({
+          success: false,
+          pending: true,
+          code: 'SSV_PENDING',
+          message: 'Aguardando confirmacao do anuncio.',
+          newBalance: balance,
+          pointValues: POINT_VALUES,
+          dailyLimit: 100,
+          dailyCount
+        });
+      }
+
+      const event = eventResult.rows[0];
+      return res.json({
+        success: true,
+        pending: false,
+        verifiedBy: 'admob_ssv',
+        pointsAwarded: event.points_awarded,
+        newBalance: balance,
+        eventId: event.id,
+        rewardSessionId: sessionId,
+        pointValues: POINT_VALUES,
+        dailyLimit: 100,
+        dailyCount
+      });
+    } catch (error) {
+      console.error('Reward status error:', error);
+      return res.status(500).json({ error: 'Failed to get reward status' });
+    }
+  }
+);
 
 // ============================================================================================
 // POST /api/points/reward

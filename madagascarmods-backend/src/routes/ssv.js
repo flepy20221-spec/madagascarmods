@@ -9,12 +9,34 @@
  * https://madagascarmods-production.up.railway.app/api/ssv/callback
  */
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
 const { validateSsvCallback } = require('../utils/admobSsv');
 const { drawRewardPoints, POINT_VALUES } = require('../utils/pointsRandom');
 
 const router = express.Router();
+
+/**
+ * custom_data v2: `<user_uuid>:<reward_session_uuid>`.
+ *
+ * APKs antigos enviam apenas o UUID do usuario; eles continuam aceitos, mas nao
+ * possuem correlacao de sessao e usam o endpoint legado de confirmacao.
+ */
+function parseSsvIdentity(customData, fallbackUserId) {
+  const raw = String(customData || fallbackUserId || '').trim();
+  if (!raw) return null;
+
+  const parts = raw.split(':');
+  if (parts.length === 1 && uuidValidate(parts[0])) {
+    return { userId: parts[0], rewardSessionId: null, version: 1 };
+  }
+
+  if (parts.length === 2 && uuidValidate(parts[0]) && uuidValidate(parts[1])) {
+    return { userId: parts[0], rewardSessionId: parts[1], version: 2 };
+  }
+
+  return null;
+}
 
 // GET /api/ssv/callback - AdMob SSV callback (chamado pelo Google)
 // O Google envia via GET com query params assinados
@@ -46,24 +68,28 @@ router.get('/callback', async (req, res) => {
 
     const { data } = validation;
 
-    // Extrair user_id do custom_data (enviado pelo app)
-    // O custom_data contém o userId do nosso sistema
-    const userId = data.customData || data.userId;
-
-    if (!userId) {
-      console.warn('[SSV] No user_id in callback');
-      return res.status(200).json({ success: false, error: 'No user_id' });
+    // Extrair identidade e sessao do custom_data. O formato v2 permite ao app
+    // consultar exatamente o anuncio atual; o formato v1 preserva APKs existentes.
+    const identity = parseSsvIdentity(data.customData, data.userId);
+    if (!identity) {
+      console.warn('[SSV] Missing or malformed user/session identity');
+      return res.status(200).json({ success: false, error: 'Invalid user identity' });
     }
+    const { userId, rewardSessionId } = identity;
 
-    // Verificar se o transaction_id já foi processado (anti-replay)
-    if (data.transactionId) {
+    // Verificar transaction_id e sessao antes da transacao para responder de forma
+    // idempotente. Os indices UNIQUE continuam sendo a protecao atomica definitiva.
+    if (data.transactionId || rewardSessionId) {
       const existing = await db.query(
-        `SELECT id FROM reward_events WHERE ssv_transaction_id = $1 LIMIT 1`,
-        [data.transactionId]
+        `SELECT id FROM reward_events
+          WHERE ($1::text IS NOT NULL AND ssv_transaction_id = $1)
+             OR ($2::uuid IS NOT NULL AND reward_session_id = $2)
+          LIMIT 1`,
+        [data.transactionId || null, rewardSessionId]
       );
 
       if (existing.rows.length > 0) {
-        console.log('[SSV] Duplicate transaction:', data.transactionId);
+        console.log('[SSV] Duplicate callback ignored');
         return res.status(200).json({ success: true, message: 'Already processed' });
       }
     }
@@ -103,8 +129,10 @@ router.get('/callback', async (req, res) => {
       // Registrar evento de reward com SSV verificado
       const eventId = uuidv4();
       await client.query(
-        `INSERT INTO reward_events (id, user_id, ad_type, ad_network, ad_unit_id, points_awarded, ssv_token, ssv_verified, ssv_transaction_id, ip_address)
-         VALUES ($1, $2, 'rewarded', $3, $4, $5, $6, true, $7, $8)`,
+        `INSERT INTO reward_events
+           (id, user_id, ad_type, ad_network, ad_unit_id, points_awarded,
+            ssv_token, ssv_verified, ssv_transaction_id, reward_session_id, ip_address)
+         VALUES ($1, $2, 'rewarded', $3, $4, $5, $6, true, $7, $8, $9)`,
         [
           eventId, userId,
           data.adNetwork || 'admob',
@@ -112,6 +140,7 @@ router.get('/callback', async (req, res) => {
           pointsToAward,
           JSON.stringify(queryParams),
           data.transactionId || null,
+          rewardSessionId,
           req.headers['x-forwarded-for'] || req.socket.remoteAddress
         ]
       );
@@ -126,12 +155,20 @@ router.get('/callback', async (req, res) => {
 
       await client.query('COMMIT');
 
-      console.log(`[SSV] Credited ${pointsToAward} pts to user ${userId} (tx: ${data.transactionId})`);
+      console.log('[SSV] Reward credited', {
+        points: pointsToAward,
+        sessionCorrelated: Boolean(rewardSessionId),
+        customDataVersion: identity.version
+      });
 
       // Retornar 200 para o Google saber que processamos
       res.status(200).json({ success: true, pointsAwarded: pointsToAward });
     } catch (err) {
       await client.query('ROLLBACK');
+      if (err.code === '23505') {
+        console.log('[SSV] Concurrent duplicate callback ignored');
+        return res.status(200).json({ success: true, message: 'Already processed' });
+      }
       throw err;
     } finally {
       client.release();
@@ -160,3 +197,4 @@ router.get('/verify', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.parseSsvIdentity = parseSsvIdentity;

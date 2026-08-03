@@ -2,6 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { payoutSetupLimiter } = require('../middleware/rateLimits');
 const { encrypt, hashValue } = require('../utils/crypto');
 
@@ -92,7 +93,7 @@ router.get('/status', authenticateToken, async (req, res) => {
 // POST /api/pix/submit - Submit PIX account for approval
 // payoutSetupLimiter: 10 tentativas/hora por usuario. Sem esse limite, o endpoint podia
 // ser usado para testar CPFs em massa contra as validacoes do servidor. (auditoria VULN-10)
-router.post('/submit', payoutSetupLimiter, authenticateToken, async (req, res) => {
+router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddleware, async (req, res) => {
   try {
     const { cpf, full_name, pix_key_type, pix_key_value } = req.body;
     const userId = req.user.userId;

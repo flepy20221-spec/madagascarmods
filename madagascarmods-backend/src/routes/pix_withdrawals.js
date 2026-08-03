@@ -1,5 +1,5 @@
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: uuidValidate } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
@@ -21,19 +21,29 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     const { idempotency_key, points_amount } = req.body;
     const userId = req.user.userId;
 
-    // Check idempotency
-    if (idempotency_key) {
-      const existingWithdrawal = await db.query(
-        'SELECT id, status FROM withdrawals WHERE idempotency_key = $1',
-        [idempotency_key]
-      );
-      if (existingWithdrawal.rows.length > 0) {
-        return res.status(409).json({
-          error: 'Solicitação de saque duplicada',
-          code: 'DUPLICATE',
-          withdrawal: existingWithdrawal.rows[0]
-        });
-      }
+    if (typeof idempotency_key !== 'string' || !uuidValidate(idempotency_key)) {
+      return res.status(400).json({
+        error: 'Valid idempotency_key is required',
+        code: 'INVALID_IDEMPOTENCY_KEY'
+      });
+    }
+
+    if (!Number.isSafeInteger(points_amount) || points_amount <= 0) {
+      return res.status(400).json({
+        error: 'points_amount must be a positive integer',
+        code: 'INVALID_POINTS_AMOUNT'
+      });
+    }
+
+    const existingWithdrawal = await db.query(
+      'SELECT 1 FROM withdrawals WHERE idempotency_key = $1 LIMIT 1',
+      [idempotency_key]
+    );
+    if (existingWithdrawal.rows.length > 0) {
+      return res.status(409).json({
+        error: 'Solicitacao de saque duplicada',
+        code: 'DUPLICATE'
+      });
     }
 
     await client.query('BEGIN');
@@ -48,19 +58,16 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     );
 
     // Revalidacao da idempotencia dentro do lock
-    if (idempotency_key) {
-      const raceCheck = await client.query(
-        'SELECT id, status FROM withdrawals WHERE idempotency_key = $1',
-        [idempotency_key]
-      );
-      if (raceCheck.rows.length > 0) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: 'Solicitacao de saque duplicada',
-          code: 'DUPLICATE',
-          withdrawal: raceCheck.rows[0]
-        });
-      }
+    const raceCheck = await client.query(
+      'SELECT 1 FROM withdrawals WHERE idempotency_key = $1 LIMIT 1',
+      [idempotency_key]
+    );
+    if (raceCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Solicitacao de saque duplicada',
+        code: 'DUPLICATE'
+      });
     }
 
     // Get system config
@@ -129,25 +136,18 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       });
     }
 
-    // Calculate withdrawal amount
-    let pointsToDebit;
-    if (points_amount && Number.isFinite(Number(points_amount)) && Number(points_amount) >= minPoints) {
-      pointsToDebit = Math.min(parseInt(points_amount), balance);
-    } else if (points_amount && Number(points_amount) > 0 && Number(points_amount) < minPoints) {
+    const pointsToDebit = points_amount;
+    if (pointsToDebit < minPoints) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: `Mínimo para saque: ${minPoints} pontos`,
         code: 'BELOW_MINIMUM',
         required: minPoints,
-        requested: Number(points_amount)
+        requested: pointsToDebit
       });
-    } else {
-      pointsToDebit = balance;
     }
 
-    // Guarda final: o fluxo PIX nao tinha esta verificacao (o FaucetPay tinha).
-    // Protege contra qualquer caminho que resulte em debito acima do saldo.
-    if (pointsToDebit > balance || pointsToDebit <= 0) {
+    if (pointsToDebit > balance) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: 'Saldo insuficiente para o valor solicitado',
@@ -169,7 +169,6 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
 
     // Create withdrawal record
     const withdrawalId = uuidv4();
-    const idemKey = idempotency_key || uuidv4();
 
     await client.query(
       `INSERT INTO withdrawals (id, user_id, payout_destination_id, amount, points_debited, 
@@ -177,7 +176,7 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
        VALUES ($1, $2, $3, $4, $5, 'pix', $6, 'BRL', 'PENDING', $7, $8, NOW())`,
       [withdrawalId, userId, pixAccount.id, amountInReal, pointsToDebit,
        JSON.stringify({ cpf: pixAccount.cpf, full_name: pixAccount.full_name, pix_key_type: pixAccount.pix_key_type, pix_key_value: pixAccount.pix_key_value }),
-       idemKey, reservationId]
+       idempotency_key, reservationId]
     );
 
     // Audit log
@@ -204,6 +203,12 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      return res.status(409).json({
+        error: 'Solicitacao de saque duplicada',
+        code: 'DUPLICATE'
+      });
+    }
     console.error('PIX withdrawal request error:', error);
     res.status(500).json({ error: 'Falha ao processar solicitação de saque PIX' });
   } finally {

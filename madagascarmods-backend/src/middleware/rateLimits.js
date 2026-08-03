@@ -65,6 +65,25 @@ const rewardLimiter = rateLimit({
 });
 
 /**
+ * Polling leve do status SSV por sessao.
+ *
+ * O app usa backoff curto durante poucos segundos depois de fechar o anuncio.
+ * Trinta consultas por minuto acomodam variacao de rede sem permitir loops
+ * indefinidos que pressionem PostgreSQL ou enumerem sessoes em volume.
+ */
+const rewardStatusLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  keyGenerator: userOrTokenKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Muitas consultas de confirmacao. Aguarde alguns segundos.',
+    code: 'REWARD_STATUS_RATE_LIMIT'
+  }
+});
+
+/**
  * Limite das rotas de saque (FaucetPay e PIX).
  * Um usuario legitimo faz poucos saques por hora; 5 e folgado.
  */
@@ -133,6 +152,7 @@ const authLimiter = rateLimit({
 
 module.exports = {
   rewardLimiter,
+  rewardStatusLimiter,
   withdrawalLimiter,
   adminLoginLimiter,
   payoutSetupLimiter,
