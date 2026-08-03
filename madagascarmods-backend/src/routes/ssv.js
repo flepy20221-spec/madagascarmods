@@ -38,6 +38,54 @@ function parseSsvIdentity(customData, fallbackUserId) {
   return null;
 }
 
+/**
+ * Descreve a ESTRUTURA de uma query crua de SSV sem expor PII nem material de
+ * assinatura. Usado apenas quando a verificação falha, para diagnosticar ordem
+ * de parâmetros, parâmetros inesperados e normalização feita por proxies.
+ *
+ * Campos sensíveis viram metadados: comprimento, presença de percent-encoding e
+ * um prefixo curto. Nunca o valor completo.
+ */
+function redactRawQuery(rawQueryString) {
+  if (typeof rawQueryString !== 'string' || rawQueryString.length === 0) {
+    return { present: false };
+  }
+
+  const SENSITIVE = new Set(['signature', 'custom_data', 'user_id']);
+  const pairs = rawQueryString.split('&');
+
+  return {
+    present: true,
+    totalLength: rawQueryString.length,
+    paramCount: pairs.length,
+    // Ordem exata das chaves — revela se signature/key_id são os dois últimos.
+    keyOrder: pairs.map((pair) => {
+      const eq = pair.indexOf('=');
+      return eq >= 0 ? pair.slice(0, eq) : pair;
+    }),
+    params: pairs.map((pair) => {
+      const eq = pair.indexOf('=');
+      const key = eq >= 0 ? pair.slice(0, eq) : pair;
+      const value = eq >= 0 ? pair.slice(eq + 1) : '';
+
+      const meta = {
+        key,
+        valueLength: value.length,
+        hasPercentEncoding: /%[0-9A-Fa-f]{2}/.test(value),
+        hasPlus: value.includes('+'),
+      };
+
+      if (!SENSITIVE.has(key)) {
+        meta.value = value;
+      } else {
+        meta.prefix = value.slice(0, 8);
+      }
+
+      return meta;
+    }),
+  };
+}
+
 // GET /api/ssv/callback - AdMob SSV callback (chamado pelo Google)
 // O Google envia via GET com query params assinados
 router.get('/callback', async (req, res) => {
@@ -62,6 +110,11 @@ router.get('/callback', async (req, res) => {
 
     if (!validation.valid) {
       console.warn('[SSV] Invalid callback:', validation.error);
+      // Diagnóstico estrutural (sem PII) para falhas de assinatura. Sem estes
+      // dados é impossível distinguir ordem de parâmetros de normalização do proxy.
+      if (validation.error === 'Signature verification failed') {
+        console.warn('[SSV] Diagnostic', JSON.stringify(redactRawQuery(rawQueryString)));
+      }
       // Retornar 200 mesmo em caso de erro para o Google não retentar
       return res.status(200).json({ success: false, error: validation.error });
     }
@@ -198,3 +251,4 @@ router.get('/verify', async (req, res) => {
 
 module.exports = router;
 module.exports.parseSsvIdentity = parseSsvIdentity;
+module.exports.redactRawQuery = redactRawQuery;

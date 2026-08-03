@@ -160,6 +160,13 @@ function buildVerificationMessage(queryParams, rawQueryString = null) {
   // O Google exige os bytes exatos recebidos antes de `&signature=`. Usar a
   // query crua evita alterar ordem, percent-encoding, espaços ou caracteres
   // especiais de custom_data/user_id durante o parse do Express.
+  //
+  // Documentação oficial: os dois últimos parâmetros são sempre `signature` e
+  // `key_id`, nessa ordem. Porém proxies e integrações podem anexar parâmetros
+  // extras depois deles (ex.: `?...&signature=X&key_id=Y&utm_source=Z`). Nesse
+  // caso, cortar apenas "tudo antes de &signature" mantém o conteúdo assinado
+  // correto, mas se `signature` NÃO for o penúltimo parâmetro é preciso remover
+  // cirurgicamente os pares `signature` e `key_id` preservando todo o resto.
   if (typeof rawQueryString === 'string' && rawQueryString.length > 0) {
     const signatureMarker = '&signature=';
     const signatureIndex = rawQueryString.lastIndexOf(signatureMarker);
@@ -168,7 +175,31 @@ function buildVerificationMessage(queryParams, rawQueryString = null) {
       throw new Error('Raw SSV query has no signature marker');
     }
 
-    return rawQueryString.slice(0, signatureIndex);
+    const beforeSignature = rawQueryString.slice(0, signatureIndex);
+    const afterSignature = rawQueryString.slice(signatureIndex + 1);
+
+    // Caso canônico: `signature=...&key_id=...` encerra a query.
+    const trailingPairs = afterSignature.split('&');
+    const isCanonicalTail =
+      trailingPairs.length === 2 &&
+      trailingPairs[0].startsWith('signature=') &&
+      trailingPairs[1].startsWith('key_id=');
+
+    if (isCanonicalTail) {
+      return beforeSignature;
+    }
+
+    // Cauda inesperada: reconstruir preservando os bytes originais de cada par,
+    // descartando somente `signature` e `key_id`.
+    const preserved = rawQueryString
+      .split('&')
+      .filter((pair) => {
+        const eq = pair.indexOf('=');
+        const key = eq >= 0 ? pair.slice(0, eq) : pair;
+        return key !== 'signature' && key !== 'key_id';
+      });
+
+    return preserved.join('&');
   }
 
   // Fallback para chamadas internas/testes antigos que fornecem apenas objeto.
