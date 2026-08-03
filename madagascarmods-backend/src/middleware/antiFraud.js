@@ -220,12 +220,28 @@ async function antifraudMiddleware(req, res, next) {
 }
 
 /**
+ * A rota rewarded do app nao credita pontos: ela apenas consulta se o callback
+ * SSV do Google ja chegou. Aplicar regras de velocidade de credito a esse
+ * polling produz falsos positivos, pois o evento SSV acabou de ser criado por
+ * definicao. Interstitial e banner continuam sujeitos a deteccao de padrao.
+ */
+function shouldRunRewardPatternDetection(req) {
+  return req.body?.ad_type !== 'rewarded';
+}
+
+/**
  * Deteccao de padroes de fraude no reward.
  * Roda depois da autenticacao e da validacao de integridade.
  * Nao bloqueia sozinho: calcula req.fraudScore, que a rota usa para decidir.
  */
 async function rewardFraudDetection(req, res, next) {
   try {
+    if (!shouldRunRewardPatternDetection(req)) {
+      req.fraudFlags = [];
+      req.fraudScore = 0;
+      return next();
+    }
+
     const userId = req.user?.userId;
     if (!userId) return next();
 
@@ -379,6 +395,7 @@ function logSuspicion(req, type, severity, details = {}) {
 module.exports = {
   antifraudMiddleware,
   rewardFraudDetection,
+  shouldRunRewardPatternDetection,
   validateSignature,
   canonicalPath,
   clientIp,
