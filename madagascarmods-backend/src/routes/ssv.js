@@ -271,6 +271,11 @@ router.get('/callback', async (req, res) => {
 
     const { data } = validation;
 
+    // `messageForm` indica se a assinatura validou sobre a query crua ou sobre a
+    // decodificada. Em callbacks com `custom_data` percent-encoded o esperado é
+    // `decoded`, conforme a implementação de referência do AdMob.
+    console.log('[SSV] Signature verified', { messageForm: validation.messageForm });
+
     // Extrair identidade e sessao do custom_data. O formato v2 permite ao app
     // consultar exatamente o anuncio atual; o formato v1 preserva APKs existentes.
     const identity = parseSsvIdentity(data.customData, data.userId);

@@ -87,7 +87,7 @@ function publicKeyFromEntry(keyEntry) {
  * @param {Object} queryParams - Parâmetros do callback (req.query)
  * @returns {Object} { valid: boolean, data: object, error?: string }
  */
-async function validateSsvCallback(queryParams, rawQueryString = null) {
+async function validateSsvCallback(queryParams, rawQueryString = null, keyOverride = null) {
   try {
     const { signature, key_id, ...params } = queryParams;
 
@@ -95,23 +95,52 @@ async function validateSsvCallback(queryParams, rawQueryString = null) {
       return { valid: false, error: 'Missing signature or key_id' };
     }
 
-    // Buscar chaves públicas do Google
-    const keys = await fetchGoogleKeys();
+    // Buscar chaves públicas do Google (keyOverride existe apenas para testes).
+    const keys = Array.isArray(keyOverride) ? keyOverride : await fetchGoogleKeys();
     const keyEntry = keys.find(k => String(k.keyId) === String(key_id));
 
     if (!keyEntry) {
       return { valid: false, error: `Key ID ${key_id} not found in Google's public keys` };
     }
 
-    // Construir a mensagem que foi assinada (todos os params exceto signature e key_id, na ordem da URL)
-    // O Google assina a query string completa antes de signature e key_id
-    const message = buildVerificationMessage(queryParams, rawQueryString);
+    // Construir a mensagem que foi assinada (todos os params exceto signature e
+    // key_id, na ordem exata em que chegaram na URL).
+    const rawMessage = buildVerificationMessage(queryParams, rawQueryString);
 
-    const isValid = verifySsvSignature(message, signature, keyEntry);
+    // A implementação de referência do AdMob monta o conteúdo assinado a partir
+    // de `URI.getQuery()`, que em Java devolve a query DECODIFICADA
+    // (`getRawQuery()` é a variante crua). A própria documentação avisa, na
+    // seção "Custom data": "The custom reward string is percent escaped and
+    // might require decoding when parsed from the SSV callback."
+    //
+    // Enquanto `custom_data` não contém caracteres escapados, a forma crua e a
+    // decodificada são idênticas e a verificação passa nas duas. No formato
+    // `<user_uuid>%3A<session_uuid>` elas divergem em 2 bytes por `%3A`, e a
+    // verificação sobre os bytes crus falha sempre.
+    //
+    // Testamos as duas formas: ambas derivam dos mesmos bytes recebidos, então
+    // aceitar qualquer uma não enfraquece a segurança — a assinatura só valida
+    // para a mensagem que o Google realmente assinou.
+    const candidates = [rawMessage];
+    const decodedMessage = safeDecodeMessage(rawMessage);
+    if (decodedMessage !== null && decodedMessage !== rawMessage) {
+      candidates.push(decodedMessage);
+    }
+
+    let isValid = false;
+    let matchedForm = null;
+    for (const candidate of candidates) {
+      if (verifySsvSignature(candidate, signature, keyEntry)) {
+        isValid = true;
+        matchedForm = candidate === rawMessage ? 'raw' : 'decoded';
+        break;
+      }
+    }
 
     if (isValid) {
       return {
         valid: true,
+        messageForm: matchedForm,
         data: {
           adNetwork: params.ad_network,
           adUnit: params.ad_unit,
@@ -128,6 +157,25 @@ async function validateSsvCallback(queryParams, rawQueryString = null) {
     return { valid: false, error: 'Signature verification failed' };
   } catch (err) {
     return { valid: false, error: `SSV validation error: ${err.message}` };
+  }
+}
+
+/**
+ * Decodifica percent-encoding de forma tolerante.
+ *
+ * `decodeURIComponent` lança URIError em sequências mal formadas (ex.: um `%`
+ * literal não escapado). Como a mensagem é apenas um candidato de verificação,
+ * uma falha de decodificação não deve derrubar o callback: devolvemos null e o
+ * chamador segue usando somente a forma crua.
+ */
+function safeDecodeMessage(message) {
+  if (typeof message !== 'string' || !message.includes('%')) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(message);
+  } catch (err) {
+    return null;
   }
 }
 
