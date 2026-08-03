@@ -155,6 +155,90 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       });
     }
 
+    // ========================================================================
+    // VERIFICACAO DE LEGITIMIDADE DOS PONTOS (anti-automacao)
+    //
+    // Um usuario legitimo acumula a maioria dos pontos via rewarded (SSV).
+    // Um bot que explora interstitial/banner acumula 100% dos pontos sem SSV.
+    //
+    // Regra: se a conta tem 0 reward_events com ssv_verified=true MAS tem
+    // saldo suficiente para sacar, os pontos vieram exclusivamente de
+    // interstitial/banner (exploravel por automacao). Bloquear e banir.
+    //
+    // Excecao: contas com pontos creditados manualmente pelo admin (ADMIN_CREDIT)
+    // nao devem ser bloqueadas.
+    // ========================================================================
+    const ssvCheck = await client.query(
+      `SELECT COUNT(*) as ssv_count FROM reward_events
+       WHERE user_id = $1 AND ssv_verified = true`,
+      [userId]
+    );
+    const ssvCount = parseInt(ssvCheck.rows[0].ssv_count, 10);
+
+    const adminCreditCheck = await client.query(
+      `SELECT COUNT(*) as admin_count FROM points_ledger
+       WHERE user_id = $1 AND transaction_type = 'ADMIN_CREDIT'`,
+      [userId]
+    );
+    const adminCreditCount = parseInt(adminCreditCheck.rows[0].admin_count, 10);
+
+    // Se tem saldo para sacar mas ZERO rewards SSV e ZERO creditos admin = bot
+    if (ssvCount === 0 && adminCreditCount === 0 && balance >= minPoints) {
+      await client.query('ROLLBACK');
+
+      // Auto-ban: acumulou saldo apenas via interstitial/banner (automacao)
+      await db.query(
+        `UPDATE users SET
+          is_banned = true,
+          ban_reason = 'Auto-ban: saque sem nenhum reward SSV verificado (automacao de interstitial/banner)',
+          fraud_score = COALESCE(fraud_score, 0) + 10,
+          last_fraud_at = NOW(),
+          banned_at = NOW(),
+          updated_at = NOW()
+         WHERE id = $1 AND is_banned = false`,
+        [userId]
+      ).catch(() => {});
+
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ($1, 'system', 'WITHDRAWAL_BOT_BAN', 'user', $1, $2, $3)`,
+        [userId, JSON.stringify({ ssvCount, balance, reason: 'zero_ssv_with_balance' }), req.headers['x-forwarded-for'] || req.socket?.remoteAddress]
+      ).catch(() => {});
+
+      console.warn(`[Withdrawal] AUTO-BAN user ${userId}: attempted withdrawal with 0 SSV rewards`);
+
+      return res.status(403).json({
+        error: 'Conta suspensa por atividade irregular.',
+        code: 'ACCOUNT_BANNED'
+      });
+    }
+
+    // Verificacao adicional: ratio SSV muito baixo comparado ao saldo
+    // Se tem menos de 20% dos pontos vindos de SSV, flag de suspeita
+    const totalFromSsv = await client.query(
+      `SELECT COALESCE(SUM(points_awarded), 0) as total FROM reward_events
+       WHERE user_id = $1 AND ssv_verified = true`,
+      [userId]
+    );
+    const ssvPoints = parseInt(totalFromSsv.rows[0].total, 10);
+    const ssvRatio = balance > 0 ? ssvPoints / balance : 0;
+
+    if (ssvRatio < 0.2 && ssvCount > 0 && balance >= minPoints * 2) {
+      // Nao bane, mas registra suspeita e incrementa fraud_score
+      await db.query(
+        `UPDATE users SET fraud_score = COALESCE(fraud_score, 0) + 2, last_fraud_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [userId]
+      ).catch(() => {});
+
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ($1, 'system', 'LOW_SSV_RATIO_WITHDRAWAL', 'user', $1, $2, $3)`,
+        [userId, JSON.stringify({ ssvRatio: ssvRatio.toFixed(2), ssvPoints, balance }), req.headers['x-forwarded-for'] || req.socket?.remoteAddress]
+      ).catch(() => {});
+
+      console.warn(`[Withdrawal] LOW SSV RATIO for user ${userId}: ${(ssvRatio*100).toFixed(0)}% (${ssvPoints}/${balance})`);
+    }
+
     // Check approved payout destination
     const destResult = await client.query(
       `SELECT id, value_encrypted, value_masked FROM payout_destinations 

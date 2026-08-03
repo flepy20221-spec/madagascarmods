@@ -104,6 +104,35 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       });
     }
 
+    // ========================================================================
+    // VERIFICACAO DE LEGITIMIDADE (mesma logica de withdrawals.js)
+    // ========================================================================
+    const ssvCheck = await client.query(
+      `SELECT COUNT(*) as ssv_count FROM reward_events WHERE user_id = $1 AND ssv_verified = true`,
+      [userId]
+    );
+    const ssvCount = parseInt(ssvCheck.rows[0].ssv_count, 10);
+
+    const adminCreditCheck = await client.query(
+      `SELECT COUNT(*) as admin_count FROM points_ledger WHERE user_id = $1 AND transaction_type = 'ADMIN_CREDIT'`,
+      [userId]
+    );
+    const adminCreditCount = parseInt(adminCreditCheck.rows[0].admin_count, 10);
+
+    if (ssvCount === 0 && adminCreditCount === 0 && balance >= minPoints) {
+      await client.query('ROLLBACK');
+      await db.query(
+        `UPDATE users SET is_banned = true, ban_reason = 'Auto-ban: saque PIX sem nenhum reward SSV verificado', fraud_score = COALESCE(fraud_score, 0) + 10, last_fraud_at = NOW(), banned_at = NOW(), updated_at = NOW() WHERE id = $1 AND is_banned = false`,
+        [userId]
+      ).catch(() => {});
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address) VALUES ($1, 'system', 'WITHDRAWAL_BOT_BAN', 'user', $1, $2, $3)`,
+        [userId, JSON.stringify({ ssvCount, balance, method: 'pix' }), req.headers['x-forwarded-for'] || req.socket?.remoteAddress]
+      ).catch(() => {});
+      console.warn(`[PixWithdrawal] AUTO-BAN user ${userId}: attempted PIX withdrawal with 0 SSV rewards`);
+      return res.status(403).json({ error: 'Conta suspensa por atividade irregular.', code: 'ACCOUNT_BANNED' });
+    }
+
     // Check approved PIX account
     const pixResult = await client.query(
       `SELECT id, cpf, full_name, pix_key_type, pix_key_value, pix_key_masked FROM pix_accounts 
