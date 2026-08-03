@@ -1326,4 +1326,345 @@ router.post('/users/:id/allow-device-change', authenticateAdmin, requireRole('su
   }
 });
 
+// ============ USER DETAIL ============
+
+// GET /api/admin/users/:id - Get full user details
+router.get('/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const userResult = await db.query(
+      `SELECT u.id, u.email, u.device_id, u.device_model, u.ip_address, u.app_version,
+              u.is_active, u.is_banned, u.ban_reason, u.banned_at, u.banned_by,
+              u.fraud_score, u.last_fraud_at, u.device_migration_allowed,
+              u.created_at, u.updated_at, u.last_login_at,
+              COALESCE(SUM(pl.amount), 0) as balance
+       FROM users u
+       LEFT JOIN points_ledger pl ON pl.user_id = u.id
+       WHERE u.id = $1
+       GROUP BY u.id`,
+      [id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Usu\u00e1rio n\u00e3o encontrado' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Stats
+    const statsResult = await db.query(
+      `SELECT 
+        COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) as total_earned,
+        COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) as total_spent,
+        COUNT(CASE WHEN amount > 0 THEN 1 END) as total_rewards,
+        COUNT(*) as total_transactions
+       FROM points_ledger WHERE user_id = $1`,
+      [id]
+    );
+
+    const todayResult = await db.query(
+      `SELECT COUNT(*) as count, COALESCE(SUM(points_awarded), 0) as total
+       FROM reward_events WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
+      [id]
+    );
+
+    // Payout destinations
+    const payoutResult = await db.query(
+      `SELECT id, type, value_masked, status, version, submitted_at, reviewed_at, rejection_reason
+       FROM payout_destinations WHERE user_id = $1 AND is_active = true
+       ORDER BY submitted_at DESC`,
+      [id]
+    );
+
+    // PIX accounts
+    const pixResult = await db.query(
+      `SELECT id, cpf, full_name, pix_key_type, pix_key_value, pix_key_masked, status, submitted_at, reviewed_at, rejection_reason
+       FROM pix_accounts WHERE user_id = $1 AND is_active = true
+       ORDER BY submitted_at DESC`,
+      [id]
+    );
+
+    // Withdrawals summary
+    const withdrawalsResult = await db.query(
+      `SELECT id, amount, points_debited, payment_method, status, crypto_currency, created_at, processed_at
+       FROM withdrawals WHERE user_id = $1
+       ORDER BY created_at DESC LIMIT 20`,
+      [id]
+    );
+
+    res.json({
+      success: true,
+      user: {
+        ...user,
+        stats: {
+          totalEarned: parseInt(statsResult.rows[0].total_earned),
+          totalSpent: parseInt(statsResult.rows[0].total_spent),
+          totalRewards: parseInt(statsResult.rows[0].total_rewards),
+          totalTransactions: parseInt(statsResult.rows[0].total_transactions),
+          todayRewards: parseInt(todayResult.rows[0].count),
+          todayEarned: parseInt(todayResult.rows[0].total)
+        },
+        payoutDestinations: payoutResult.rows,
+        pixAccounts: pixResult.rows,
+        withdrawals: withdrawalsResult.rows
+      }
+    });
+  } catch (error) {
+    console.error('Get user detail error:', error);
+    res.status(500).json({ error: 'Falha ao obter detalhes do usu\u00e1rio' });
+  }
+});
+
+// GET /api/admin/users/:id/history - Get user points history
+router.get('/users/:id/history', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+    const offset = (page - 1) * limit;
+    const type = req.query.type || '';
+
+    let query = `SELECT id, amount, transaction_type, reference_id, description, created_at
+                 FROM points_ledger WHERE user_id = $1`;
+    const params = [id];
+
+    if (type) {
+      query += ` AND transaction_type = $2`;
+      params.push(type);
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+
+    const result = await db.query(query, params);
+
+    let countQuery = 'SELECT COUNT(*) as total FROM points_ledger WHERE user_id = $1';
+    const countParams = [id];
+    if (type) {
+      countQuery += ' AND transaction_type = $2';
+      countParams.push(type);
+    }
+    const countResult = await db.query(countQuery, countParams);
+
+    res.json({
+      success: true,
+      transactions: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: parseInt(countResult.rows[0].total),
+        totalPages: Math.ceil(parseInt(countResult.rows[0].total) / limit)
+      }
+    });
+  } catch (error) {
+    console.error('User history error:', error);
+    res.status(500).json({ error: 'Falha ao obter hist\u00f3rico' });
+  }
+});
+
+// GET /api/admin/users/:id/rewards - Get user reward events
+router.get('/users/:id/rewards', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+    const offset = (page - 1) * limit;
+
+    const result = await db.query(
+      `SELECT id, ad_type, ad_network, ad_unit_id, points_awarded, ssv_verified,
+              reward_session_id, device_id, ip_address, created_at
+       FROM reward_events WHERE user_id = $1
+       ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+      [id, limit, offset]
+    );
+
+    const countResult = await db.query(
+      'SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1',
+      [id]
+    );
+
+    res.json({
+      success: true,
+      rewards: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: parseInt(countResult.rows[0].total),
+        totalPages: Math.ceil(parseInt(countResult.rows[0].total) / limit)
+      }
+    });
+  } catch (error) {
+    console.error('User rewards error:', error);
+    res.status(500).json({ error: 'Falha ao obter recompensas' });
+  }
+});
+
+// POST /api/admin/payout-destinations/:id/revoke - Revoke a payout destination
+router.post('/payout-destinations/:id/revoke', authenticateAdmin, requireRole('finance'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const result = await db.query(
+      `UPDATE payout_destinations SET status = 'REVOKED', rejection_reason = $1, updated_at = NOW()
+       WHERE id = $2 AND status = 'APPROVED'
+       RETURNING id, user_id`,
+      [reason || 'Revogado pelo admin', id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Destino n\u00e3o encontrado ou n\u00e3o est\u00e1 aprovado' });
+    }
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'admin', 'PAYOUT_DESTINATION_REVOKED', 'payout_destination', $2, $3, $4)`,
+      [req.admin.id, id, JSON.stringify({ reason }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+    );
+
+    res.json({ success: true, message: 'Destino de pagamento revogado' });
+  } catch (error) {
+    console.error('Revoke payout destination error:', error);
+    res.status(500).json({ error: 'Falha ao revogar destino' });
+  }
+});
+
+// POST /api/admin/pix-accounts/:id/revoke - Revoke a PIX account
+router.post('/pix-accounts/:id/revoke', authenticateAdmin, requireRole('finance'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const result = await db.query(
+      `UPDATE pix_accounts SET status = 'REVOKED', rejection_reason = $1, updated_at = NOW()
+       WHERE id = $2 AND status = 'APPROVED'
+       RETURNING id, user_id`,
+      [reason || 'Revogado pelo admin', id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Conta PIX n\u00e3o encontrada ou n\u00e3o est\u00e1 aprovada' });
+    }
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'admin', 'PIX_ACCOUNT_REVOKED', 'pix_account', $2, $3, $4)`,
+      [req.admin.id, id, JSON.stringify({ reason }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+    );
+
+    res.json({ success: true, message: 'Conta PIX revogada' });
+  } catch (error) {
+    console.error('Revoke PIX account error:', error);
+    res.status(500).json({ error: 'Falha ao revogar conta PIX' });
+  }
+});
+
+// GET /api/admin/audit-log - Get audit log
+router.get('/audit-log', authenticateAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+    const offset = (page - 1) * limit;
+    const action = req.query.action || '';
+    const targetId = req.query.target_id || '';
+
+    let query = `SELECT al.id, al.actor_id, al.actor_type, al.action, al.target_type, al.target_id,
+                        al.old_value, al.new_value, al.ip_address, al.created_at,
+                        COALESCE(au.email, au2.email) as actor_email
+                 FROM audit_log al
+                 LEFT JOIN admin_users au ON al.actor_id = au.id AND al.actor_type = 'admin'
+                 LEFT JOIN users au2 ON al.actor_id = au2.id AND al.actor_type = 'user'
+                 WHERE 1=1`;
+    const params = [];
+
+    if (action) {
+      params.push(action);
+      query += ` AND al.action = $${params.length}`;
+    }
+    if (targetId) {
+      params.push(targetId);
+      query += ` AND al.target_id = $${params.length}`;
+    }
+
+    query += ` ORDER BY al.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+
+    const result = await db.query(query, params);
+
+    let countQuery = 'SELECT COUNT(*) as total FROM audit_log WHERE 1=1';
+    const countParams = [];
+    if (action) {
+      countParams.push(action);
+      countQuery += ` AND action = $${countParams.length}`;
+    }
+    if (targetId) {
+      countParams.push(targetId);
+      countQuery += ` AND target_id = $${countParams.length}`;
+    }
+    const countResult = await db.query(countQuery, countParams);
+
+    res.json({
+      success: true,
+      entries: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: parseInt(countResult.rows[0].total),
+        totalPages: Math.ceil(parseInt(countResult.rows[0].total) / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Audit log error:', error);
+    res.status(500).json({ error: 'Falha ao obter log de auditoria' });
+  }
+});
+
+// GET /api/admin/system-config - Get system configuration
+router.get('/system-config', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await db.query('SELECT key, value, updated_at FROM system_config ORDER BY key');
+    const config = {};
+    result.rows.forEach(row => {
+      try {
+        config[row.key] = { value: JSON.parse(row.value), updatedAt: row.updated_at };
+      } catch {
+        config[row.key] = { value: row.value, updatedAt: row.updated_at };
+      }
+    });
+    res.json({ success: true, config });
+  } catch (error) {
+    console.error('System config error:', error);
+    res.status(500).json({ error: 'Falha ao obter configura\u00e7\u00f5es' });
+  }
+});
+
+// PUT /api/admin/system-config - Update system configuration
+router.put('/system-config', authenticateAdmin, requireRole('finance'), async (req, res) => {
+  try {
+    const { key, value } = req.body;
+    if (!key) return res.status(400).json({ error: 'Chave obrigat\u00f3ria' });
+
+    const oldResult = await db.query('SELECT value FROM system_config WHERE key = $1', [key]);
+    const oldValue = oldResult.rows.length > 0 ? oldResult.rows[0].value : null;
+
+    await db.query(
+      `INSERT INTO system_config (key, value, updated_at) VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+      [key, JSON.stringify(value)]
+    );
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, old_value, new_value, ip_address)
+       VALUES ($1, 'admin', 'SYSTEM_CONFIG_UPDATED', 'system_config', NULL, $2, $3, $4)`,
+      [req.admin.id, JSON.stringify({ key, value: oldValue }), JSON.stringify({ key, value }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+    );
+
+    res.json({ success: true, message: `Configura\u00e7\u00e3o '${key}' atualizada` });
+  } catch (error) {
+    console.error('Update system config error:', error);
+    res.status(500).json({ error: 'Falha ao atualizar configura\u00e7\u00e3o' });
+  }
+});
+
 module.exports = router;
