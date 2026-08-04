@@ -157,22 +157,46 @@ async function botDetectionMiddleware(req, res, next) {
     }
 
     // ===== BURST DETECTION (em memória - para rajadas rápidas) =====
-    if (!burstTracker.has(userId)) {
-      burstTracker.set(userId, { requests: [], lastActivity: now });
-    }
-    const burst = burstTracker.get(userId);
-    burst.lastActivity = now;
-    burst.requests.push(now);
-    // Limpar requests antigas (>60s)
-    burst.requests = burst.requests.filter(t => t > now - 60000);
+    // CORREÇÃO: O burst detection anterior usava threshold de 8 reqs/60s, que é
+    // facilmente atingido por uso legítimo. Cenário real:
+    //   - Vídeo rewarded de 5s → POST /reward + 2-3x GET /reward-status = 3-4 reqs
+    //   - Usuário assiste 3 vídeos curtos em 60s = 9-12 reqs (BANIDO INDEVIDAMENTE)
+    //
+    // Correções aplicadas:
+    //   1. Excluir requisições GET de polling (reward-status) do burst count
+    //   2. Aumentar threshold para 25 reqs/60s (comportamento impossível sem automação)
+    //   3. Não banir imediatamente — primeiro aplicar rate limit, só banir em 40+
+    const isPollingRequest = req.method === 'GET' && req.path.includes('reward-status');
 
-    if (burst.requests.length >= 8) {
-      console.warn(`[BotDetection] BURST detected for user ${userId} (${burst.requests.length} reqs in 60s)`);
-      await autoBanUser(userId, `Auto-ban: burst de requests (${burst.requests.length} em 60s)`, burst.requests.length, ip);
-      return res.status(403).json({
-        error: 'Conta suspensa por atividade automatizada.',
-        code: 'ACCOUNT_BANNED',
-      });
+    if (!isPollingRequest) {
+      if (!burstTracker.has(userId)) {
+        burstTracker.set(userId, { requests: [], lastActivity: now });
+      }
+      const burst = burstTracker.get(userId);
+      burst.lastActivity = now;
+      burst.requests.push(now);
+      // Limpar requests antigas (>60s)
+      burst.requests = burst.requests.filter(t => t > now - 60000);
+
+      // 40+ requests em 60s (excluindo polling) = automação certa → AUTO-BAN
+      if (burst.requests.length >= 40) {
+        console.warn(`[BotDetection] BURST detected for user ${userId} (${burst.requests.length} reqs in 60s)`);
+        await autoBanUser(userId, `Auto-ban: burst de requests (${burst.requests.length} em 60s)`, burst.requests.length, ip);
+        return res.status(403).json({
+          error: 'Conta suspensa por atividade automatizada.',
+          code: 'ACCOUNT_BANNED',
+        });
+      }
+
+      // 25+ requests em 60s = rate limit temporário (sem ban, sem fraud_score)
+      if (burst.requests.length >= 25) {
+        console.warn(`[BotDetection] Rate limiting user ${userId} (${burst.requests.length} reqs in 60s)`);
+        return res.status(429).json({
+          error: 'Muitas solicitações. Aguarde alguns segundos.',
+          code: 'BURST_RATE_LIMITED',
+          retryAfter: 10,
+        });
+      }
     }
 
     // ===== PHANTOM REWARD DETECTION (persistido no banco) =====
