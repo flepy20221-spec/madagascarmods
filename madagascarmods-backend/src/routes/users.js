@@ -23,6 +23,16 @@ router.get('/me', authenticateToken, async (req, res) => {
 
     const userData = user.rows[0];
 
+    // Calcular nível visual baseado em total de anúncios assistidos
+    const rewardCount = await db.query(
+      `SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1`,
+      [req.user.userId]
+    );
+    const totalAds = parseInt(rewardCount.rows[0].total) || 0;
+    const adsPerLevel = 50;
+    const level = Math.floor(totalAds / adsPerLevel);
+    const levelProgress = totalAds % adsPerLevel;
+
     // Get payout destination status
     const payout = await db.query(
       `SELECT id, status, value_masked, submitted_at, reviewed_at 
@@ -40,7 +50,11 @@ router.get('/me', authenticateToken, async (req, res) => {
         balance: parseInt(userData.balance),
         appVersion: userData.app_version,
         createdAt: userData.created_at,
-        lastLoginAt: userData.last_login_at
+        lastLoginAt: userData.last_login_at,
+        level: level,
+        levelProgress: levelProgress,
+        levelTarget: adsPerLevel,
+        totalAdsWatched: totalAds
       },
       payoutDestination: payout.rows.length > 0 ? {
         id: payout.rows[0].id,

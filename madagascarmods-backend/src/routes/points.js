@@ -356,15 +356,27 @@ router.get('/stats', authenticateToken, async (req, res) => {
       [req.user.userId]
     );
 
+    // Sistema de níveis visual (puramente cosmético)
+    // Nível 1 = 50 anúncios, Nível 2 = 100, Nível 3 = 150, etc.
+    const totalAdsWatched = parseInt(stats.rows[0].total_rewards) || 0;
+    const adsPerLevel = 50;
+    const currentLevel = Math.floor(totalAdsWatched / adsPerLevel);
+    const adsInCurrentLevel = totalAdsWatched % adsPerLevel;
+    const adsForNextLevel = adsPerLevel;
+
     res.json({
       success: true,
       stats: {
         balance: parseInt(stats.rows[0].total_balance),
         totalEarned: parseInt(stats.rows[0].total_earned),
         totalSpent: parseInt(stats.rows[0].total_spent),
-        totalRewards: parseInt(stats.rows[0].total_rewards),
+        totalRewards: totalAdsWatched,
         todayEarned: parseInt(todayStats.rows[0].today_earned),
-        todayViews: parseInt(todayStats.rows[0].today_views)
+        todayViews: parseInt(todayStats.rows[0].today_views),
+        level: currentLevel,
+        levelProgress: adsInCurrentLevel,
+        levelTarget: adsForNextLevel,
+        totalAdsWatched: totalAdsWatched
       }
     });
   } catch (error) {

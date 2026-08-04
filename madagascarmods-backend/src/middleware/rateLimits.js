@@ -150,6 +150,22 @@ const authLimiter = rateLimit({
   }
 });
 
+/**
+ * Limite da rota de configuração do app.
+ * O app busca config na abertura e a cada reload. 10 por minuto é generoso.
+ */
+const configLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: userOrTokenKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Muitas consultas de configuração. Aguarde.',
+    code: 'CONFIG_RATE_LIMIT'
+  }
+});
+
 module.exports = {
   rewardLimiter,
   rewardStatusLimiter,
@@ -157,5 +173,6 @@ module.exports = {
   adminLoginLimiter,
   payoutSetupLimiter,
   authLimiter,
+  configLimiter,
   userOrTokenKey,
 };

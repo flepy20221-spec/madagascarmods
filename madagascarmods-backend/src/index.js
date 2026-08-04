@@ -109,9 +109,94 @@ app.use('/api/', (req, res, next) => {
 });
 app.use('/api/auth/', authLimiter);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '1.0.0', timestamp: new Date().toISOString() });
+// ============ HEALTH CHECK AVANÇADO ============
+// Verifica conexão com o banco de dados e retorna status detalhado.
+app.get('/health', async (req, res) => {
+  const db = require('./models/db');
+  let dbStatus = 'unknown';
+  let dbLatency = 0;
+  try {
+    const start = Date.now();
+    await db.query('SELECT 1');
+    dbLatency = Date.now() - start;
+    dbStatus = 'connected';
+  } catch (err) {
+    dbStatus = 'disconnected';
+  }
+
+  const status = dbStatus === 'connected' ? 'healthy' : 'degraded';
+  const httpCode = dbStatus === 'connected' ? 200 : 503;
+
+  res.status(httpCode).json({
+    status,
+    version: process.env.APP_VERSION || '1.5.2',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime()),
+    database: {
+      status: dbStatus,
+      latencyMs: dbLatency
+    },
+    memory: {
+      heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    }
+  });
+});
+
+// ============ MIDDLEWARE DE VERSÃO MÍNIMA ============
+// Bloqueia versões antigas do app que podem ter bugs ou vulnerabilidades.
+// A versão mínima é controlada via system_config (chave: min_app_version).
+const versionCheckCache = { minVersion: null, lastCheck: 0 };
+
+app.use('/api/', async (req, res, next) => {
+  // Não aplicar a rotas admin, SSV, health, ou config
+  if (req.path.startsWith('/admin') || req.path.startsWith('/ssv/') || 
+      req.path.startsWith('/config/') || req.path.startsWith('/auth/')) {
+    return next();
+  }
+
+  const clientVersion = req.headers['x-app-version'];
+  if (!clientVersion) return next(); // Apps antigos sem header passam (backward compat)
+
+  // Cache da versão mínima por 5 minutos
+  const now = Date.now();
+  if (!versionCheckCache.minVersion || now - versionCheckCache.lastCheck > 5 * 60 * 1000) {
+    try {
+      const db = require('./models/db');
+      const result = await db.query("SELECT value FROM system_config WHERE key = 'min_app_version'");
+      if (result.rows.length > 0) {
+        versionCheckCache.minVersion = JSON.parse(result.rows[0].value);
+      } else {
+        versionCheckCache.minVersion = '0.0.0';
+      }
+      versionCheckCache.lastCheck = now;
+    } catch {
+      return next(); // Fail-open
+    }
+  }
+
+  const minVersion = versionCheckCache.minVersion;
+  if (minVersion && minVersion !== '0.0.0') {
+    // Comparação semver simples
+    const parseVer = (v) => (v || '0.0.0').split('.').map(Number);
+    const client = parseVer(clientVersion);
+    const min = parseVer(minVersion);
+    
+    const isOutdated = client[0] < min[0] || 
+      (client[0] === min[0] && client[1] < min[1]) ||
+      (client[0] === min[0] && client[1] === min[1] && client[2] < min[2]);
+
+    if (isOutdated) {
+      return res.status(426).json({
+        error: 'Versão do app desatualizada. Atualize para continuar.',
+        code: 'APP_VERSION_OUTDATED',
+        minVersion,
+        currentVersion: clientVersion
+      });
+    }
+  }
+
+  next();
 });
 
 // API Routes

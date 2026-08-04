@@ -1,12 +1,13 @@
 const express = require('express');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const { configLimiter } = require('../middleware/rateLimits');
 const { POINT_VALUES, getRewardDistribution } = require('../utils/pointsRandom');
 
 const router = express.Router();
 
-// GET /api/config/app - Get app configuration (public)
-router.get('/app', async (req, res) => {
+// GET /api/config/app - Get app configuration (public, rate limited)
+router.get('/app', configLimiter, async (req, res) => {
   try {
     const result = await db.query(
       "SELECT key, value FROM system_config WHERE key IN ('withdrawal_min_points', 'points_per_real', 'withdrawal_min_amount', 'withdrawal_max_amount', 'withdrawal_methods', 'withdrawal_crypto_currency', 'quick_values', 'reward_points_multiplier', 'reward_point_values', 'daily_ad_limit_rewarded', 'daily_ad_limit_other', 'app_version', 'test_ads_enabled')"
