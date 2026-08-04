@@ -177,8 +177,17 @@ async function botDetectionMiddleware(req, res, next) {
 
     // ===== PHANTOM REWARD DETECTION (persistido no banco) =====
     if (req.method === 'POST' && req.path.includes('reward')) {
-      // Registrar tentativa
-      await logRewardAttempt(userId, ip);
+      // CORREÇÃO: Apenas anúncios 'rewarded' possuem SSV do Google.
+      // Interstitial e banner NUNCA recebem confirmação SSV por design do AdMob.
+      // Registrar tentativas desses tipos geraria falsos positivos, pois o
+      // phantom count subiria indefinidamente para uso legítimo do app.
+      const adType = req.body?.ad_type;
+      const isRewardedAd = adType === 'rewarded';
+
+      // Registrar tentativa APENAS para anúncios rewarded
+      if (isRewardedAd) {
+        await logRewardAttempt(userId, ip);
+      }
 
       // Verificar contagem de phantoms
       const { phantom, attempts, confirmed } = await getPhantomRewardCount(userId);
