@@ -135,6 +135,8 @@ router.post('/admin/send', authenticateAdmin, async (req, res) => {
               priority: 'high',
               notification: {
                 sound: 'default',
+                icon: 'ic_stat_cashpix',
+                color: '#9C27B0',
                 clickAction: 'FLUTTER_NOTIFICATION_CLICK',
                 channelId: 'cashpix_notifications'
               }
@@ -252,5 +254,236 @@ router.get('/admin/stats', authenticateAdmin, async (req, res) => {
     res.status(500).json({ error: 'Erro ao buscar estatísticas' });
   }
 });
+
+// =============================================================================
+// NOTIFICAÇÕES AGENDADAS (Scheduled Notifications)
+// =============================================================================
+
+/**
+ * GET /api/admin/push/scheduled
+ * Lista todas as notificações agendadas
+ */
+router.get('/admin/scheduled', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, title, body, image_url, target_type, schedule_time, days_of_week, 
+              is_active, last_sent_at, total_sent, created_at
+       FROM scheduled_notifications
+       ORDER BY schedule_time ASC`
+    );
+    res.json({ success: true, schedules: result.rows });
+  } catch (error) {
+    console.error('Scheduled list error:', error);
+    res.status(500).json({ error: 'Erro ao listar agendamentos' });
+  }
+});
+
+/**
+ * POST /api/admin/push/scheduled
+ * Cria uma nova notificação agendada
+ */
+router.post('/admin/scheduled', authenticateAdmin, async (req, res) => {
+  try {
+    const { title, body, imageUrl, targetType, scheduleTime, daysOfWeek } = req.body;
+
+    if (!title || !body || !scheduleTime) {
+      return res.status(400).json({ error: 'Título, mensagem e horário são obrigatórios' });
+    }
+
+    // Validar formato do horário (HH:MM)
+    const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    if (!timeRegex.test(scheduleTime)) {
+      return res.status(400).json({ error: 'Horário inválido. Use formato HH:MM' });
+    }
+
+    const days = daysOfWeek && daysOfWeek.length > 0 ? daysOfWeek : [0, 1, 2, 3, 4, 5, 6];
+
+    const result = await db.query(
+      `INSERT INTO scheduled_notifications (title, body, image_url, target_type, schedule_time, days_of_week, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [title, body, imageUrl || null, targetType || 'all', scheduleTime, days, req.admin?.id || null]
+    );
+
+    res.json({ success: true, schedule: result.rows[0] });
+  } catch (error) {
+    console.error('Scheduled create error:', error);
+    res.status(500).json({ error: 'Erro ao criar agendamento' });
+  }
+});
+
+/**
+ * PUT /api/admin/push/scheduled/:id
+ * Atualiza uma notificação agendada
+ */
+router.put('/admin/scheduled/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, body, imageUrl, targetType, scheduleTime, daysOfWeek, isActive } = req.body;
+
+    const result = await db.query(
+      `UPDATE scheduled_notifications 
+       SET title = COALESCE($1, title),
+           body = COALESCE($2, body),
+           image_url = $3,
+           target_type = COALESCE($4, target_type),
+           schedule_time = COALESCE($5, schedule_time),
+           days_of_week = COALESCE($6, days_of_week),
+           is_active = COALESCE($7, is_active),
+           updated_at = NOW()
+       WHERE id = $8
+       RETURNING *`,
+      [title, body, imageUrl || null, targetType, scheduleTime, daysOfWeek, isActive, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Agendamento não encontrado' });
+    }
+
+    res.json({ success: true, schedule: result.rows[0] });
+  } catch (error) {
+    console.error('Scheduled update error:', error);
+    res.status(500).json({ error: 'Erro ao atualizar agendamento' });
+  }
+});
+
+/**
+ * DELETE /api/admin/push/scheduled/:id
+ * Remove uma notificação agendada
+ */
+router.delete('/admin/scheduled/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `DELETE FROM scheduled_notifications WHERE id = $1 RETURNING id`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Agendamento não encontrado' });
+    }
+
+    res.json({ success: true, message: 'Agendamento removido' });
+  } catch (error) {
+    console.error('Scheduled delete error:', error);
+    res.status(500).json({ error: 'Erro ao remover agendamento' });
+  }
+});
+
+// =============================================================================
+// SCHEDULER - Verifica e dispara notificações agendadas a cada minuto
+// =============================================================================
+
+async function processScheduledNotifications() {
+  try {
+    const now = new Date();
+    // Usar horário de Brasília (UTC-3)
+    const brasiliaOffset = -3 * 60;
+    const brasiliaTime = new Date(now.getTime() + (brasiliaOffset + now.getTimezoneOffset()) * 60000);
+    const currentTime = brasiliaTime.toTimeString().slice(0, 5); // HH:MM
+    const currentDay = brasiliaTime.getDay(); // 0=domingo, 6=sábado
+
+    // Buscar notificações ativas para este horário e dia
+    const schedules = await db.query(
+      `SELECT * FROM scheduled_notifications 
+       WHERE is_active = true 
+       AND schedule_time = $1::time
+       AND $2 = ANY(days_of_week)
+       AND (last_sent_at IS NULL OR last_sent_at < CURRENT_DATE)`,
+      [currentTime, currentDay]
+    );
+
+    for (const schedule of schedules.rows) {
+      try {
+        // Buscar todos os tokens ativos
+        const tokensResult = await db.query(
+          `SELECT DISTINCT token FROM push_tokens WHERE is_active = true`
+        );
+        const tokens = tokensResult.rows.map(r => r.token);
+
+        if (tokens.length === 0) continue;
+
+        let successCount = 0;
+        let failureCount = 0;
+
+        if (firebaseAdmin) {
+          const batchSize = 500;
+          for (let i = 0; i < tokens.length; i += batchSize) {
+            const batch = tokens.slice(i, i + batchSize);
+            try {
+              const message = {
+                notification: {
+                  title: schedule.title,
+                  body: schedule.body,
+                  ...(schedule.image_url && { imageUrl: schedule.image_url })
+                },
+                data: {
+                  title: schedule.title,
+                  body: schedule.body,
+                  type: 'scheduled_notification'
+                },
+                android: {
+                  priority: 'high',
+                  notification: {
+                    sound: 'default',
+                    icon: 'ic_stat_cashpix',
+                    color: '#9C27B0',
+                    clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+                    channelId: 'cashpix_notifications'
+                  }
+                },
+                tokens: batch
+              };
+
+              const response = await firebaseAdmin.messaging().sendEachForMulticast(message);
+              successCount += response.successCount;
+              failureCount += response.failureCount;
+
+              // Remover tokens inválidos
+              response.responses.forEach(async (resp, idx) => {
+                if (!resp.success) {
+                  const errorCode = resp.error?.code;
+                  if (errorCode === 'messaging/registration-token-not-registered' ||
+                      errorCode === 'messaging/invalid-registration-token') {
+                    await db.query(
+                      `UPDATE push_tokens SET is_active = false WHERE token = $1`,
+                      [batch[idx]]
+                    );
+                  }
+                }
+              });
+            } catch (fcmError) {
+              console.error('[Scheduler] FCM batch error:', fcmError.message);
+              failureCount += batch.length;
+            }
+          }
+        }
+
+        // Atualizar registro do agendamento
+        await db.query(
+          `UPDATE scheduled_notifications SET last_sent_at = NOW(), total_sent = total_sent + 1 WHERE id = $1`,
+          [schedule.id]
+        );
+
+        // Registrar no histórico de push
+        await db.query(
+          `INSERT INTO push_notifications (title, body, image_url, target_type, sent_count, success_count, failure_count)
+           VALUES ($1, $2, $3, 'all (agendado)', $4, $5, $6)`,
+          [schedule.title, schedule.body, schedule.image_url, tokens.length, successCount, failureCount]
+        );
+
+        console.log(`[Scheduler] Notificação "${schedule.title}" enviada: ${successCount} sucesso, ${failureCount} falha`);
+      } catch (scheduleError) {
+        console.error(`[Scheduler] Erro ao processar agendamento ${schedule.id}:`, scheduleError.message);
+      }
+    }
+  } catch (error) {
+    console.error('[Scheduler] Erro geral:', error.message);
+  }
+}
+
+// Iniciar scheduler - verifica a cada 60 segundos
+setInterval(processScheduledNotifications, 60 * 1000);
+console.log('[Scheduler] Notificações agendadas ativo - verificando a cada 60s (horário de Brasília)');
 
 module.exports = router;
