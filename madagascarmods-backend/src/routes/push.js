@@ -3,6 +3,25 @@ const router = express.Router();
 const db = require('../models/db');
 const { authenticateToken, authenticateAdmin } = require('../middleware/auth');
 
+// Firebase Admin SDK para push notifications (FCM v1)
+let firebaseAdmin = null;
+try {
+  const admin = require('firebase-admin');
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (serviceAccountJson) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    firebaseAdmin = admin;
+    console.log('Firebase Admin SDK inicializado com sucesso');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT não configurada. Push notifications desabilitadas.');
+  }
+} catch (e) {
+  console.error('Erro ao inicializar Firebase Admin:', e.message);
+}
+
 /**
  * POST /api/push/register
  * Registra o token FCM do dispositivo do usuário
@@ -89,69 +108,66 @@ router.post('/admin/send', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Nenhum dispositivo registrado para receber notificações' });
     }
 
-    // Enviar via FCM (Firebase Cloud Messaging)
+    // Enviar via Firebase Admin SDK (FCM v1 API)
     let successCount = 0;
     let failureCount = 0;
 
-    const fcmServerKey = process.env.FCM_SERVER_KEY;
-    
-    if (fcmServerKey) {
-      // Enviar em lotes de 1000 (limite do FCM)
-      const batchSize = 1000;
+    if (firebaseAdmin) {
+      // Enviar em lotes de 500 (limite do sendEachForMulticast)
+      const batchSize = 500;
       for (let i = 0; i < tokens.length; i += batchSize) {
         const batch = tokens.slice(i, i + batchSize);
         
         try {
-          const fcmPayload = {
-            registration_ids: batch,
+          const message = {
             notification: {
               title,
               body,
-              ...(imageUrl && { image: imageUrl }),
-              sound: 'default',
-              click_action: 'FLUTTER_NOTIFICATION_CLICK'
+              ...(imageUrl && { imageUrl })
             },
             data: {
               title,
               body,
               type: 'admin_notification',
               ...(imageUrl && { image: imageUrl })
-            }
+            },
+            android: {
+              priority: 'high',
+              notification: {
+                sound: 'default',
+                clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+                channelId: 'cashpix_notifications'
+              }
+            },
+            tokens: batch
           };
 
-          const response = await fetch('https://fcm.googleapis.com/fcm/send', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `key=${fcmServerKey}`
-            },
-            body: JSON.stringify(fcmPayload)
-          });
-
-          const result = await response.json();
-          successCount += result.success || 0;
-          failureCount += result.failure || 0;
+          const response = await firebaseAdmin.messaging().sendEachForMulticast(message);
+          successCount += response.successCount;
+          failureCount += response.failureCount;
 
           // Remover tokens inválidos
-          if (result.results) {
-            for (let j = 0; j < result.results.length; j++) {
-              if (result.results[j].error === 'NotRegistered' || result.results[j].error === 'InvalidRegistration') {
+          response.responses.forEach(async (resp, idx) => {
+            if (!resp.success) {
+              const errorCode = resp.error?.code;
+              if (errorCode === 'messaging/registration-token-not-registered' ||
+                  errorCode === 'messaging/invalid-registration-token') {
                 await db.query(
                   `UPDATE push_tokens SET is_active = false WHERE token = $1`,
-                  [batch[j]]
+                  [batch[idx]]
                 );
               }
             }
-          }
+          });
         } catch (fcmError) {
           console.error('FCM batch error:', fcmError);
           failureCount += batch.length;
         }
       }
     } else {
-      // Sem FCM key configurada - simular envio para desenvolvimento
+      // Sem Firebase configurado - simular envio para desenvolvimento
       successCount = tokens.length;
-      console.warn('FCM_SERVER_KEY não configurada. Notificação registrada mas não enviada.');
+      console.warn('Firebase Admin não configurado. Notificação registrada mas não enviada.');
     }
 
     // Registrar no histórico
