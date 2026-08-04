@@ -103,7 +103,13 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const missionId = req.params.id;
+    const { ad_watched } = req.body;
     const today = new Date().toISOString().split('T')[0];
+
+    // Exigir que o usuário tenha assistido um anúncio antes de coletar recompensa
+    if (!ad_watched) {
+      return res.status(403).json({ error: 'É necessário assistir um anúncio para coletar a recompensa', require_ad: true });
+    }
 
     await client.query('BEGIN');
 

@@ -100,6 +100,13 @@ router.post('/claim', authenticateToken, async (req, res) => {
   const client = await db.getClient();
   try {
     const userId = req.user.userId;
+    const { ad_watched } = req.body;
+
+    // Exigir que o usuário tenha assistido um anúncio antes de fazer check-in
+    if (!ad_watched) {
+      return res.status(403).json({ error: 'É necessário assistir um anúncio para fazer check-in', require_ad: true });
+    }
+
     await client.query('BEGIN');
 
     // Verificar se já fez check-in hoje

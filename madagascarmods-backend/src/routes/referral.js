@@ -5,10 +5,42 @@ const { authenticateToken } = require('../middleware/auth');
 const crypto = require('crypto');
 
 /**
- * Gera um código de referral único de 6 caracteres alfanuméricos
+ * ============================================================================
+ * SISTEMA DE REFERRAL COM PROTEÇÃO ANTI-FRAUDE
+ * ============================================================================
+ * 
+ * Proteções implementadas:
+ * 1. Verificação de mesmo IP entre referrer e referred
+ * 2. Verificação de mesmo device_id entre referrer e referred
+ * 3. Rate limit por IP no endpoint /apply (max 3 por hora por IP)
+ * 4. Limite máximo de referrals por dia por código
+ * 5. Conta convidada precisa de mínimo de atividade para dar bônus ao referrer
+ * 6. Cooldown entre criação da conta e aplicação de código (anti-bot)
+ * 7. Verificação de padrões suspeitos (muitos referrals do mesmo IP)
+ * 8. Bônus ao referrer só é creditado após convidado assistir X anúncios (deferred reward)
+ * ============================================================================
  */
+
 function generateReferralCode() {
   return crypto.randomBytes(4).toString('hex').substring(0, 6).toUpperCase();
+}
+
+/**
+ * Verifica se um IP já foi usado em muitos referrals recentes (anti-farm)
+ */
+async function isIPSuspicious(ip, client) {
+  if (!ip) return false;
+  
+  // Contar quantos referrals vieram deste IP nas últimas 24h
+  const result = await (client || db).query(
+    `SELECT COUNT(*) as total FROM users 
+     WHERE ip_address = $1 
+     AND referred_by IS NOT NULL 
+     AND created_at > NOW() - INTERVAL '24 hours'`,
+    [ip]
+  );
+  
+  return parseInt(result.rows[0].total) >= 3; // Max 3 referrals do mesmo IP por dia
 }
 
 /**
@@ -28,7 +60,6 @@ router.get('/info', authenticateToken, async (req, res) => {
     let referralCode = user.rows[0]?.referral_code;
 
     if (!referralCode) {
-      // Gerar código único
       let attempts = 0;
       while (attempts < 10) {
         referralCode = generateReferralCode();
@@ -39,7 +70,7 @@ router.get('/info', authenticateToken, async (req, res) => {
           );
           break;
         } catch (e) {
-          if (e.code === '23505') { // unique violation
+          if (e.code === '23505') {
             attempts++;
             continue;
           }
@@ -48,10 +79,12 @@ router.get('/info', authenticateToken, async (req, res) => {
       }
     }
 
-    // Buscar convidados
+    // Buscar convidados com status de ativação
     const referrals = await db.query(
-      `SELECT u.email, u.created_at, 
-              COALESCE((SELECT SUM(points_awarded) FROM referral_rewards WHERE referrer_id = $1 AND referred_id = u.id), 0) as total_earned
+      `SELECT u.email, u.created_at, u.is_active,
+              COALESCE((SELECT COUNT(*) FROM reward_events WHERE user_id = u.id), 0) as ads_watched,
+              COALESCE((SELECT SUM(points_awarded) FROM referral_rewards WHERE referrer_id = $1 AND referred_id = u.id), 0) as total_earned,
+              (SELECT status FROM referral_rewards WHERE referrer_id = $1 AND referred_id = u.id AND reward_type = 'signup' LIMIT 1) as reward_status
        FROM users u 
        WHERE u.referred_by = $1
        ORDER BY u.created_at DESC
@@ -59,9 +92,9 @@ router.get('/info', authenticateToken, async (req, res) => {
       [userId]
     );
 
-    // Total de pontos ganhos com referrals
+    // Total de pontos ganhos com referrals (apenas os já creditados)
     const totalEarned = await db.query(
-      `SELECT COALESCE(SUM(points_awarded), 0) as total FROM referral_rewards WHERE referrer_id = $1`,
+      `SELECT COALESCE(SUM(points_awarded), 0) as total FROM referral_rewards WHERE referrer_id = $1 AND status = 'credited'`,
       [userId]
     );
 
@@ -81,10 +114,13 @@ router.get('/info', authenticateToken, async (req, res) => {
         signupBonus: config.referral_signup_bonus_referrer || 200,
         referredBonus: config.referral_signup_bonus_referred || 100,
         milestoneBonus: config.referral_milestone_50ads || 500,
+        minAdsForBonus: config.referral_min_ads_for_bonus || 10,
         referrals: referrals.rows.map(r => ({
-          email: r.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'), // Mascarar email
+          email: r.email.replace(/(.{2})(.*)(@.*)/, '$1***$3'),
           joinedAt: r.created_at,
-          earned: parseInt(r.total_earned)
+          earned: parseInt(r.total_earned),
+          adsWatched: parseInt(r.ads_watched),
+          status: r.reward_status || 'pending'
         }))
       }
     });
@@ -96,13 +132,19 @@ router.get('/info', authenticateToken, async (req, res) => {
 
 /**
  * POST /api/referral/apply
- * Aplica um código de referral (chamado no cadastro/primeiro login)
+ * Aplica um código de referral com múltiplas verificações anti-fraude
  */
 router.post('/apply', authenticateToken, async (req, res) => {
   const client = await db.getClient();
   try {
     const userId = req.user.userId;
-    const { code } = req.body;
+    const { code, ad_watched } = req.body;
+    const userIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+
+    // Exigir que o usuário tenha assistido um anúncio antes de aplicar código
+    if (!ad_watched) {
+      return res.status(403).json({ error: 'É necessário assistir um anúncio para aplicar o código', require_ad: true });
+    }
 
     if (!code || code.length < 4) {
       return res.status(400).json({ error: 'Código inválido' });
@@ -110,9 +152,11 @@ router.post('/apply', authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Verificar se o usuário já tem um referrer
+    // =========================================================================
+    // VERIFICAÇÃO 1: Usuário já tem um referrer?
+    // =========================================================================
     const user = await client.query(
-      `SELECT referred_by FROM users WHERE id = $1`,
+      `SELECT referred_by, ip_address, device_id, created_at FROM users WHERE id = $1`,
       [userId]
     );
 
@@ -121,9 +165,21 @@ router.post('/apply', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Você já usou um código de convite' });
     }
 
-    // Buscar dono do código
+    // =========================================================================
+    // VERIFICAÇÃO 2: Cooldown - conta precisa ter pelo menos 2 minutos de vida
+    // (anti-bot que cria e aplica código instantaneamente)
+    // =========================================================================
+    const accountAge = Date.now() - new Date(user.rows[0]?.created_at).getTime();
+    if (accountAge < 2 * 60 * 1000) { // 2 minutos
+      await client.query('ROLLBACK');
+      return res.status(429).json({ error: 'Aguarde um momento antes de aplicar um código de convite' });
+    }
+
+    // =========================================================================
+    // VERIFICAÇÃO 3: Buscar dono do código
+    // =========================================================================
     const referrer = await client.query(
-      `SELECT id FROM users WHERE referral_code = $1`,
+      `SELECT id, ip_address, device_id FROM users WHERE referral_code = $1`,
       [code.toUpperCase()]
     );
 
@@ -133,24 +189,110 @@ router.post('/apply', authenticateToken, async (req, res) => {
     }
 
     const referrerId = referrer.rows[0].id;
+    const referrerIP = referrer.rows[0].ip_address;
+    const referrerDeviceId = referrer.rows[0].device_id;
 
+    // =========================================================================
+    // VERIFICAÇÃO 4: Auto-convite (mesmo user ID)
+    // =========================================================================
     if (referrerId === userId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Você não pode usar seu próprio código' });
     }
 
+    // =========================================================================
+    // VERIFICAÇÃO 5: Mesmo IP (possível auto-convite com emulador/multi-conta)
+    // =========================================================================
+    const currentUserIP = user.rows[0]?.ip_address || userIP;
+    if (referrerIP && currentUserIP && referrerIP === currentUserIP) {
+      await client.query('ROLLBACK');
+      // Registrar tentativa suspeita no audit_log
+      await db.query(
+        `INSERT INTO audit_log (user_id, action, details, ip_address)
+         VALUES ($1, 'REFERRAL_SAME_IP_BLOCKED', $2, $3)`,
+        [userId, JSON.stringify({ referrer_id: referrerId, ip: currentUserIP }), currentUserIP]
+      );
+      return res.status(403).json({ error: 'Não foi possível aplicar este código. Tente novamente mais tarde.' });
+    }
+
+    // =========================================================================
+    // VERIFICAÇÃO 6: Mesmo device_id (mesmo dispositivo/emulador)
+    // =========================================================================
+    const currentDeviceId = user.rows[0]?.device_id;
+    if (referrerDeviceId && currentDeviceId && referrerDeviceId === currentDeviceId) {
+      await client.query('ROLLBACK');
+      await db.query(
+        `INSERT INTO audit_log (user_id, action, details, ip_address)
+         VALUES ($1, 'REFERRAL_SAME_DEVICE_BLOCKED', $2, $3)`,
+        [userId, JSON.stringify({ referrer_id: referrerId, device_id: currentDeviceId }), userIP]
+      );
+      return res.status(403).json({ error: 'Não foi possível aplicar este código. Tente novamente mais tarde.' });
+    }
+
+    // =========================================================================
+    // VERIFICAÇÃO 7: Rate limit por IP (max 3 aplicações por hora do mesmo IP)
+    // =========================================================================
+    const recentFromIP = await client.query(
+      `SELECT COUNT(*) as total FROM users 
+       WHERE ip_address = $1 
+       AND referred_by IS NOT NULL 
+       AND updated_at > NOW() - INTERVAL '1 hour'`,
+      [userIP]
+    );
+    if (parseInt(recentFromIP.rows[0].total) >= 3) {
+      await client.query('ROLLBACK');
+      await db.query(
+        `INSERT INTO audit_log (user_id, action, details, ip_address)
+         VALUES ($1, 'REFERRAL_IP_RATE_LIMITED', $2, $3)`,
+        [userId, JSON.stringify({ ip: userIP, count: recentFromIP.rows[0].total }), userIP]
+      );
+      return res.status(429).json({ error: 'Muitas tentativas. Tente novamente mais tarde.' });
+    }
+
+    // =========================================================================
+    // VERIFICAÇÃO 8: IP suspeito (muitos referrals nas últimas 24h)
+    // =========================================================================
+    if (await isIPSuspicious(userIP, client)) {
+      await client.query('ROLLBACK');
+      await db.query(
+        `INSERT INTO audit_log (user_id, action, details, ip_address)
+         VALUES ($1, 'REFERRAL_SUSPICIOUS_IP', $2, $3)`,
+        [userId, JSON.stringify({ ip: userIP }), userIP]
+      );
+      return res.status(403).json({ error: 'Não foi possível aplicar este código. Tente novamente mais tarde.' });
+    }
+
+    // =========================================================================
+    // VERIFICAÇÃO 9: Limite diário de referrals por código (max 10 por dia)
+    // =========================================================================
+    const dailyReferrals = await client.query(
+      `SELECT COUNT(*) as total FROM users 
+       WHERE referred_by = $1 
+       AND created_at > NOW() - INTERVAL '24 hours'`,
+      [referrerId]
+    );
+    if (parseInt(dailyReferrals.rows[0].total) >= 10) {
+      await client.query('ROLLBACK');
+      return res.status(429).json({ error: 'Este código atingiu o limite diário. Tente amanhã.' });
+    }
+
+    // =========================================================================
+    // TUDO OK - Aplicar referral
+    // =========================================================================
+    
     // Buscar configs
     const configResult = await client.query(
-      `SELECT key, value FROM system_config WHERE key IN ('referral_signup_bonus_referrer', 'referral_signup_bonus_referred')`
+      `SELECT key, value FROM system_config WHERE key IN ('referral_signup_bonus_referrer', 'referral_signup_bonus_referred', 'referral_min_ads_for_bonus')`
     );
     const config = {};
     configResult.rows.forEach(r => { config[r.key] = parseInt(r.value); });
     const referrerBonus = config.referral_signup_bonus_referrer || 200;
     const referredBonus = config.referral_signup_bonus_referred || 100;
+    const minAdsForBonus = config.referral_min_ads_for_bonus || 10;
 
-    // Aplicar referral
+    // Marcar referral
     await client.query(
-      `UPDATE users SET referred_by = $1 WHERE id = $2`,
+      `UPDATE users SET referred_by = $1, updated_at = NOW() WHERE id = $2`,
       [referrerId, userId]
     );
 
@@ -160,24 +302,7 @@ router.post('/apply', authenticateToken, async (req, res) => {
       [referrerId]
     );
 
-    // Bônus para o referrer
-    await client.query(
-      `INSERT INTO referral_rewards (referrer_id, referred_id, reward_type, points_awarded)
-       VALUES ($1, $2, 'signup', $3)
-       ON CONFLICT DO NOTHING`,
-      [referrerId, userId, referrerBonus]
-    );
-    await client.query(
-      `UPDATE users SET balance = balance + $1 WHERE id = $2`,
-      [referrerBonus, referrerId]
-    );
-    await client.query(
-      `INSERT INTO points_ledger (user_id, amount, type, description)
-       VALUES ($1, $2, 'referral', 'Bônus: novo convidado se cadastrou')`,
-      [referrerId, referrerBonus]
-    );
-
-    // Bônus para o convidado
+    // Bônus IMEDIATO para o convidado (incentivo para continuar usando)
     await client.query(
       `UPDATE users SET balance = balance + $1 WHERE id = $2`,
       [referredBonus, userId]
@@ -188,12 +313,28 @@ router.post('/apply', authenticateToken, async (req, res) => {
       [userId, referredBonus]
     );
 
+    // Bônus PENDENTE para o referrer (só credita quando convidado assistir X anúncios)
+    await client.query(
+      `INSERT INTO referral_rewards (referrer_id, referred_id, reward_type, points_awarded, status)
+       VALUES ($1, $2, 'signup', $3, 'pending')
+       ON CONFLICT DO NOTHING`,
+      [referrerId, userId, referrerBonus]
+    );
+
+    // Registrar no audit_log
+    await client.query(
+      `INSERT INTO audit_log (user_id, action, details, ip_address)
+       VALUES ($1, 'REFERRAL_APPLIED', $2, $3)`,
+      [userId, JSON.stringify({ referrer_id: referrerId, code: code.toUpperCase() }), userIP]
+    );
+
     await client.query('COMMIT');
 
     res.json({
       success: true,
       message: `Código aplicado! Você ganhou ${referredBonus} pontos de bônus.`,
-      pointsEarned: referredBonus
+      pointsEarned: referredBonus,
+      note: `Seu amigo receberá o bônus quando você assistir ${minAdsForBonus} anúncios.`
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -205,10 +346,11 @@ router.post('/apply', authenticateToken, async (req, res) => {
 });
 
 /**
- * Middleware interno: verificar milestones de referral
- * Chamado quando um convidado atinge marcos (50 anúncios, etc.)
+ * Verifica e credita bônus pendentes de referral
+ * Chamado após cada anúncio assistido pelo convidado
+ * O referrer só recebe o bônus quando o convidado atinge o mínimo de anúncios
  */
-async function checkReferralMilestones(userId) {
+async function checkReferralBonusActivation(userId) {
   try {
     const user = await db.query(
       `SELECT referred_by FROM users WHERE id = $1`,
@@ -216,7 +358,6 @@ async function checkReferralMilestones(userId) {
     );
 
     if (!user.rows[0]?.referred_by) return;
-
     const referrerId = user.rows[0].referred_by;
 
     // Contar total de anúncios do convidado
@@ -226,14 +367,51 @@ async function checkReferralMilestones(userId) {
     );
     const totalAds = parseInt(adsCount.rows[0].total);
 
-    // Milestone: 50 anúncios
-    if (totalAds >= 50) {
-      const configResult = await db.query(
-        `SELECT value FROM system_config WHERE key = 'referral_milestone_50ads'`
-      );
-      const milestoneBonus = parseInt(configResult.rows[0]?.value || 500);
+    // Buscar config de mínimo de anúncios
+    const configResult = await db.query(
+      `SELECT key, value FROM system_config WHERE key IN ('referral_min_ads_for_bonus', 'referral_milestone_50ads')`
+    );
+    const config = {};
+    configResult.rows.forEach(r => { config[r.key] = parseInt(r.value); });
+    const minAdsForBonus = config.referral_min_ads_for_bonus || 10;
+    const milestoneBonus = config.referral_milestone_50ads || 500;
 
-      // Verificar se já foi dado
+    // =========================================================================
+    // Ativação do bônus de signup (convidado atingiu mínimo de anúncios)
+    // =========================================================================
+    if (totalAds >= minAdsForBonus) {
+      const pendingReward = await db.query(
+        `SELECT id, points_awarded FROM referral_rewards 
+         WHERE referrer_id = $1 AND referred_id = $2 AND reward_type = 'signup' AND status = 'pending'`,
+        [referrerId, userId]
+      );
+
+      if (pendingReward.rows.length > 0) {
+        const reward = pendingReward.rows[0];
+        
+        // Creditar bônus ao referrer
+        await db.query(
+          `UPDATE users SET balance = balance + $1 WHERE id = $2`,
+          [reward.points_awarded, referrerId]
+        );
+        await db.query(
+          `INSERT INTO points_ledger (user_id, amount, type, description)
+           VALUES ($1, $2, 'referral', $3)`,
+          [referrerId, reward.points_awarded, `Bônus: convidado atingiu ${minAdsForBonus} anúncios`]
+        );
+        
+        // Marcar como creditado
+        await db.query(
+          `UPDATE referral_rewards SET status = 'credited', credited_at = NOW() WHERE id = $1`,
+          [reward.id]
+        );
+      }
+    }
+
+    // =========================================================================
+    // Milestone: 50 anúncios
+    // =========================================================================
+    if (totalAds >= 50) {
       const existing = await db.query(
         `SELECT id FROM referral_rewards 
          WHERE referrer_id = $1 AND referred_id = $2 AND reward_type = 'milestone' AND milestone_name = '50_ads'`,
@@ -242,8 +420,8 @@ async function checkReferralMilestones(userId) {
 
       if (existing.rows.length === 0) {
         await db.query(
-          `INSERT INTO referral_rewards (referrer_id, referred_id, reward_type, points_awarded, milestone_name)
-           VALUES ($1, $2, 'milestone', $3, '50_ads')`,
+          `INSERT INTO referral_rewards (referrer_id, referred_id, reward_type, points_awarded, milestone_name, status)
+           VALUES ($1, $2, 'milestone', $3, '50_ads', 'credited')`,
           [referrerId, userId, milestoneBonus]
         );
         await db.query(
@@ -258,9 +436,9 @@ async function checkReferralMilestones(userId) {
       }
     }
   } catch (error) {
-    console.error('Referral milestone check error:', error);
+    console.error('Referral bonus activation error:', error);
   }
 }
 
 module.exports = router;
-module.exports.checkReferralMilestones = checkReferralMilestones;
+module.exports.checkReferralBonusActivation = checkReferralBonusActivation;
