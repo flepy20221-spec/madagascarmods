@@ -209,8 +209,8 @@ router.post('/apply', authenticateToken, async (req, res) => {
       await client.query('ROLLBACK');
       // Registrar tentativa suspeita no audit_log
       await db.query(
-        `INSERT INTO audit_log (user_id, action, details, ip_address)
-         VALUES ($1, 'REFERRAL_SAME_IP_BLOCKED', $2, $3)`,
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
+         VALUES ($1, 'user', 'REFERRAL_SAME_IP_BLOCKED', 'referral', $2, $3)`,
         [userId, JSON.stringify({ referrer_id: referrerId, ip: currentUserIP }), currentUserIP]
       );
       return res.status(403).json({ error: 'Não foi possível aplicar este código. Tente novamente mais tarde.' });
@@ -223,8 +223,8 @@ router.post('/apply', authenticateToken, async (req, res) => {
     if (referrerDeviceId && currentDeviceId && referrerDeviceId === currentDeviceId) {
       await client.query('ROLLBACK');
       await db.query(
-        `INSERT INTO audit_log (user_id, action, details, ip_address)
-         VALUES ($1, 'REFERRAL_SAME_DEVICE_BLOCKED', $2, $3)`,
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
+         VALUES ($1, 'user', 'REFERRAL_SAME_DEVICE_BLOCKED', 'referral', $2, $3)`,
         [userId, JSON.stringify({ referrer_id: referrerId, device_id: currentDeviceId }), userIP]
       );
       return res.status(403).json({ error: 'Não foi possível aplicar este código. Tente novamente mais tarde.' });
@@ -243,8 +243,8 @@ router.post('/apply', authenticateToken, async (req, res) => {
     if (parseInt(recentFromIP.rows[0].total) >= 3) {
       await client.query('ROLLBACK');
       await db.query(
-        `INSERT INTO audit_log (user_id, action, details, ip_address)
-         VALUES ($1, 'REFERRAL_IP_RATE_LIMITED', $2, $3)`,
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
+         VALUES ($1, 'user', 'REFERRAL_IP_RATE_LIMITED', 'referral', $2, $3)`,
         [userId, JSON.stringify({ ip: userIP, count: recentFromIP.rows[0].total }), userIP]
       );
       return res.status(429).json({ error: 'Muitas tentativas. Tente novamente mais tarde.' });
@@ -256,8 +256,8 @@ router.post('/apply', authenticateToken, async (req, res) => {
     if (await isIPSuspicious(userIP, client)) {
       await client.query('ROLLBACK');
       await db.query(
-        `INSERT INTO audit_log (user_id, action, details, ip_address)
-         VALUES ($1, 'REFERRAL_SUSPICIOUS_IP', $2, $3)`,
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
+         VALUES ($1, 'user', 'REFERRAL_SUSPICIOUS_IP', 'referral', $2, $3)`,
         [userId, JSON.stringify({ ip: userIP }), userIP]
       );
       return res.status(403).json({ error: 'Não foi possível aplicar este código. Tente novamente mais tarde.' });
@@ -320,8 +320,8 @@ router.post('/apply', authenticateToken, async (req, res) => {
 
     // Registrar no audit_log
     await client.query(
-      `INSERT INTO audit_log (user_id, action, details, ip_address)
-       VALUES ($1, 'REFERRAL_APPLIED', $2, $3)`,
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
+       VALUES ($1, 'user', 'REFERRAL_APPLIED', 'referral', $2, $3)`,
       [userId, JSON.stringify({ referrer_id: referrerId, code: code.toUpperCase() }), userIP]
     );
 
