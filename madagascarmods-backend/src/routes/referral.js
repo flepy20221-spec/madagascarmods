@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const crypto = require('crypto');
@@ -302,15 +303,11 @@ router.post('/apply', authenticateToken, async (req, res) => {
       [referrerId]
     );
 
-    // Bônus IMEDIATO para o convidado (incentivo para continuar usando)
+    // Bônus IMEDIATO para o convidado (saldo calculado pelo points_ledger)
     await client.query(
-      `UPDATE users SET balance = balance + $1 WHERE id = $2`,
-      [referredBonus, userId]
-    );
-    await client.query(
-      `INSERT INTO points_ledger (user_id, amount, type, description)
-       VALUES ($1, $2, 'referral', 'Bônus: código de convite aplicado')`,
-      [userId, referredBonus]
+      `INSERT INTO points_ledger (id, user_id, amount, transaction_type, description)
+       VALUES ($1, $2, $3, 'REFERRAL', 'Bônus: código de convite aplicado')`,
+      [uuidv4(), userId, referredBonus]
     );
 
     // Bônus PENDENTE para o referrer (só credita quando convidado assistir X anúncios)
@@ -389,15 +386,11 @@ async function checkReferralBonusActivation(userId) {
       if (pendingReward.rows.length > 0) {
         const reward = pendingReward.rows[0];
         
-        // Creditar bônus ao referrer
+        // Creditar bônus ao referrer (saldo calculado pelo points_ledger)
         await db.query(
-          `UPDATE users SET balance = balance + $1 WHERE id = $2`,
-          [reward.points_awarded, referrerId]
-        );
-        await db.query(
-          `INSERT INTO points_ledger (user_id, amount, type, description)
-           VALUES ($1, $2, 'referral', $3)`,
-          [referrerId, reward.points_awarded, `Bônus: convidado atingiu ${minAdsForBonus} anúncios`]
+          `INSERT INTO points_ledger (id, user_id, amount, transaction_type, description)
+           VALUES ($1, $2, $3, 'REFERRAL', $4)`,
+          [uuidv4(), referrerId, reward.points_awarded, `Bônus: convidado atingiu ${minAdsForBonus} anúncios`]
         );
         
         // Marcar como creditado
@@ -425,13 +418,9 @@ async function checkReferralBonusActivation(userId) {
           [referrerId, userId, milestoneBonus]
         );
         await db.query(
-          `UPDATE users SET balance = balance + $1 WHERE id = $2`,
-          [milestoneBonus, referrerId]
-        );
-        await db.query(
-          `INSERT INTO points_ledger (user_id, amount, type, description)
-           VALUES ($1, $2, 'referral', 'Bônus: convidado atingiu 50 anúncios')`,
-          [referrerId, milestoneBonus]
+          `INSERT INTO points_ledger (id, user_id, amount, transaction_type, description)
+           VALUES ($1, $2, $3, 'REFERRAL', 'Bônus: convidado atingiu 50 anúncios')`,
+          [uuidv4(), referrerId, milestoneBonus]
         );
       }
     }

@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 
@@ -160,17 +161,11 @@ router.post('/claim', authenticateToken, async (req, res) => {
       [userId, today, newStreak, points]
     );
 
-    // Creditar pontos ao usuário
+    // Registrar no ledger (saldo é calculado pela soma do points_ledger)
     await client.query(
-      `UPDATE users SET balance = balance + $1 WHERE id = $2`,
-      [points, userId]
-    );
-
-    // Registrar no ledger
-    await client.query(
-      `INSERT INTO points_ledger (user_id, amount, type, description)
-       VALUES ($1, $2, 'checkin', $3)`,
-      [userId, points, `Check-in dia ${newStreak} (+${points} pts)`]
+      `INSERT INTO points_ledger (id, user_id, amount, transaction_type, description)
+       VALUES ($1, $2, $3, 'CHECKIN', $4)`,
+      [uuidv4(), userId, points, `Check-in dia ${newStreak} (+${points} pts)`]
     );
 
     await client.query('COMMIT');
