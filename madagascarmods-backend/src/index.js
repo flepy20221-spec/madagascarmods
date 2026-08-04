@@ -22,6 +22,10 @@ const pixRoutes = require('./routes/pix');
 const pixWithdrawalRoutes = require('./routes/pix_withdrawals');
 const ssvRoutes = require('./routes/ssv');
 const adminPayoutKeysRoutes = require('./routes/admin_payout_keys');
+const checkinRoutes = require('./routes/checkin');
+const referralRoutes = require('./routes/referral');
+const pushRoutes = require('./routes/push');
+const missionsRoutes = require('./routes/missions');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -211,6 +215,10 @@ app.use('/api/config', configRoutes);
 app.use('/api/pix', pixRoutes);
 app.use('/api/pix-withdrawals', pixWithdrawalRoutes);
 app.use('/api/ssv', ssvRoutes);
+app.use('/api/checkin', checkinRoutes);
+app.use('/api/referral', referralRoutes);
+app.use('/api/push', pushRoutes);
+app.use('/api/missions', missionsRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
