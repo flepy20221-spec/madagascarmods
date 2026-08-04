@@ -9,7 +9,7 @@ const router = express.Router();
 router.get('/app', async (req, res) => {
   try {
     const result = await db.query(
-      "SELECT key, value FROM system_config WHERE key IN ('withdrawal_min_points', 'points_per_real', 'withdrawal_min_amount', 'withdrawal_max_amount', 'withdrawal_methods', 'withdrawal_crypto_currency', 'quick_values', 'reward_points_multiplier', 'reward_point_values', 'daily_ad_limit_rewarded', 'daily_ad_limit_other', 'app_version')"
+      "SELECT key, value FROM system_config WHERE key IN ('withdrawal_min_points', 'points_per_real', 'withdrawal_min_amount', 'withdrawal_max_amount', 'withdrawal_methods', 'withdrawal_crypto_currency', 'quick_values', 'reward_points_multiplier', 'reward_point_values', 'daily_ad_limit_rewarded', 'daily_ad_limit_other', 'app_version', 'test_ads_enabled')"
     );
 
     const config = {};
@@ -38,7 +38,8 @@ router.get('/app', async (req, res) => {
         rewardPointValues: config.reward_point_values || POINT_VALUES,
         rewardPointsMultiplier: Number(config.reward_points_multiplier) || 1,
         rewardDistribution: getRewardDistribution(),
-        appVersion: config.app_version || '1.3.2'
+        appVersion: config.app_version || '1.3.2',
+        testAdsEnabled: config.test_ads_enabled === true || config.test_ads_enabled === 'true' || false
       }
     });
   } catch (error) {
