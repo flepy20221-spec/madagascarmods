@@ -202,6 +202,19 @@ router.post('/apply', authenticateToken, async (req, res) => {
     }
 
     // =========================================================================
+    // VERIFICAÇÃO 4.5: Referral circular (A convidou B, B não pode usar código de A)
+    // Se o dono do código (referrer) já foi convidado pelo usuário atual, bloquear
+    // =========================================================================
+    const referrerUser = await client.query(
+      `SELECT referred_by FROM users WHERE id = $1`,
+      [referrerId]
+    );
+    if (referrerUser.rows[0]?.referred_by === userId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Não é possível usar o código de alguém que você convidou' });
+    }
+
+    // =========================================================================
     // VERIFICAÇÃO 5: Mesmo IP (possível auto-convite com emulador/multi-conta)
     // =========================================================================
     const currentUserIP = user.rows[0]?.ip_address || userIP;

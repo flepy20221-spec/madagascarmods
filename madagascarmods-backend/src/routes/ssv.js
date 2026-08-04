@@ -18,6 +18,7 @@ const {
   verifySsvSignature,
 } = require('../utils/admobSsv');
 const { drawRewardPoints, POINT_VALUES } = require('../utils/pointsRandom');
+const { checkReferralBonusActivation } = require('./referral');
 
 const router = express.Router();
 
@@ -408,6 +409,13 @@ router.get('/callback', async (req, res) => {
       );
 
       await client.query('COMMIT');
+
+      // Verificar se ativa bônus de referral (após commit)
+      try {
+        await checkReferralBonusActivation(userId);
+      } catch (e) {
+        console.error('[SSV] Referral bonus check error:', e);
+      }
 
       console.log('[SSV] Reward credited', {
         points: pointsToAward,
