@@ -4,6 +4,28 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken, authenticateAdmin } = require('../middleware/auth');
 
+function compatibleField(body, camelCase, snakeCase) {
+  if (Object.prototype.hasOwnProperty.call(body, camelCase)) {
+    return body[camelCase];
+  }
+  if (Object.prototype.hasOwnProperty.call(body, snakeCase)) {
+    return body[snakeCase];
+  }
+  return undefined;
+}
+
+function parseOptionalPositiveInteger(value) {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseOptionalNonNegativeInteger(value) {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
 /**
  * GET /api/missions
  * Lista missões ativas com progresso do usuário
@@ -230,16 +252,39 @@ router.get('/admin/list', authenticateAdmin, async (req, res) => {
  */
 router.post('/admin/create', authenticateAdmin, async (req, res) => {
   try {
-    const { title, description, type, targetValue, rewardPoints, icon, isActive, isDaily, sortOrder } = req.body;
+    const { title, description, type, icon } = req.body;
+    const targetValue = parseOptionalPositiveInteger(
+      compatibleField(req.body, 'targetValue', 'target_value')
+    );
+    const rewardPoints = parseOptionalPositiveInteger(
+      compatibleField(req.body, 'rewardPoints', 'reward_points')
+    );
+    const sortOrder = parseOptionalNonNegativeInteger(
+      compatibleField(req.body, 'sortOrder', 'sort_order')
+    );
+    const isActive = compatibleField(req.body, 'isActive', 'is_active');
+    const isDaily = compatibleField(req.body, 'isDaily', 'is_daily');
 
-    if (!title || !type || !targetValue || !rewardPoints) {
+    if (!title || !type || targetValue === undefined || rewardPoints === undefined) {
       return res.status(400).json({ error: 'Campos obrigatórios: title, type, targetValue, rewardPoints' });
+    }
+    if (targetValue === null || rewardPoints === null) {
+      return res.status(400).json({ error: 'Meta e recompensa devem ser números inteiros maiores que zero' });
+    }
+    if (sortOrder === null) {
+      return res.status(400).json({ error: 'Ordem deve ser um número inteiro maior ou igual a zero' });
+    }
+    if (isActive !== undefined && typeof isActive !== 'boolean') {
+      return res.status(400).json({ error: 'isActive deve ser booleano' });
+    }
+    if (isDaily !== undefined && typeof isDaily !== 'boolean') {
+      return res.status(400).json({ error: 'isDaily deve ser booleano' });
     }
 
     const result = await db.query(
       `INSERT INTO missions (title, description, type, target_value, reward_points, icon, is_active, is_daily, sort_order)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [title, description || '', type, targetValue, rewardPoints, icon || 'star', isActive !== false, isDaily !== false, sortOrder || 0]
+      [title, description || '', type, targetValue, rewardPoints, icon || 'star', isActive !== false, isDaily !== false, sortOrder ?? 0]
     );
 
     res.json({ success: true, mission: result.rows[0] });
@@ -256,7 +301,31 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
 router.put('/admin/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, description, type, targetValue, rewardPoints, icon, isActive, isDaily, sortOrder } = req.body;
+    const { title, description, type, icon } = req.body;
+    const targetValue = parseOptionalPositiveInteger(
+      compatibleField(req.body, 'targetValue', 'target_value')
+    );
+    const rewardPoints = parseOptionalPositiveInteger(
+      compatibleField(req.body, 'rewardPoints', 'reward_points')
+    );
+    const sortOrder = parseOptionalNonNegativeInteger(
+      compatibleField(req.body, 'sortOrder', 'sort_order')
+    );
+    const isActive = compatibleField(req.body, 'isActive', 'is_active');
+    const isDaily = compatibleField(req.body, 'isDaily', 'is_daily');
+
+    if (targetValue === null || rewardPoints === null) {
+      return res.status(400).json({ error: 'Meta e recompensa devem ser números inteiros maiores que zero' });
+    }
+    if (sortOrder === null) {
+      return res.status(400).json({ error: 'Ordem deve ser um número inteiro maior ou igual a zero' });
+    }
+    if (isActive !== undefined && typeof isActive !== 'boolean') {
+      return res.status(400).json({ error: 'isActive deve ser booleano' });
+    }
+    if (isDaily !== undefined && typeof isDaily !== 'boolean') {
+      return res.status(400).json({ error: 'isDaily deve ser booleano' });
+    }
 
     const result = await db.query(
       `UPDATE missions SET 
