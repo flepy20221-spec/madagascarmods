@@ -16,6 +16,7 @@
  * quando nao ha token), sobre a janela real de negocio de cada rota.
  */
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 
 /**
  * Chave de contagem: prioriza o usuario autenticado; cai para o IP quando anonimo.
@@ -41,7 +42,12 @@ function userOrTokenKey(req) {
     } catch (_) { /* token malformado: usa IP */ }
   }
 
-  return `ip:${req.ip}`;
+  // Um endereco IPv6 precisa ser reduzido ao prefixo /64 antes de virar chave de
+  // contagem. Sem isso, quem tem uma faixa IPv6 gera enderecos novos a vontade e
+  // escapa do limite. O express-rate-limit 8 passou a exigir essa normalizacao
+  // (ERR_ERL_KEY_GEN_IPV6) e oferece ipKeyGenerator pronto para isso; enderecos
+  // IPv4 passam inalterados.
+  return `ip:${ipKeyGenerator(req.ip)}`;
 }
 
 /**
