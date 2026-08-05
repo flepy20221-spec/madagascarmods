@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at TIMESTAMP WITH TIME ZONE
 );
 
+-- CREATE TABLE IF NOT EXISTS nao adiciona colunas a uma tabela existente.
+-- Garanta a coluna antes de criar o indice; a migracao 005 acrescenta tambem
+-- a validacao de formato e permanece idempotente.
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS device_account_key VARCHAR(64);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device_account_key_unique
   ON users(device_account_key)
   WHERE device_account_key IS NOT NULL;
