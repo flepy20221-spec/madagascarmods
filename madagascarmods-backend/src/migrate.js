@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
   token VARCHAR(512),
   refresh_token VARCHAR(512),
   device_id VARCHAR(255),
+  device_account_key VARCHAR(64),
   device_model VARCHAR(255),
   ip_address VARCHAR(45),
   app_version VARCHAR(20),
@@ -28,6 +29,14 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   last_login_at TIMESTAMP WITH TIME ZONE
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device_account_key_unique
+  ON users(device_account_key)
+  WHERE device_account_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device_id_unique
+  ON users(device_id)
+  WHERE device_id IS NOT NULL AND btrim(device_id) <> '';
 
 -- Points ledger (append-only)
 CREATE TABLE IF NOT EXISTS points_ledger (

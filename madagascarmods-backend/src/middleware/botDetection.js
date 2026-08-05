@@ -344,7 +344,7 @@ async function loginBotDetection(req, res, next) {
     // Contar logins/registros deste IP nos últimos 10 minutos
     const recentLogins = await db.query(
       `SELECT COUNT(*) as count FROM users
-       WHERE last_login_ip = $1 AND last_login_at > NOW() - INTERVAL '10 minutes'`,
+       WHERE ip_address = $1 AND last_login_at > NOW() - INTERVAL '10 minutes'`,
       [ip]
     );
 

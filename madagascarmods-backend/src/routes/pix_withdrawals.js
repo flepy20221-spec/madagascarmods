@@ -199,12 +199,15 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     // Create withdrawal record
     const withdrawalId = uuidv4();
 
+    // payout_destination_id referencia exclusivamente payout_destinations (FaucetPay).
+    // Para PIX, ele precisa permanecer NULL; o vinculo e o snapshot da conta PIX ficam
+    // no JSON de crypto_address, preservando os dados usados pelo painel administrativo.
     await client.query(
       `INSERT INTO withdrawals (id, user_id, payout_destination_id, amount, points_debited, 
        payment_method, crypto_address, crypto_currency, status, idempotency_key, ledger_reservation_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, 'pix', $6, 'BRL', 'PENDING', $7, $8, NOW())`,
-      [withdrawalId, userId, pixAccount.id, amountInReal, pointsToDebit,
-       JSON.stringify({ cpf: pixAccount.cpf, full_name: pixAccount.full_name, pix_key_type: pixAccount.pix_key_type, pix_key_value: pixAccount.pix_key_value }),
+       VALUES ($1, $2, NULL, $3, $4, 'pix', $5, 'BRL', 'PENDING', $6, $7, NOW())`,
+      [withdrawalId, userId, amountInReal, pointsToDebit,
+       JSON.stringify({ pix_account_id: pixAccount.id, cpf: pixAccount.cpf, full_name: pixAccount.full_name, pix_key_type: pixAccount.pix_key_type, pix_key_value: pixAccount.pix_key_value }),
        idempotency_key, reservationId]
     );
 

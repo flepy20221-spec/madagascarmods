@@ -60,6 +60,7 @@ const pathCases = [
   ['/api/pix-withdrawals/request', '/pix-withdrawals/request'],
   ['/api/points/history?page=2', '/points/history'],
   ['/api/auth/login', '/auth/login'],
+  ['/api/auth/device', '/auth/device'],
 ];
 
 for (const [originalUrl, expected] of pathCases) {
