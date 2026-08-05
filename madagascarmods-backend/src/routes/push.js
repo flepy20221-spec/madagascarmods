@@ -300,9 +300,9 @@ router.post('/admin/scheduled', authenticateAdmin, async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO scheduled_notifications (title, body, image_url, target_type, schedule_time, days_of_week, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       VALUES ($1, $2, $3, $4, $5::time, $6, $7)
        RETURNING *`,
-      [title, body, imageUrl || null, targetType || 'all', scheduleTime, days, req.admin?.id || null]
+      [title, body, imageUrl || null, targetType || 'all', scheduleTime + ':00', days, req.admin?.id || null]
     );
 
     res.json({ success: true, schedule: result.rows[0] });
@@ -327,13 +327,13 @@ router.put('/admin/scheduled/:id', authenticateAdmin, async (req, res) => {
            body = COALESCE($2, body),
            image_url = $3,
            target_type = COALESCE($4, target_type),
-           schedule_time = COALESCE($5, schedule_time),
+           schedule_time = COALESCE($5::time, schedule_time),
            days_of_week = COALESCE($6, days_of_week),
            is_active = COALESCE($7, is_active),
            updated_at = NOW()
        WHERE id = $8
        RETURNING *`,
-      [title, body, imageUrl || null, targetType, scheduleTime, daysOfWeek, isActive, id]
+      [title, body, imageUrl || null, targetType, scheduleTime ? scheduleTime + ':00' : null, daysOfWeek, isActive, id]
     );
 
     if (result.rows.length === 0) {
@@ -374,24 +374,58 @@ router.delete('/admin/scheduled/:id', authenticateAdmin, async (req, res) => {
 // SCHEDULER - Verifica e dispara notificações agendadas a cada minuto
 // =============================================================================
 
+/**
+ * Retorna a data/hora atual em Brasília (UTC-3).
+ * Não depende do timezone do servidor (Railway usa UTC).
+ */
+function getBrasiliaTime() {
+  const now = new Date();
+  // Brasília = UTC-3 (sem horário de verão desde 2019)
+  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+  const brasiliaMs = utcMs - 3 * 3600000;
+  return new Date(brasiliaMs);
+}
+
+/**
+ * Retorna a data de "hoje" em Brasília como string YYYY-MM-DD.
+ * Usada para verificar se já enviou hoje.
+ */
+function getBrasiliaDateString() {
+  const brasilia = getBrasiliaTime();
+  const year = brasilia.getFullYear();
+  const month = String(brasilia.getMonth() + 1).padStart(2, '0');
+  const day = String(brasilia.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 async function processScheduledNotifications() {
   try {
-    const now = new Date();
-    // Usar horário de Brasília (UTC-3)
-    const brasiliaOffset = -3 * 60;
-    const brasiliaTime = new Date(now.getTime() + (brasiliaOffset + now.getTimezoneOffset()) * 60000);
-    const currentTime = brasiliaTime.toTimeString().slice(0, 5); // HH:MM
-    const currentDay = brasiliaTime.getDay(); // 0=domingo, 6=sábado
+    const brasilia = getBrasiliaTime();
+    const currentHour = String(brasilia.getHours()).padStart(2, '0');
+    const currentMinute = String(brasilia.getMinutes()).padStart(2, '0');
+    const currentTime = `${currentHour}:${currentMinute}:00`; // Formato TIME completo (HH:MM:SS)
+    const currentDay = brasilia.getDay(); // 0=domingo, 6=sábado
+    const todayStr = getBrasiliaDateString();
 
-    // Buscar notificações ativas para este horário e dia
+    // Buscar notificações ativas para este horário e dia.
+    // A comparação usa timezone de Brasília explicitamente:
+    // - schedule_time é comparado com o horário atual de Brasília
+    // - last_sent_at é convertido para Brasília antes de comparar com "hoje"
     const schedules = await db.query(
       `SELECT * FROM scheduled_notifications 
        WHERE is_active = true 
        AND schedule_time = $1::time
        AND $2 = ANY(days_of_week)
-       AND (last_sent_at IS NULL OR last_sent_at < CURRENT_DATE)`,
-      [currentTime, currentDay]
+       AND (
+         last_sent_at IS NULL 
+         OR (last_sent_at AT TIME ZONE 'America/Sao_Paulo')::date < $3::date
+       )`,
+      [currentTime, currentDay, todayStr]
     );
+
+    if (schedules.rows.length > 0) {
+      console.log(`[Scheduler] ${schedules.rows.length} notificação(ões) para enviar às ${currentHour}:${currentMinute} (Brasília)`);
+    }
 
     for (const schedule of schedules.rows) {
       try {
@@ -401,7 +435,10 @@ async function processScheduledNotifications() {
         );
         const tokens = tokensResult.rows.map(r => r.token);
 
-        if (tokens.length === 0) continue;
+        if (tokens.length === 0) {
+          console.log(`[Scheduler] Nenhum token ativo. Pulando "${schedule.title}".`);
+          continue;
+        }
 
         let successCount = 0;
         let failureCount = 0;
@@ -440,26 +477,38 @@ async function processScheduledNotifications() {
               failureCount += response.failureCount;
 
               // Remover tokens inválidos
-              response.responses.forEach(async (resp, idx) => {
+              const invalidTokenUpdates = [];
+              response.responses.forEach((resp, idx) => {
                 if (!resp.success) {
                   const errorCode = resp.error?.code;
                   if (errorCode === 'messaging/registration-token-not-registered' ||
                       errorCode === 'messaging/invalid-registration-token') {
-                    await db.query(
-                      `UPDATE push_tokens SET is_active = false WHERE token = $1`,
-                      [batch[idx]]
+                    invalidTokenUpdates.push(
+                      db.query(
+                        `UPDATE push_tokens SET is_active = false WHERE token = $1`,
+                        [batch[idx]]
+                      )
                     );
                   }
                 }
               });
+              // Aguardar remoção de tokens inválidos
+              if (invalidTokenUpdates.length > 0) {
+                await Promise.allSettled(invalidTokenUpdates);
+              }
             } catch (fcmError) {
               console.error('[Scheduler] FCM batch error:', fcmError.message);
               failureCount += batch.length;
             }
           }
+        } else {
+          // Firebase não configurado — registrar mas não enviar
+          successCount = 0;
+          failureCount = tokens.length;
+          console.warn(`[Scheduler] Firebase Admin não configurado. Notificação "${schedule.title}" NÃO enviada.`);
         }
 
-        // Atualizar registro do agendamento
+        // Atualizar registro do agendamento com timestamp UTC (será convertido para Brasília na query)
         await db.query(
           `UPDATE scheduled_notifications SET last_sent_at = NOW(), total_sent = total_sent + 1 WHERE id = $1`,
           [schedule.id]
@@ -472,7 +521,7 @@ async function processScheduledNotifications() {
           [schedule.title, schedule.body, schedule.image_url, tokens.length, successCount, failureCount]
         );
 
-        console.log(`[Scheduler] Notificação "${schedule.title}" enviada: ${successCount} sucesso, ${failureCount} falha`);
+        console.log(`[Scheduler] Notificação "${schedule.title}" enviada: ${successCount} sucesso, ${failureCount} falha (${tokens.length} tokens)`);
       } catch (scheduleError) {
         console.error(`[Scheduler] Erro ao processar agendamento ${schedule.id}:`, scheduleError.message);
       }
@@ -482,8 +531,29 @@ async function processScheduledNotifications() {
   }
 }
 
-// Iniciar scheduler - verifica a cada 60 segundos
-setInterval(processScheduledNotifications, 60 * 1000);
-console.log('[Scheduler] Notificações agendadas ativo - verificando a cada 60s (horário de Brasília)');
+// =============================================================================
+// Iniciar scheduler com intervalo de 60 segundos.
+//
+// CORREÇÃO: O setInterval puro pode "perder" o minuto exato se a execução
+// anterior demorar ou se houver drift. Para garantir que o scheduler dispare
+// exatamente no início de cada minuto, alinhamos o primeiro tick ao próximo
+// segundo :00 e depois usamos intervalo de 60s.
+// =============================================================================
+function startScheduler() {
+  const now = new Date();
+  const msUntilNextMinute = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+
+  // Primeiro tick alinhado ao início do próximo minuto
+  setTimeout(() => {
+    processScheduledNotifications();
+    // Depois, a cada 60 segundos
+    setInterval(processScheduledNotifications, 60 * 1000);
+  }, msUntilNextMinute);
+
+  const brasilia = getBrasiliaTime();
+  console.log(`[Scheduler] Notificações agendadas ativo. Horário atual de Brasília: ${brasilia.toTimeString().slice(0, 8)}. Próximo tick em ${Math.round(msUntilNextMinute / 1000)}s.`);
+}
+
+startScheduler();
 
 module.exports = router;
