@@ -10,7 +10,14 @@ const router = express.Router();
 router.get('/app', configLimiter, async (req, res) => {
   try {
     const result = await db.query(
-      "SELECT key, value FROM system_config WHERE key IN ('withdrawal_min_points', 'points_per_real', 'withdrawal_min_amount', 'withdrawal_max_amount', 'withdrawal_methods', 'withdrawal_crypto_currency', 'quick_values', 'reward_points_multiplier', 'reward_point_values', 'daily_ad_limit_rewarded', 'daily_ad_limit_other', 'app_version', 'test_ads_enabled')"
+      `SELECT key, value FROM system_config WHERE key IN (
+        'withdrawal_min_points', 'points_per_real', 'withdrawal_min_amount',
+        'withdrawal_max_amount', 'withdrawal_methods', 'withdrawal_crypto_currency',
+        'quick_values', 'reward_points_multiplier', 'reward_point_values',
+        'daily_ad_limit_rewarded', 'daily_ad_limit_other', 'app_version',
+        'test_ads_enabled', 'maintenance_mode', 'maintenance_message',
+        'min_supported_version', 'force_update_message', 'play_store_url'
+      )`
     );
 
     const config = {};
@@ -34,13 +41,23 @@ router.get('/app', configLimiter, async (req, res) => {
         quickValues: config.quick_values || [1, 2, 5, 10, 20, 50],
         dailyAdLimitRewarded: Number(config.daily_ad_limit_rewarded) || 50,
         dailyAdLimitOther: Number(config.daily_ad_limit_other) || 30,
-        // A pontuacao por anuncio premiado NAO e fixa: o servidor sorteia um
-        // valor da grade abaixo com probabilidade ponderada.
         rewardPointValues: config.reward_point_values || POINT_VALUES,
         rewardPointsMultiplier: Number(config.reward_points_multiplier) || 1,
         rewardDistribution: getRewardDistribution(),
         appVersion: config.app_version || '1.3.2',
-        testAdsEnabled: config.test_ads_enabled === true || config.test_ads_enabled === 'true' || false
+        testAdsEnabled: config.test_ads_enabled === true || config.test_ads_enabled === 'true' || false,
+
+        // ====================================================================
+        // Controle remoto do app: Manutenção e Atualização Forçada
+        // ====================================================================
+        // Modo manutenção: bloqueia o app com mensagem customizável
+        maintenanceMode: config.maintenance_mode === true || config.maintenance_mode === 'true' || false,
+        maintenanceMessage: config.maintenance_message || 'Estamos em manutenção. Voltaremos em breve!',
+
+        // Atualização forçada: versão mínima suportada (semver)
+        minSupportedVersion: config.min_supported_version || '1.0.0',
+        forceUpdateMessage: config.force_update_message || 'Uma nova versão do CashPix está disponível. Atualize para continuar usando o app.',
+        playStoreUrl: config.play_store_url || 'https://play.google.com/store/apps/details?id=com.madagascarmods'
       }
     });
   } catch (error) {
