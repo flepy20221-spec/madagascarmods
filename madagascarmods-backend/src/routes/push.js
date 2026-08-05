@@ -256,6 +256,46 @@ router.get('/admin/stats', authenticateAdmin, async (req, res) => {
 });
 
 // =============================================================================
+// HORÁRIO DO SERVIDOR (para debug do scheduler)
+// =============================================================================
+
+/**
+ * GET /api/admin/push/server-time
+ * Retorna o horário atual do servidor em Brasília (usado pelo painel para debug)
+ */
+router.get('/admin/server-time', authenticateAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+    const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+    const brasiliaMs = utcMs - 3 * 3600000;
+    const brasilia = new Date(brasiliaMs);
+    
+    const hours = String(brasilia.getHours()).padStart(2, '0');
+    const minutes = String(brasilia.getMinutes()).padStart(2, '0');
+    const seconds = String(brasilia.getSeconds()).padStart(2, '0');
+    const day = brasilia.getDay(); // 0=dom
+    
+    const dateStr = brasilia.toISOString().slice(0, 10);
+    const timeStr = `${hours}:${minutes}:${seconds}`;
+    
+    res.json({
+      success: true,
+      serverTime: {
+        brasilia: `${dateStr} ${timeStr}`,
+        time: `${hours}:${minutes}`,
+        seconds: timeStr,
+        dayOfWeek: day,
+        dayName: ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'][day],
+        utc: now.toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Server time error:', error);
+    res.status(500).json({ error: 'Erro ao obter horário' });
+  }
+});
+
+// =============================================================================
 // NOTIFICAÇÕES AGENDADAS (Scheduled Notifications)
 // =============================================================================
 
