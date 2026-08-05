@@ -8,7 +8,7 @@ const router = express.Router();
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const user = await db.query(
-      `SELECT u.id, u.email, u.device_id, u.app_version, u.is_active, u.created_at, u.last_login_at,
+      `SELECT u.id, u.support_code, u.email, u.device_id, u.app_version, u.is_active, u.created_at, u.last_login_at,
        COALESCE(SUM(pl.amount), 0) as balance
        FROM users u
        LEFT JOIN points_ledger pl ON pl.user_id = u.id
@@ -46,6 +46,7 @@ router.get('/me', authenticateToken, async (req, res) => {
       success: true,
       user: {
         id: userData.id,
+        supportCode: userData.support_code,
         email: userData.email,
         balance: parseInt(userData.balance),
         appVersion: userData.app_version,
