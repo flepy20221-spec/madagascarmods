@@ -37,6 +37,10 @@ const { loginBotDetection } = require('../middleware/botDetection');
 const {
   normalizeDeviceAccountKey,
   buildDeviceAccountEmail,
+  generateDeviceBindingToken,
+  hashDeviceBindingToken,
+  normalizeInstallationState,
+  INSTALLATION_STATE,
 } = require('../utils/deviceIdentity');
 const jwt = require('jsonwebtoken');
 
@@ -121,6 +125,8 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       device_account_key,
       legacy_device_id,
       migration_refresh_token,
+      device_binding_token,
+      installation_state,
       device_model,
       app_version,
     } = req.body;
@@ -142,6 +148,19 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     const safeAppVersion = typeof app_version === 'string'
       ? app_version.trim().slice(0, 20)
       : null;
+
+    // Estado da instalacao declarado pelo cliente. Ver device_service.dart:
+    // `upgraded_without_proof` significa que o aparelho ja rodou o CashPix mas a
+    // prova local desapareceu. O valor por si so nao concede acesso a nada; ele
+    // apenas IMPEDE a criacao de conta, portanto um cliente malicioso nao ganha
+    // nada declarando-o.
+    const installationState = normalizeInstallationState(installation_state);
+
+    const bindingTokenHash = typeof device_binding_token === 'string'
+      && device_binding_token.trim().length >= 32
+      ? hashDeviceBindingToken(device_binding_token.trim())
+      : null;
+
     const ip = clientIp(req);
 
     await client.query('BEGIN');
@@ -179,7 +198,25 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     let accountMigrated = false;
     let migrationMethod = user ? (user.alias_source === 'device_account_key' ? 'device_account_key' : 'device_alias') : null;
 
-    // Primeiro caminho de migracao: refresh token valido salvo pela versao antiga.
+    // Primeiro caminho de migracao, e agora o mais confiavel: token de vinculo
+    // dedicado. Diferente do refresh token, ele nao e rotacionado pelo ciclo de
+    // sessao, portanto continua valido depois de qualquer numero de renovacoes.
+    // Ver migrations/009_device_binding_tokens.sql: somente o hash e armazenado.
+    if (!user && bindingTokenHash) {
+      const boundUser = await client.query(
+        `SELECT id, email, is_active, is_banned, device_account_key
+           FROM users
+          WHERE device_binding_token_hash = $1
+            AND merged_into_user_id IS NULL
+          LIMIT 1
+          FOR UPDATE`,
+        [bindingTokenHash]
+      );
+      user = boundUser.rows[0] || null;
+      if (user) migrationMethod = 'binding_token';
+    }
+
+    // Segundo caminho de migracao: refresh token valido salvo pela versao antiga.
     if (!user && typeof migration_refresh_token === 'string' && migration_refresh_token.length > 0) {
       try {
         const decoded = jwt.verify(migration_refresh_token, JWT_REFRESH_SECRET);
@@ -198,7 +235,7 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       }
     }
 
-    // Segundo caminho: identificador aleatorio persistido pela instalacao antiga.
+    // Terceiro caminho: identificador aleatorio persistido pela instalacao antiga.
     if (!user && legacyDeviceId.length >= 8) {
       const legacyUsers = await client.query(
         `SELECT id, email, is_active, is_banned, device_account_key
@@ -232,7 +269,8 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     );
 
     if (requiresKeyRotation) {
-      const rotationProved = migrationMethod === 'refresh_token'
+      const rotationProved = migrationMethod === 'binding_token'
+        || migrationMethod === 'refresh_token'
         || migrationMethod === 'legacy_device_id'
         || migrationMethod === 'device_alias';
 
@@ -260,6 +298,34 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       );
       user.device_account_key = deviceAccountKey;
       accountMigrated = true;
+    }
+
+    // ==========================================================================
+    // BLOQUEIO DE CRIACAO SILENCIOSA EM ESTADO AMBIGUO
+    //
+    // Nenhuma prova localizou a conta e o proprio aplicativo informa que este
+    // aparelho JA rodou o CashPix antes. Criar uma conta aqui e exatamente o
+    // defeito relatado em producao: o usuario reinstalava o app e reaparecia com
+    // saldo zero, enquanto a conta antiga continuava existindo intacta.
+    //
+    // A recusa e deliberada. O saldo anterior permanece no servidor e a conta e
+    // religada pelo suporte, usando o codigo CP-XXXX-XXXX-XXXX. Uma instalacao
+    // genuinamente nova declara `fresh_install` e segue criando conta normalmente.
+    // ==========================================================================
+    if (!user && installationState === INSTALLATION_STATE.UPGRADED_WITHOUT_PROOF) {
+      await client.query('ROLLBACK');
+      await logAuthEvent(
+        'DEVICE_ACCOUNT_CREATION_BLOCKED_AMBIGUOUS',
+        null,
+        { ip, appVersion: safeAppVersion, deviceModel: safeDeviceModel },
+        req
+      );
+      return res.status(409).json({
+        error: 'Este aparelho ja possui uma conta CashPix, mas o vinculo local foi '
+          + `perdido. Para nao duplicar a conta nem zerar seu saldo, fale com ${SUPPORT_EMAIL}.`,
+        code: 'DEVICE_RECOVERY_REQUIRED',
+        supportEmail: SUPPORT_EMAIL,
+      });
     }
 
     if (!user) {
@@ -344,10 +410,55 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     }
 
     const { accessToken, refreshToken } = generateTokens(user.id, user.email);
+
+    // ==========================================================================
+    // EMISSAO / REAPROVEITAMENTO DO TOKEN DE VINCULO
+    //
+    // Um token novo e emitido somente quando a conta ainda nao possui um. Um
+    // token existente e valido NAO e rotacionado: rotacionar traria de volta
+    // exatamente a fragilidade do refresh token, em que o valor guardado no
+    // aparelho fica obsoleto sem o usuario perceber.
+    //
+    // O token e devolvido em texto claro uma unica vez, no momento da emissao,
+    // porque o servidor guarda apenas o hash e nao tem como reexibi-lo depois.
+    // ==========================================================================
+    let issuedBindingToken = null;
+
+    if (!bindingTokenHash || migrationMethod !== 'binding_token') {
+      const existing = await client.query(
+        'SELECT device_binding_token_hash FROM users WHERE id = $1',
+        [user.id]
+      );
+      const storedHash = existing.rows[0]?.device_binding_token_hash || null;
+
+      // Somente contas sem token recebem um. Se a conta ja tem um token e o
+      // aparelho apresentou outro (ou nenhum), o token vigente permanece o unico
+      // valido: sobrescrever permitiria que um cliente qualquer substituisse a
+      // credencial de vinculo de uma conta com saldo.
+      if (!storedHash) {
+        issuedBindingToken = generateDeviceBindingToken();
+        await client.query(
+          `UPDATE users
+              SET device_binding_token_hash = $1,
+                  device_binding_token_issued_at = NOW()
+            WHERE id = $2`,
+          [hashDeviceBindingToken(issuedBindingToken), user.id]
+        );
+      }
+    }
+
     await client.query(
       'UPDATE users SET token = $1, refresh_token = $2 WHERE id = $3',
       [accessToken, refreshToken, user.id]
     );
+
+    // O codigo de suporte e derivado do UUID por trigger e nunca muda. E o unico
+    // identificador que o usuario pode ler, anotar e informar ao atendimento.
+    const supportCodeResult = await client.query(
+      'SELECT support_code FROM users WHERE id = $1',
+      [user.id]
+    );
+    const supportCode = supportCodeResult.rows[0]?.support_code || null;
 
     await client.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
@@ -355,7 +466,12 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       [
         user.id,
         accountCreated ? 'DEVICE_ACCOUNT_CREATED' : accountMigrated ? 'DEVICE_ACCOUNT_MIGRATED' : 'DEVICE_ACCOUNT_LOGIN',
-        JSON.stringify({ migrationMethod, appVersion: safeAppVersion }),
+        JSON.stringify({
+          migrationMethod,
+          appVersion: safeAppVersion,
+          installationState,
+          bindingTokenIssued: Boolean(issuedBindingToken),
+        }),
         ip,
       ]
     );
@@ -366,9 +482,13 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       success: true,
       accountCreated,
       accountMigrated,
-      user: { id: user.id, email: user.email },
+      migrationMethod,
+      user: { id: user.id, email: user.email, supportCode },
       accessToken,
       refreshToken,
+      // Presente apenas na emissao. Nas chamadas seguintes o campo e omitido e o
+      // aplicativo continua usando o token que ja tem salvo.
+      ...(issuedBindingToken ? { deviceBindingToken: issuedBindingToken } : {}),
     });
   } catch (error) {
     await client.query('ROLLBACK');

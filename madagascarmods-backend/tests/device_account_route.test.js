@@ -70,6 +70,29 @@ function createFakeDatabase() {
         const user = userId ? users.get(userId) : null;
         return { rows: user ? [{ ...user, alias_source: 'test' }] : [] };
       }
+      if (normalized.startsWith('SELECT device_binding_token_hash FROM users')) {
+        const user = users.get(params[0]);
+        return {
+          rows: user
+            ? [{ device_binding_token_hash: user.device_binding_token_hash || null }]
+            : [],
+        };
+      }
+      if (normalized.includes('WHERE device_binding_token_hash = $1')) {
+        const user = [...users.values()].find(
+          (item) => item.device_binding_token_hash === params[0]
+        );
+        return { rows: user ? [{ ...user }] : [] };
+      }
+      if (normalized.startsWith('UPDATE users SET device_binding_token_hash = $1')) {
+        const user = users.get(params[1]);
+        if (user) user.device_binding_token_hash = params[0];
+        return { rows: [] };
+      }
+      if (normalized.startsWith('SELECT support_code FROM users')) {
+        const user = users.get(params[0]);
+        return { rows: user ? [{ support_code: user.support_code }] : [] };
+      }
       if (normalized.includes('WHERE id = $1 AND refresh_token = $2')) {
         const user = users.get(params[0]);
         return {
@@ -97,6 +120,7 @@ function createFakeDatabase() {
           device_account_key: params[2],
           support_code: `CP-TEST-${String(userInsertCount).padStart(4, '0')}`,
           refresh_token: null,
+          device_binding_token_hash: null,
         };
         users.set(user.id, user);
         return { rows: [{ ...user }] };
