@@ -1,8 +1,4 @@
-# Node 22 LTS (Jod). O Node 18 saiu do suporte e as dependencias atuais do
-# projeto exigem >=20 (ver engines em package.json): com a imagem antiga o
-# `npm ci` falha no boot do deploy. A tag e fixada na minor para que o build
-# seja reprodutivel.
-FROM node:22.23-alpine
+FROM node:18-alpine
 
 WORKDIR /app
 
