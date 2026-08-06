@@ -46,39 +46,18 @@ function authenticateToken(req, res, next) {
     // o token continuava valido. Agora ambos os casos bloqueiam.
     try {
       const userCheck = await db.query(
-        `SELECT source.is_banned, source.is_active, source.merged_into_user_id,
-                target.email AS merged_email,
-                target.is_banned AS merged_is_banned,
-                target.is_active AS merged_is_active
-           FROM users source
-           LEFT JOIN users target ON target.id = source.merged_into_user_id
-          WHERE source.id = $1`,
+        'SELECT is_banned, is_active FROM users WHERE id = $1',
         [decoded.userId]
       );
 
       if (userCheck.rows.length === 0) {
         return res.status(403).json({ error: 'Conta nao encontrada', code: 'USER_NOT_FOUND' });
       }
-
-      const account = userCheck.rows[0];
-      if (account.merged_into_user_id) {
-        if (account.merged_is_banned) {
-          return res.status(403).json({ error: 'Conta suspensa', code: 'BANNED' });
-        }
-        if (!account.merged_is_active) {
-          return res.status(403).json({ error: 'Conta inativa', code: 'INACTIVE' });
-        }
-
-        decoded.mergedFromUserId = decoded.userId;
-        decoded.userId = account.merged_into_user_id;
-        decoded.email = account.merged_email;
-      } else {
-        if (account.is_banned) {
-          return res.status(403).json({ error: 'Conta suspensa', code: 'BANNED' });
-        }
-        if (!account.is_active) {
-          return res.status(403).json({ error: 'Conta inativa', code: 'INACTIVE' });
-        }
+      if (userCheck.rows[0].is_banned) {
+        return res.status(403).json({ error: 'Conta suspensa', code: 'BANNED' });
+      }
+      if (!userCheck.rows[0].is_active) {
+        return res.status(403).json({ error: 'Conta inativa', code: 'INACTIVE' });
       }
     } catch (dbErr) {
       console.error('Ban check error:', dbErr.message);

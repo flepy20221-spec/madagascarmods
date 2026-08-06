@@ -97,22 +97,6 @@ async function accountHasValue(userId) {
 // O cliente envia somente o SHA-256 do ANDROID_ID com escopo do app. Contas da
 // versao anterior sao migradas de forma silenciosa usando o refresh token salvo
 // ou, como fallback, o device_id legado armazenado no mesmo aparelho.
-//
-// ============================================================================================
-// CORRECAO — CONTA DUPLICADA APOS ROTACAO DA CHAVE DE ASSINATURA (1.6.0+8 -> 1.7.0+9)
-//
-// Settings.Secure.ANDROID_ID e unico por combinacao aparelho + usuario Android + CHAVE DE
-// ASSINATURA do aplicativo. Quando o release deixou de usar signingConfigs.debug e passou a
-// usar a keystore propria, o ANDROID_ID do mesmo aparelho mudou e, com ele, o hash enviado
-// como device_account_key. A versao anterior desta rota procurava apenas a chave atual em
-// users.device_account_key; nao encontrando, tratava o aparelho como novo e criava outra conta.
-//
-// A partir daqui a conta nao depende mais de uma unica chave mutavel: toda chave ja vista e
-// registrada em device_account_aliases e a busca acontece pelo alias. Uma chave nunca pertence
-// a mais de um usuario (PRIMARY KEY), e a associacao continua exigindo prova de posse da conta
-// (chave conhecida, refresh token salvo ou device_id legado do mesmo aparelho). IP e modelo
-// jamais associam contas automaticamente.
-// ============================================================================================
 router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, async (req, res) => {
   const client = await db.getClient();
 
@@ -150,34 +134,19 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       [DEVICE_ACCOUNT_LOCK_NAMESPACE, deviceAccountKey]
     );
 
-    // Busca pelo alias: resolve tanto a chave atual quanto qualquer chave anterior do mesmo
-    // aparelho, inclusive apos rotacao da assinatura do APK. O UNION com users.device_account_key
-    // mantem compatibilidade com contas criadas antes da tabela de aliases existir.
     let userResult = await client.query(
-      `SELECT u.id, u.email, u.is_active, u.is_banned, u.device_account_key,
-              a.source AS alias_source
-         FROM device_account_aliases a
-         JOIN users u ON u.id = a.user_id
-        WHERE a.device_account_key = $1
-          AND u.merged_into_user_id IS NULL
-        UNION ALL
-       SELECT u.id, u.email, u.is_active, u.is_banned, u.device_account_key,
-              'device_account_key' AS alias_source
-         FROM users u
-        WHERE u.device_account_key = $1
-          AND u.merged_into_user_id IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM device_account_aliases a2
-             WHERE a2.device_account_key = $1
-          )
-        LIMIT 1`,
+      `SELECT id, email, is_active, is_banned, device_account_key
+         FROM users
+        WHERE device_account_key = $1
+        LIMIT 1
+        FOR UPDATE`,
       [deviceAccountKey]
     );
 
     let user = userResult.rows[0] || null;
     let accountCreated = false;
     let accountMigrated = false;
-    let migrationMethod = user ? (user.alias_source === 'device_account_key' ? 'device_account_key' : 'device_alias') : null;
+    let migrationMethod = null;
 
     // Primeiro caminho de migracao: refresh token valido salvo pela versao antiga.
     if (!user && typeof migration_refresh_token === 'string' && migration_refresh_token.length > 0) {
@@ -223,33 +192,19 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       if (user) migrationMethod = 'legacy_device_id';
     }
 
-    // Chave diferente da atual da conta, porem com posse comprovada (refresh token salvo,
-    // device_id legado do mesmo aparelho ou alias anterior). Este e exatamente o caso da
-    // rotacao da chave de assinatura: a chave nova passa a ser a principal e a antiga
-    // continua resolvivel como alias, sem criar outra conta e sem recorrer a IP ou modelo.
-    const requiresKeyRotation = Boolean(
-      user && user.device_account_key && user.device_account_key !== deviceAccountKey
-    );
-
-    if (requiresKeyRotation) {
-      const rotationProved = migrationMethod === 'refresh_token'
-        || migrationMethod === 'legacy_device_id'
-        || migrationMethod === 'device_alias';
-
-      if (!rotationProved) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: `Esta conta ja esta vinculada a outro aparelho. Contate ${SUPPORT_EMAIL}.`,
-          code: 'DEVICE_ACCOUNT_CONFLICT',
-          supportEmail: SUPPORT_EMAIL,
-        });
-      }
+    if (user && user.device_account_key && user.device_account_key !== deviceAccountKey) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `Esta conta ja esta vinculada a outro aparelho. Contate ${SUPPORT_EMAIL}.`,
+        code: 'DEVICE_ACCOUNT_CONFLICT',
+        supportEmail: SUPPORT_EMAIL,
+      });
     }
 
-    if (user && (requiresKeyRotation || !user.device_account_key)) {
+    if (user && !user.device_account_key) {
       await client.query(
-        `UPDATE users SET device_id = $1,
-                device_account_key = $1,
+        `UPDATE users
+            SET device_account_key = $1,
                 device_model = COALESCE($2, device_model),
                 app_version = COALESCE($3, app_version),
                 ip_address = $4,
@@ -292,45 +247,15 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       accountCreated = true;
     } else if (!accountMigrated) {
       await client.query(
-        `UPDATE users SET device_id = $1,
-                device_account_key = $1,
-                device_model = COALESCE($2, device_model),
-                app_version = COALESCE($3, app_version),
-                ip_address = $4,
+        `UPDATE users
+            SET device_model = COALESCE($1, device_model),
+                app_version = COALESCE($2, app_version),
+                ip_address = $3,
                 last_login_at = NOW(),
                 updated_at = NOW()
-          WHERE id = $5`,
-        [deviceAccountKey, safeDeviceModel, safeAppVersion, ip, user.id]
+          WHERE id = $4`,
+        [safeDeviceModel, safeAppVersion, ip, user.id]
       );
-    }
-
-    // Registra a chave atual como alias resolvivel da conta. O conflito e ignorado quando o
-    // alias ja pertence a este usuario; se pertencer a outro, nada e sobrescrito e o vinculo
-    // permanece exclusivo, conforme a PRIMARY KEY da tabela.
-    const aliasResult = await client.query(
-      `INSERT INTO device_account_aliases (
-         device_account_key, user_id, source, first_seen_at, last_seen_at, metadata
-       )
-       VALUES ($1, $2, $3, NOW(), NOW(), $4::jsonb)
-       ON CONFLICT (device_account_key) DO UPDATE
-          SET last_seen_at = NOW()
-        WHERE device_account_aliases.user_id = EXCLUDED.user_id
-       RETURNING user_id`,
-      [
-        deviceAccountKey,
-        user.id,
-        accountCreated ? 'account_created' : (migrationMethod || 'device_login'),
-        JSON.stringify({ appVersion: safeAppVersion, deviceModel: safeDeviceModel }),
-      ]
-    );
-
-    if (aliasResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: `Este aparelho ja esta vinculado a outra conta. Contate ${SUPPORT_EMAIL}.`,
-        code: 'DEVICE_ALIAS_CONFLICT',
-        supportEmail: SUPPORT_EMAIL,
-      });
     }
 
     if (user.is_banned) {

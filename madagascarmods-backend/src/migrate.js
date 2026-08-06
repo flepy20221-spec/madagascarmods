@@ -243,9 +243,7 @@ async function appliedMigrations() {
 function stripExplicitTransactionControl(sql) {
   return sql
     .split('\n')
-    // `END;` também encerra blocos PL/pgSQL. Removê-lo corrompe funções e
-    // blocos DO válidos; apenas BEGIN/COMMIT explícitos controlam a transação.
-    .filter((line) => !/^\s*(BEGIN|COMMIT)\s*;\s*$/i.test(line))
+    .filter((line) => !/^\s*(BEGIN|COMMIT|END)\s*;\s*$/i.test(line))
     .join('\n');
 }
 
