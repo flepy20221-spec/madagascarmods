@@ -8,6 +8,7 @@ const { authenticateAdmin, requireRole, JWT_SECRET } = require('../middleware/au
 const { adminLoginLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
 const faucetpay = require('../utils/faucetpay');
+const { UserMergeError, mergeUserAccounts } = require('../services/userMerge');
 
 const router = express.Router();
 
@@ -778,7 +779,9 @@ router.get('/faucetpay/rate', authenticateAdmin, async (req, res) => {
 // GET /api/admin/stats - Dashboard stats
 router.get('/stats', authenticateAdmin, async (req, res) => {
   try {
-    const userCount = await db.query('SELECT COUNT(*) as count FROM users WHERE is_active = true');
+    const userCount = await db.query(
+      'SELECT COUNT(*) as count FROM users WHERE is_active = true AND merged_into_user_id IS NULL'
+    );
     const withdrawalStats = await db.query(
       `SELECT status, COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM withdrawals GROUP BY status`
     );
@@ -808,38 +811,162 @@ router.get('/stats', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/users - List users
+// GET /api/admin/users - List users with unified support search
 router.get('/users', authenticateAdmin, async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const offset = (page - 1) * limit;
-    const search = req.query.search || '';
+    const search = String(req.query.search || '').trim().slice(0, 120);
+    const status = String(req.query.status || 'all').toLowerCase();
+    const appVersion = String(req.query.appVersion || '').trim().slice(0, 20);
 
-    let query = `SELECT u.id, u.email, u.device_id, u.ip_address, u.app_version, u.is_active, u.is_banned, 
-                        u.created_at, u.last_login_at, u.fraud_score, u.last_fraud_at, u.ban_reason,
-                        COALESCE(SUM(pl.amount), 0) as balance
-                 FROM users u
-                 LEFT JOIN points_ledger pl ON pl.user_id = u.id`;
-    
+    let query = `SELECT u.id, u.support_code, u.support_label, u.email,
+                        u.device_id, u.device_account_key, u.device_model,
+                        u.ip_address, u.app_version, u.is_active, u.is_banned,
+                        u.created_at, u.last_login_at, u.fraud_score,
+                        u.last_fraud_at, u.ban_reason, balance.total AS balance
+                   FROM users u
+                   CROSS JOIN LATERAL (
+                     SELECT COALESCE(SUM(pl.amount), 0) AS total
+                       FROM points_ledger pl
+                      WHERE pl.user_id = u.id
+                   ) balance
+                  WHERE u.merged_into_user_id IS NULL`;
+
     const params = [];
     if (search) {
-      query += ` WHERE u.email ILIKE $1`;
       params.push(`%${search}%`);
+      const p = `$${params.length}`;
+      query += ` AND (
+        u.support_code ILIKE ${p}
+        OR COALESCE(u.support_label, '') ILIKE ${p}
+        OR u.email ILIKE ${p}
+        OR u.id::text ILIKE ${p}
+        OR COALESCE(u.device_id, '') ILIKE ${p}
+        OR COALESCE(u.device_account_key, '') ILIKE ${p}
+        OR COALESCE(u.device_model, '') ILIKE ${p}
+        OR COALESCE(u.ip_address, '') ILIKE ${p}
+        OR EXISTS (
+          SELECT 1 FROM device_account_aliases alias
+           WHERE alias.user_id = u.id
+             AND alias.device_account_key ILIKE ${p}
+        )
+        OR EXISTS (
+          SELECT 1 FROM payout_destinations pd
+           WHERE pd.user_id = u.id
+             AND COALESCE(pd.value_masked, '') ILIKE ${p}
+        )
+        OR EXISTS (
+          SELECT 1 FROM pix_accounts pa
+           WHERE pa.user_id = u.id
+             AND (
+               COALESCE(pa.full_name, '') ILIKE ${p}
+               OR COALESCE(pa.pix_key_masked, '') ILIKE ${p}
+             )
+        )
+      )`;
     }
-    
-    query += ` GROUP BY u.id ORDER BY u.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+    if (status === 'active') {
+      query += ' AND u.is_active = true AND u.is_banned = false';
+    } else if (status === 'banned') {
+      query += ' AND u.is_banned = true';
+    } else if (status === 'inactive') {
+      query += ' AND u.is_active = false';
+    }
+
+    if (appVersion) {
+      params.push(appVersion);
+      query += ` AND u.app_version = $${params.length}`;
+    }
+
+    query += ` ORDER BY u.last_login_at DESC NULLS LAST, u.created_at DESC
+               LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
 
     const result = await db.query(query, params);
 
     res.json({
       success: true,
-      users: result.rows
+      users: result.rows,
+      pagination: { page, limit, hasMore: result.rows.length === limit }
     });
   } catch (error) {
     console.error('List users error:', error);
-    res.status(500).json({ error: 'Failed to list users' });
+    res.status(500).json({ error: 'Falha ao listar usuarios' });
+  }
+});
+
+// PATCH /api/admin/users/:id/support-label - internal human-readable label
+router.patch('/users/:id/support-label', authenticateAdmin, requireRole('support'), async (req, res) => {
+  try {
+    const supportLabel = typeof req.body.supportLabel === 'string'
+      ? req.body.supportLabel.trim().slice(0, 120)
+      : '';
+
+    const updated = await db.query(
+      `UPDATE users
+          SET support_label = NULLIF($1, ''), updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, support_code, support_label`,
+      [supportLabel, req.params.id]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+
+    await db.query(
+      `INSERT INTO audit_log (
+         actor_id, actor_type, action, target_type, target_id, new_value, ip_address
+       ) VALUES ($1, 'admin', 'USER_SUPPORT_LABEL_UPDATED', 'user', $2, $3, $4)`,
+      [
+        req.admin.id,
+        req.params.id,
+        JSON.stringify({ supportLabel: updated.rows[0].support_label }),
+        req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+      ]
+    );
+
+    res.json({ success: true, user: updated.rows[0] });
+  } catch (error) {
+    console.error('Update support label error:', error);
+    res.status(500).json({ error: 'Falha ao atualizar o rotulo de suporte' });
+  }
+});
+
+// POST /api/admin/users/:sourceId/merge - merge duplicate into canonical account
+router.post('/users/:sourceId/merge', authenticateAdmin, requireRole('super_admin'), async (req, res) => {
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    const result = await mergeUserAccounts({
+      client,
+      sourceUserId: req.params.sourceId,
+      targetUserId: req.body.targetUserId,
+      adminId: req.admin.id,
+      reason: req.body.reason,
+      requestIp: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+      confirmSupportCode: req.body.confirmSupportCode,
+    });
+
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      message: `Contas reconciliadas. A conta principal agora e ${result.target.support_code}.`,
+      ...result,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error instanceof UserMergeError) {
+      return res.status(error.statusCode).json({ error: error.message, code: error.code });
+    }
+    console.error('Merge users error:', error);
+    res.status(500).json({ error: 'Falha ao reconciliar as contas' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1334,15 +1461,20 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
 
     const userResult = await db.query(
-      `SELECT u.id, u.email, u.device_id, u.device_model, u.ip_address, u.app_version,
-              u.is_active, u.is_banned, u.ban_reason, u.banned_at, u.banned_by,
-              u.fraud_score, u.last_fraud_at, u.device_migration_allowed,
+      `SELECT u.id, u.support_code, u.support_label, u.email,
+              u.device_id, u.device_account_key, u.device_model,
+              u.ip_address, u.app_version, u.is_active, u.is_banned,
+              u.ban_reason, u.banned_at, u.banned_by, u.fraud_score,
+              u.last_fraud_at, u.device_migration_allowed,
+              u.merged_into_user_id, u.merged_at,
+              merged.support_code AS merged_into_support_code,
               u.created_at, u.updated_at, u.last_login_at,
               COALESCE(SUM(pl.amount), 0) as balance
        FROM users u
+       LEFT JOIN users merged ON merged.id = u.merged_into_user_id
        LEFT JOIN points_ledger pl ON pl.user_id = u.id
        WHERE u.id = $1
-       GROUP BY u.id`,
+       GROUP BY u.id, merged.support_code`,
       [id]
     );
 
@@ -1351,6 +1483,14 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
     }
 
     const user = userResult.rows[0];
+
+    const aliasesResult = await db.query(
+      `SELECT device_account_key, source, first_seen_at, last_seen_at, metadata
+         FROM device_account_aliases
+        WHERE user_id = $1
+        ORDER BY last_seen_at DESC`,
+      [id]
+    );
 
     // Stats
     const statsResult = await db.query(
@@ -1405,6 +1545,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
           todayRewards: parseInt(todayResult.rows[0].count),
           todayEarned: parseInt(todayResult.rows[0].total)
         },
+        deviceAliases: aliasesResult.rows,
         payoutDestinations: payoutResult.rows,
         pixAccounts: pixResult.rows,
         withdrawals: withdrawalsResult.rows
