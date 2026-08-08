@@ -38,6 +38,7 @@
  * ===========================================================================================
  */
 const express = require('express');
+const { clientIp } = require('../middleware/antiFraud');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateAdmin, requireRole } = require('../middleware/auth');
@@ -79,7 +80,8 @@ function normalizeReason(raw) {
   return reason.slice(0, 500);
 }
 
-const clientIp = (req) => req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+// clientIp vem de middleware/antiFraud: resolve o IP real atras do proxy e evita
+// gravar a lista completa do X-Forwarded-For no campo ip_address.
 
 // -------------------------------------------------------------------------------------------
 // GET /api/admin/payout-destinations/:id/reveal

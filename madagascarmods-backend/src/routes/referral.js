@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const crypto = require('crypto');
+const { clientIp } = require('../middleware/antiFraud');
 
 /**
  * ============================================================================
@@ -140,7 +141,7 @@ router.post('/apply', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { code, ad_watched } = req.body;
-    const userIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+    const userIP = clientIp(req);
 
     // Exigir que o usuário tenha assistido um anúncio antes de aplicar código
     if (!ad_watched) {

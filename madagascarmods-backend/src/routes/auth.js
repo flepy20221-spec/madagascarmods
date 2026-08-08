@@ -50,9 +50,63 @@ const router = express.Router();
 // a nova regra de uma unica conta vinculada a cada device_id.
 const MAX_ACCOUNTS_PER_DEVICE = 1;
 
-// Teto de contas criadas pelo mesmo IP em 24h. Redes compartilhadas (escola, trabalho,
-// CGNAT de operadora movel) justificam um valor mais folgado.
-const MAX_ACCOUNTS_PER_IP_24H = 8;
+// ============================================================================================
+// TETO DE CONTAS POR IP EM 24H — CORRECAO DE FALSO POSITIVO EM MASSA (CGNAT)
+//
+// O valor anterior era 8, herdado de uma premissa de "um IP = uma casa". Na pratica a base
+// do CashPix acessa por dados moveis, e as operadoras brasileiras usam CGNAT: Claro, Vivo e
+// TIM colocam MILHARES de celulares distintos atras de um unico IPv4 publico (faixas como
+// 152.233.x.x e 189.x.x.x). Com teto 8, bastavam oito cadastros de pessoas diferentes na
+// mesma operadora para que todo usuario novo daquele IP recebesse
+// "Muitas contas criadas nesta rede" pelas 24h seguintes — exatamente o bloqueio relatado
+// em producao, atingindo usuario legitimo e nao fraudador.
+//
+// Por que elevar e seguro: o anti-farm real desta base NAO depende do IP. Ele e garantido
+// por aparelho, de forma atomica no banco:
+//   - idx_users_device_account_key_unique (migration 005): uma conta por device_account_key
+//   - idx_users_device_id_unique: mesma garantia para clientes legados
+//   - device_account_aliases (PRIMARY KEY): uma chave de aparelho nunca em duas contas
+//   - MAX_ACCOUNTS_PER_DEVICE = 1 + pg_advisory_xact_lock na criacao
+// Ou seja: criar N contas exige N aparelhos fisicos distintos. O IP passa a ser o que sempre
+// deveria ter sido — um freio contra volume anormal, nao a trava de primeira linha.
+// ============================================================================================
+const MAX_ACCOUNTS_PER_IP_24H = Number(process.env.MAX_ACCOUNTS_PER_IP_24H) > 0
+  ? Number(process.env.MAX_ACCOUNTS_PER_IP_24H)
+  : 60;
+
+// IPs que nunca devem servir de chave de bloqueio: ausentes, loopback ou private range.
+// Sem isto, uma falha na resolucao do IP real colapsaria todos os cadastros num mesmo
+// bucket (por exemplo "::1") e bloquearia a base inteira apos algumas contas.
+function isUnreliableIp(ip) {
+  if (!ip || typeof ip !== 'string') return true;
+  const clean = ip.trim().replace(/^::ffff:/i, '');
+  if (!clean) return true;
+  if (clean === '::1' || clean === '127.0.0.1' || clean.startsWith('127.')) return true;
+  if (clean === 'unknown') return true;
+  return false;
+}
+
+/**
+ * Conta quantos APARELHOS DISTINTOS criaram conta neste IP nas ultimas 24h.
+ *
+ * A contagem anterior usava COUNT(*) sobre linhas de users, o que inflava o numero:
+ * contas antigas do mesmo aparelho (reinstalacao, rotacao de chave de assinatura,
+ * migracao de alias) somavam varias unidades e consumiam a cota sem existir farm algum.
+ * Contar dispositivos distintos mede o que realmente importa.
+ *
+ * Retorna null quando o IP nao e confiavel, sinalizando que a checagem deve ser ignorada.
+ */
+async function countDevicesCreatedByIp(queryable, ip) {
+  if (isUnreliableIp(ip)) return null;
+  const result = await queryable.query(
+    `SELECT COUNT(DISTINCT COALESCE(device_account_key, device_id, id::text)) AS count
+       FROM users
+      WHERE ip_address = $1
+        AND created_at > NOW() - INTERVAL '24 hours'`,
+    [ip]
+  );
+  return parseInt(result.rows[0].count, 10);
+}
 
 // Namespace exclusivo da criacao/recuperacao de conta por aparelho. A trava evita
 // que duas aberturas simultaneas do app criem duas contas antes do indice unico.
@@ -329,14 +383,17 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     }
 
     if (!user) {
-      const ipAccounts = await client.query(
-        `SELECT COUNT(*) AS count FROM users
-          WHERE ip_address = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
-        [ip]
-      );
-      if (parseInt(ipAccounts.rows[0].count, 10) >= MAX_ACCOUNTS_PER_IP_24H) {
+      // Freio por IP contra farm em volume. Ignorado quando o IP nao e confiavel, e
+      // medido em aparelhos distintos com teto compativel com CGNAT de operadora movel.
+      const devicesFromIp = await countDevicesCreatedByIp(client, ip);
+      if (devicesFromIp !== null && devicesFromIp >= MAX_ACCOUNTS_PER_IP_24H) {
         await client.query('ROLLBACK');
-        await logAuthEvent('DEVICE_REGISTER_BLOCKED_IP_LIMIT', null, { ip }, req);
+        await logAuthEvent(
+          'DEVICE_REGISTER_BLOCKED_IP_LIMIT',
+          null,
+          { ip, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H },
+          req
+        );
         return res.status(429).json({
           error: 'Muitas contas criadas nesta rede. Tente novamente mais tarde.',
           code: 'IP_ACCOUNT_LIMIT',
@@ -552,13 +609,14 @@ router.post('/register', authLimiter, loginBotDetection, async (req, res) => {
     }
 
     // Limite de contas por IP em 24h (anti-farm)
-    const ipAccounts = await db.query(
-      `SELECT COUNT(*) AS count FROM users
-        WHERE ip_address = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
-      [ip]
-    );
-    if (parseInt(ipAccounts.rows[0].count, 10) >= MAX_ACCOUNTS_PER_IP_24H) {
-      await logAuthEvent('REGISTER_BLOCKED_IP_LIMIT', null, { ip, email: normalizedEmail }, req);
+    const devicesFromIp = await countDevicesCreatedByIp(db, ip);
+    if (devicesFromIp !== null && devicesFromIp >= MAX_ACCOUNTS_PER_IP_24H) {
+      await logAuthEvent(
+        'REGISTER_BLOCKED_IP_LIMIT',
+        null,
+        { ip, email: normalizedEmail, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H },
+        req
+      );
       return res.status(429).json({
         error: 'Muitas contas criadas nesta rede. Tente novamente mais tarde.',
         code: 'IP_ACCOUNT_LIMIT'
@@ -641,13 +699,14 @@ router.post('/login', authLimiter, loginBotDetection, async (req, res) => {
         });
       }
 
-      const ipAccounts = await db.query(
-        `SELECT COUNT(*) AS count FROM users
-          WHERE ip_address = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
-        [ip]
-      );
-      if (parseInt(ipAccounts.rows[0].count, 10) >= MAX_ACCOUNTS_PER_IP_24H) {
-        await logAuthEvent('LOGIN_BLOCKED_IP_LIMIT', null, { ip, email: normalizedEmail }, req);
+      const devicesFromIp = await countDevicesCreatedByIp(db, ip);
+      if (devicesFromIp !== null && devicesFromIp >= MAX_ACCOUNTS_PER_IP_24H) {
+        await logAuthEvent(
+          'LOGIN_BLOCKED_IP_LIMIT',
+          null,
+          { ip, email: normalizedEmail, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H },
+          req
+        );
         return res.status(429).json({
           error: 'Muitas contas criadas nesta rede. Tente novamente mais tarde.',
           code: 'IP_ACCOUNT_LIMIT'

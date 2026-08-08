@@ -138,10 +138,20 @@ const payoutSetupLimiter = rateLimit({
  * aqui nao e forca bruta de credencial, e sim criacao de contas em massa e sondagem de
  * e-mails. O valor precisa ser tolerante: por causa do CGNAT das operadoras moveis, muitos
  * usuarios legitimos compartilham o mesmo IP aparente.
+ *
+ * CORRECAO: o valor 20 ainda era baixo demais para CGNAT. Um unico IP de operadora atende
+ * milhares de aparelhos; vinte requisicoes de login/cadastro em quinze minutos e trafego
+ * normal, e o estouro bloqueava usuario legitimo. Elevado e tornado configuravel, alinhado
+ * ao AUTH_RATE_LIMIT_MAX de src/index.js. A contencao de farm de contas continua sendo
+ * feita por aparelho (indices unicos de device_account_key e device_id).
  */
+const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX) > 0
+  ? Number(process.env.AUTH_RATE_LIMIT_MAX)
+  : 120;
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: AUTH_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: {

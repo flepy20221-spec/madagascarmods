@@ -97,12 +97,34 @@ const generalLimiter = rateLimit({
   message: { error: 'Too many requests, please try again later.' }
 });
 
+// ---------------------------------------------------------------------------
+// Limite das rotas de autenticacao (por IP)
+//
+// CORRECAO DE FALSO POSITIVO EM MASSA (CGNAT):
+// O valor anterior era 10 requests / 15 min por IP. Este limiter roda ANTES de qualquer
+// rota, portanto era a trava mais restritiva de toda a cadeia: sob CGNAT de operadora
+// movel, onde milhares de celulares compartilham um mesmo IPv4 publico, dez requisicoes
+// esgotavam a cota em segundos e derrubavam login e cadastro para todos os usuarios
+// daquele IP durante 15 minutos.
+//
+// O login do app nao usa senha (ver VULN-05 em routes/auth.js), logo nao existe forca
+// bruta de credencial a conter aqui. O abuso possivel (farm de contas) e barrado por
+// aparelho, de forma atomica, pelos indices unicos de device_account_key e device_id.
+// Este limiter volta a ser o que deve ser: protecao contra flood de requisicoes.
+// ---------------------------------------------------------------------------
+const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX) > 0
+  ? Number(process.env.AUTH_RATE_LIMIT_MAX)
+  : 120;
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: AUTH_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many auth attempts, please try again later.' }
+  message: {
+    error: 'Muitas tentativas de acesso. Aguarde alguns minutos.',
+    code: 'AUTH_RATE_LIMIT'
+  }
 });
 
 // O callback SSV vem dos servidores do Google e nao deve ser limitado por IP:

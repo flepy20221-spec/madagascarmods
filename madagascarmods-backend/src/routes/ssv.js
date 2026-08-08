@@ -19,6 +19,7 @@ const {
 } = require('../utils/admobSsv');
 const { drawRewardPoints, POINT_VALUES } = require('../utils/pointsRandom');
 const { checkReferralBonusActivation } = require('./referral');
+const { clientIp } = require('../middleware/antiFraud');
 
 const router = express.Router();
 
@@ -396,7 +397,7 @@ router.get('/callback', async (req, res) => {
           JSON.stringify(queryParams),
           data.transactionId || null,
           rewardSessionId,
-          req.headers['x-forwarded-for'] || req.socket.remoteAddress
+          clientIp(req)
         ]
       );
 

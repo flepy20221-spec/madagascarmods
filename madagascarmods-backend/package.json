@@ -9,6 +9,7 @@
     "migrate": "node src/migrate.js",
     "test": "node --test test/pointsRandom.test.js tests/concurrency.test.js tests/device_account_route.test.js tests/device_identity.test.js tests/hmac_compat.test.js tests/mission_admin_contract.test.js tests/pix_withdrawal_persistence.test.js tests/reward_polling_antifraud.test.js tests/ssv_reward_credit.test.js tests/ssv_verification.test.js",
     "test:ssv": "node --test tests/ssv_reward_credit.test.js tests/ssv_verification.test.js",
+    "test:ip": "node --test tests/ip_limit_cgnat.test.js",
     "test:attack": "node tests/attack_simulation.test.js"
   },
   "dependencies": {

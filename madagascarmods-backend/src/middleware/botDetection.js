@@ -312,32 +312,79 @@ async function botDetectionMiddleware(req, res, next) {
   }
 }
 
+// ============================================================================================
+// LIMIARES DE LOGIN POR IP — CORRECAO DE FALSO POSITIVO EM MASSA (CGNAT)
+//
+// O comportamento anterior devolvia 429 quando 5 contas do mesmo ip_address registravam
+// last_login_at nos ultimos 10 minutos. Dois defeitos graves:
+//
+//   1. Sob CGNAT de operadora movel (Claro, Vivo, TIM), milhares de celulares distintos
+//      compartilham um unico IPv4 publico. Cinco logins em dez minutos e trafego normal de
+//      um IP de operadora, nao ataque. O resultado em producao era usuario legitimo travado.
+//   2. A regra contava LOGINS, nao criacoes de conta. Ou seja, punia justamente quem JA tinha
+//      conta e saldo, impedindo o acesso a propria carteira. O comentario original do arquivo
+//      dizia "detecta criacao em massa de contas", mas a consulta nunca mediu isso.
+//
+// Novo desenho em duas faixas:
+//   - Faixa de observacao (LOGIN_IP_SOFT_LIMIT): registra LOGIN_IP_BURST_OBSERVED no
+//     audit_log e LIBERA a requisicao. Da visibilidade no painel sem punir ninguem.
+//   - Faixa de bloqueio (LOGIN_IP_HARD_LIMIT): volume que nao tem explicacao legitima nem
+//     sob CGNAT. Somente aqui devolve 429.
+//
+// O anti-farm efetivo continua sendo por aparelho (indices unicos de device_account_key e
+// device_id, device_account_aliases e MAX_ACCOUNTS_PER_DEVICE em routes/auth.js), alem da
+// deteccao de phantom rewards deste mesmo arquivo, que mede abuso real de recompensa.
+// ============================================================================================
+const LOGIN_IP_SOFT_LIMIT = Number(process.env.LOGIN_IP_SOFT_LIMIT) > 0
+  ? Number(process.env.LOGIN_IP_SOFT_LIMIT)
+  : 40;
+
+const LOGIN_IP_HARD_LIMIT = Number(process.env.LOGIN_IP_HARD_LIMIT) > 0
+  ? Number(process.env.LOGIN_IP_HARD_LIMIT)
+  : 200;
+
 /**
- * Middleware de detecção de bots no LOGIN.
- * Detecta criação em massa de contas do mesmo IP.
+ * IPs que nunca devem servir de chave de bloqueio. Sem esta guarda, uma falha na
+ * resolucao do IP real agruparia a base inteira num mesmo bucket (por exemplo "::1")
+ * e o limite seria atingido de imediato para todos.
+ */
+function isUnreliableIp(ip) {
+  if (!ip || typeof ip !== 'string') return true;
+  const clean = ip.trim().replace(/^::ffff:/i, '');
+  if (!clean || clean === 'unknown') return true;
+  if (clean === '::1' || clean.startsWith('127.')) return true;
+  return false;
+}
+
+/**
+ * Middleware de deteccao de abuso de login por IP.
+ * Observa rajadas e bloqueia apenas volume evidentemente automatizado.
  */
 async function loginBotDetection(req, res, next) {
   try {
     const ip = clientIp(req);
-    if (!ip) return next();
+    if (isUnreliableIp(ip)) return next();
 
-    // Contar logins/registros deste IP nos últimos 10 minutos
+    // Aparelhos DISTINTOS que se autenticaram por este IP nos ultimos 10 minutos.
+    // Contar aparelhos, e nao linhas de users, evita inflar o numero com contas
+    // antigas do mesmo aparelho (reinstalacao, rotacao de chave de assinatura).
     const recentLogins = await db.query(
-      `SELECT COUNT(*) as count FROM users
-       WHERE ip_address = $1 AND last_login_at > NOW() - INTERVAL '10 minutes'`,
+      `SELECT COUNT(DISTINCT COALESCE(device_account_key, device_id, id::text)) AS count
+         FROM users
+        WHERE ip_address = $1
+          AND last_login_at > NOW() - INTERVAL '10 minutes'`,
       [ip]
     );
 
     const count = parseInt(recentLogins.rows[0]?.count || '0', 10);
 
-    // Mais de 5 logins do mesmo IP em 10 min = suspeito
-    if (count >= 5) {
-      console.warn(`[BotDetection] Login rate limit for IP ${ip} (${count} logins in 10min)`);
+    if (count >= LOGIN_IP_HARD_LIMIT) {
+      console.warn(`[BotDetection] Login BLOCKED for IP ${ip} (${count} devices in 10min)`);
 
       await db.query(
         `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
          VALUES ('system', 'system', 'LOGIN_RATE_LIMIT', 'ip', $1, $2, $1)`,
-        [ip, JSON.stringify({ count, threshold: 5 })]
+        [ip, JSON.stringify({ count, threshold: LOGIN_IP_HARD_LIMIT })]
       ).catch(() => {});
 
       return res.status(429).json({
@@ -345,6 +392,22 @@ async function loginBotDetection(req, res, next) {
         code: 'LOGIN_RATE_LIMITED',
         retryAfter: 600,
       });
+    }
+
+    // Faixa de observacao: fica visivel no painel para investigacao, sem punir o usuario.
+    if (count >= LOGIN_IP_SOFT_LIMIT) {
+      console.warn(`[BotDetection] Login burst observed for IP ${ip} (${count} devices in 10min)`);
+
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ('system', 'system', 'LOGIN_IP_BURST_OBSERVED', 'ip', $1, $2, $1)`,
+        [ip, JSON.stringify({
+          count,
+          softLimit: LOGIN_IP_SOFT_LIMIT,
+          hardLimit: LOGIN_IP_HARD_LIMIT,
+          action: 'allowed',
+        })]
+      ).catch(() => {});
     }
 
     next();

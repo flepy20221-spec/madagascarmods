@@ -9,6 +9,11 @@ const { adminLoginLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
 const faucetpay = require('../utils/faucetpay');
 const { UserMergeError, mergeUserAccounts } = require('../services/userMerge');
+// IP real do cliente atras do proxy. Padroniza o registro em audit_log: antes cada
+// ponto usava req.headers['x-forwarded-for'] diretamente, gravando a lista inteira
+// ("ip1, ip2, ip3") quando havia mais de um salto, o que inutiliza o campo para
+// investigacao e para qualquer filtro por IP no painel.
+const { clientIp } = require('../middleware/antiFraud');
 
 const router = express.Router();
 
@@ -18,7 +23,7 @@ async function logSecurityEvent(action, detail, req) {
     await db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, new_value, ip_address)
        VALUES (NULL, 'system', $1, 'security', $2, $3)`,
-      [action, JSON.stringify(detail), req.ip || req.socket.remoteAddress]
+      [action, JSON.stringify(detail), clientIp(req)]
     );
   } catch (e) {
     console.error('[Security] Falha ao registrar evento:', e.message);
@@ -242,7 +247,7 @@ router.post('/payout-destinations/:id/review', authenticateAdmin, requireRole('s
         id,
         JSON.stringify({ status: 'PENDING' }),
         JSON.stringify({ status: newStatus, reason: reason || null }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -436,7 +441,7 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
           ltcAmount: paymentResult ? paymentResult.ltcAmount : null,
           txHash: paymentResult ? (paymentResult.tx_hash || paymentResult.payout_hash) : null
         }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -545,7 +550,7 @@ router.post('/withdrawals/:id/reject', authenticateAdmin, requireRole('finance')
     await client.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
        VALUES ($1, 'admin', 'WITHDRAWAL_REJECTED', 'withdrawal', $2, $3, $4)`,
-      [req.admin.id, id, JSON.stringify({ reason, points_refunded: withdrawal.rows[0].points_debited }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+      [req.admin.id, id, JSON.stringify({ reason, points_refunded: withdrawal.rows[0].points_debited }), clientIp(req)]
     );
 
     await client.query('COMMIT');
@@ -659,7 +664,7 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
             exchange_rate: paymentResult.exchangeRate,
             tx_hash: paymentResult.tx_hash 
           }),
-          req.headers['x-forwarded-for'] || req.socket.remoteAddress
+          clientIp(req)
         ]
       );
 
@@ -689,7 +694,7 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
           req.admin.id, 
           id, 
           JSON.stringify({ error: paymentResult.message, errorCode: paymentResult.errorCode }),
-          req.headers['x-forwarded-for'] || req.socket.remoteAddress
+          clientIp(req)
         ]
       );
 
@@ -719,7 +724,7 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
          VALUES ($1, 'admin', 'FAUCETPAY_PAYMENT_UNCONFIRMED', 'withdrawal', $2, $3, $4)`,
         [req.admin.id, req.params.id,
          JSON.stringify({ error: error.message, requiresManualCheck: true }),
-         req.ip || req.socket.remoteAddress]
+         clientIp(req)]
       );
     } catch (revertErr) {
       console.error('Failed to mark withdrawal as unconfirmed:', revertErr);
@@ -925,7 +930,7 @@ router.patch('/users/:id/support-label', authenticateAdmin, requireRole('support
         req.admin.id,
         req.params.id,
         JSON.stringify({ supportLabel: updated.rows[0].support_label }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+        clientIp(req),
       ]
     );
 
@@ -948,7 +953,7 @@ router.post('/users/:sourceId/merge', authenticateAdmin, requireRole('super_admi
       targetUserId: req.body.targetUserId,
       adminId: req.admin.id,
       reason: req.body.reason,
-      requestIp: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+      requestIp: clientIp(req),
       confirmSupportCode: req.body.confirmSupportCode,
     });
 
@@ -1079,7 +1084,7 @@ router.post('/users/:id/points', authenticateAdmin, requireRole('finance'), asyn
         id,
         JSON.stringify({ balance: currentBalance }),
         JSON.stringify({ balance: newBalance, operation: op, amount: Number(amount), reason }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -1140,7 +1145,7 @@ router.post('/users/:id/ban', authenticateAdmin, requireRole('support', 'finance
         banned ? 'USER_BANNED' : 'USER_UNBANNED',
         id,
         JSON.stringify({ banned: !!banned, reason }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -1248,7 +1253,7 @@ router.post('/pix-accounts/:id/review', authenticateAdmin, requireRole('support'
         id,
         JSON.stringify({ status: 'PENDING' }),
         JSON.stringify({ status: newStatus, reason: reason || null }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -1312,7 +1317,7 @@ router.post('/withdrawals/:id/mark-paid', authenticateAdmin, requireRole('financ
       [
         req.admin.id, id,
         JSON.stringify({ amount: w.amount, payment_method: w.payment_method, tx_reference }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -1377,7 +1382,7 @@ router.put('/users/:id', authenticateAdmin, requireRole('finance'), async (req, 
         id,
         JSON.stringify({ email: oldData.email, is_active: oldData.is_active }),
         JSON.stringify({ email: email || oldData.email, is_active: is_active !== undefined ? is_active : oldData.is_active }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -1439,7 +1444,7 @@ router.post('/users/:id/allow-device-change', authenticateAdmin, requireRole('su
           email: updated.rows[0].email,
           previous_device_id: updated.rows[0].device_id
         }),
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress
+        clientIp(req)
       ]
     );
 
@@ -1661,7 +1666,7 @@ router.post('/payout-destinations/:id/revoke', authenticateAdmin, requireRole('f
     await db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
        VALUES ($1, 'admin', 'PAYOUT_DESTINATION_REVOKED', 'payout_destination', $2, $3, $4)`,
-      [req.admin.id, id, JSON.stringify({ reason }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+      [req.admin.id, id, JSON.stringify({ reason }), clientIp(req)]
     );
 
     res.json({ success: true, message: 'Destino de pagamento revogado' });
@@ -1691,7 +1696,7 @@ router.post('/pix-accounts/:id/revoke', authenticateAdmin, requireRole('finance'
     await db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
        VALUES ($1, 'admin', 'PIX_ACCOUNT_REVOKED', 'pix_account', $2, $3, $4)`,
-      [req.admin.id, id, JSON.stringify({ reason }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+      [req.admin.id, id, JSON.stringify({ reason }), clientIp(req)]
     );
 
     res.json({ success: true, message: 'Conta PIX revogada' });
@@ -1798,7 +1803,7 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
     await db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, old_value, new_value, ip_address)
        VALUES ($1, 'admin', 'SYSTEM_CONFIG_UPDATED', 'system_config', NULL, $2, $3, $4)`,
-      [req.admin.id, JSON.stringify({ key, value: oldValue }), JSON.stringify({ key, value }), req.headers['x-forwarded-for'] || req.socket.remoteAddress]
+      [req.admin.id, JSON.stringify({ key, value: oldValue }), JSON.stringify({ key, value }), clientIp(req)]
     );
 
     res.json({ success: true, message: `Configura\u00e7\u00e3o '${key}' atualizada` });

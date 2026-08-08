@@ -6,6 +6,7 @@ const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { withdrawalLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
 const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
+const { clientIp } = require('../middleware/antiFraud');
 
 // Namespace do advisory lock de saque. Precisa ser o MESMO valor usado em
 // pix_withdrawals.js: os dois fluxos consomem o mesmo saldo de pontos e por isso
@@ -203,7 +204,7 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       await db.query(
         `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
          VALUES ($1, 'system', 'WITHDRAWAL_BOT_BAN', 'user', $1, $2, $3)`,
-        [userId, JSON.stringify({ ssvCount, balance, reason: 'zero_ssv_with_balance' }), req.headers['x-forwarded-for'] || req.socket?.remoteAddress]
+        [userId, JSON.stringify({ ssvCount, balance, reason: 'zero_ssv_with_balance' }), clientIp(req)]
       ).catch(() => {});
 
       console.warn(`[Withdrawal] AUTO-BAN user ${userId}: attempted withdrawal with 0 SSV rewards`);
@@ -234,7 +235,7 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       await db.query(
         `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
          VALUES ($1, 'system', 'LOW_SSV_RATIO_WITHDRAWAL', 'user', $1, $2, $3)`,
-        [userId, JSON.stringify({ ssvRatio: ssvRatio.toFixed(2), ssvPoints, balance }), req.headers['x-forwarded-for'] || req.socket?.remoteAddress]
+        [userId, JSON.stringify({ ssvRatio: ssvRatio.toFixed(2), ssvPoints, balance }), clientIp(req)]
       ).catch(() => {});
 
       console.warn(`[Withdrawal] LOW SSV RATIO for user ${userId}: ${(ssvRatio*100).toFixed(0)}% (${ssvPoints}/${balance})`);

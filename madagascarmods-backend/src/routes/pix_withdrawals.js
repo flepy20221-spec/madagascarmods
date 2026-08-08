@@ -5,6 +5,7 @@ const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { withdrawalLimiter } = require('../middleware/rateLimits');
 const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
+const { clientIp } = require('../middleware/antiFraud');
 
 // Mesmo namespace usado em withdrawals.js (FaucetPay).
 // Os dois fluxos debitam o mesmo saldo de pontos, portanto precisam compartilhar o lock:
@@ -128,7 +129,7 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
       ).catch(() => {});
       await db.query(
         `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address) VALUES ($1, 'system', 'WITHDRAWAL_BOT_BAN', 'user', $1, $2, $3)`,
-        [userId, JSON.stringify({ ssvCount, balance, method: 'pix' }), req.headers['x-forwarded-for'] || req.socket?.remoteAddress]
+        [userId, JSON.stringify({ ssvCount, balance, method: 'pix' }), clientIp(req)]
       ).catch(() => {});
       console.warn(`[PixWithdrawal] AUTO-BAN user ${userId}: attempted PIX withdrawal with 0 SSV rewards`);
       return res.status(403).json({ error: 'Conta suspensa por atividade irregular.', code: 'ACCOUNT_BANNED' });
