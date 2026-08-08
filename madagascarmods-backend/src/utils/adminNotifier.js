@@ -48,8 +48,31 @@
  * ============================================================================================
  */
 
-// Timeout curto: um canal lento nao deve manter conexoes penduradas no servidor.
-const NOTIFY_TIMEOUT_MS = 5000;
+/**
+ * Timeout por tentativa de envio.
+ *
+ * Historico desta constante (vale registrar, porque o valor anterior causou falha real):
+ * o valor original era 5000ms, escolhido para "nao manter conexoes penduradas". Na pratica
+ * isso quebrou o canal ntfy em producao, com seis ocorrencias de
+ * `[AdminNotifier] ntfy falhou: This operation was aborted` — que e a mensagem do
+ * AbortController, ou seja, timeout, nao recusa de conexao.
+ *
+ * Medicao que motivou a mudanca: um POST ao ntfy.sh a partir de conexao NOVA custa ~3s
+ * so de handshake TLS (o ntfy.sh publico e uma instancia unica em DigitalOcean, sem CDN
+ * na frente). Como alerta de saque e evento esporadico, quase toda notificacao paga esse
+ * custo integral, sem keep-alive aproveitavel. Na rede do datacenter o custo passa de 5s.
+ * O Discord nao sofria do mesmo mal por estar atras da Cloudflare, com PoP anycast proximo.
+ *
+ * Elevar este valor NAO atrasa o usuario: notifyAdmin e chamado sem `await`, sempre depois
+ * do COMMIT. O efeito e apenas uma promise pendente em background.
+ */
+const NOTIFY_TIMEOUT_MS = 15000;
+
+// Tentativas por canal. A primeira falha de rede costuma ser transitoria; uma segunda
+// tentativa curta resolve a maioria dos casos sem introduzir risco de duplicidade
+// relevante (o custo de um alerta repetido e muito menor que o de um alerta perdido).
+const NOTIFY_MAX_ATTEMPTS = 2;
+const NOTIFY_RETRY_DELAY_MS = 1500;
 
 /**
  * Catalogo de eventos. Centralizar aqui evita que cada rota invente seu proprio titulo, cor e
@@ -107,23 +130,56 @@ function categoryEnabled(category) {
   return raw.split(',').map(c => c.trim().toLowerCase()).filter(Boolean).includes(category);
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * POST com timeout, sem lancar excecao para o chamador.
+ * POST com timeout e retentativa, sem lancar excecao para o chamador.
+ *
+ * O log inclui DURACAO e STATUS HTTP de proposito. A versao anterior registrava apenas
+ * `${channelName} falhou: ${err.message}`, o que produzia a linha "This operation was
+ * aborted" sem indicar quanto tempo havia passado — impossivel distinguir, pelo log,
+ * um timeout de 5s de uma recusa imediata de conexao. Com a duracao registrada, o
+ * diagnostico deixa de depender de suposicao.
  */
 async function safePost(url, options, channelName) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    if (!res.ok) {
+  for (let attempt = 1; attempt <= NOTIFY_MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
+    const startedAt = Date.now();
+    const suffix = NOTIFY_MAX_ATTEMPTS > 1 ? ` (tentativa ${attempt}/${NOTIFY_MAX_ATTEMPTS})` : '';
+
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      const elapsed = Date.now() - startedAt;
+
+      if (res.ok) {
+        console.log(`[AdminNotifier] ${channelName} entregue: HTTP ${res.status} em ${elapsed}ms${suffix}`);
+        return true;
+      }
+
       const body = await res.text().catch(() => '');
-      console.error(`[AdminNotifier] ${channelName} respondeu ${res.status}: ${body.slice(0, 200)}`);
+      console.error(
+        `[AdminNotifier] ${channelName} respondeu HTTP ${res.status} em ${elapsed}ms${suffix}: ${body.slice(0, 200)}`
+      );
+
+      // 4xx (exceto 429) e erro de configuracao: topico invalido, token errado, payload
+      // recusado. Repetir nao muda o resultado, apenas gera ruido no log.
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) return false;
+    } catch (err) {
+      const elapsed = Date.now() - startedAt;
+      const motivo = err.name === 'AbortError'
+        ? `timeout apos ${NOTIFY_TIMEOUT_MS}ms`
+        : `${err.name}: ${err.message}`;
+      console.error(`[AdminNotifier] ${channelName} falhou em ${elapsed}ms${suffix}: ${motivo}`);
+    } finally {
+      clearTimeout(timer);
     }
-  } catch (err) {
-    console.error(`[AdminNotifier] ${channelName} falhou: ${err.message}`);
-  } finally {
-    clearTimeout(timer);
+
+    if (attempt < NOTIFY_MAX_ATTEMPTS) await sleep(NOTIFY_RETRY_DELAY_MS);
   }
+
+  console.error(`[AdminNotifier] ${channelName} desistiu apos ${NOTIFY_MAX_ATTEMPTS} tentativas`);
+  return false;
 }
 
 /**
