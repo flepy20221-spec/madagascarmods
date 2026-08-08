@@ -826,24 +826,19 @@ router.get('/users', authenticateAdmin, async (req, res) => {
     const status = String(req.query.status || 'all').toLowerCase();
     const appVersion = String(req.query.appVersion || '').trim().slice(0, 20);
 
-    let query = `SELECT u.id, u.support_code, u.support_label, u.email,
-                        u.device_id, u.device_account_key, u.device_model,
-                        u.ip_address, u.app_version, u.is_active, u.is_banned,
-                        u.created_at, u.last_login_at, u.fraud_score,
-                        u.last_fraud_at, u.ban_reason, balance.total AS balance
-                   FROM users u
-                   CROSS JOIN LATERAL (
-                     SELECT COALESCE(SUM(pl.amount), 0) AS total
-                       FROM points_ledger pl
-                      WHERE pl.user_id = u.id
-                   ) balance
-                  WHERE u.merged_into_user_id IS NULL`;
+    // ------------------------------------------------------------------------
+    // A clausula WHERE e montada UMA vez e reaproveitada em duas consultas: a
+    // pagina de resultados e os totais agregados. Manter as duas em sincronia e
+    // obrigatorio, caso contrario os cards do painel passam a descrever um
+    // conjunto diferente do que a tabela exibe.
+    // ------------------------------------------------------------------------
+    let where = ' WHERE u.merged_into_user_id IS NULL';
 
     const params = [];
     if (search) {
       params.push(`%${search}%`);
       const p = `$${params.length}`;
-      query += ` AND (
+      where += ` AND (
         u.support_code ILIKE ${p}
         OR COALESCE(u.support_label, '') ILIKE ${p}
         OR u.email ILIKE ${p}
@@ -874,28 +869,85 @@ router.get('/users', authenticateAdmin, async (req, res) => {
     }
 
     if (status === 'active') {
-      query += ' AND u.is_active = true AND u.is_banned = false';
+      where += ' AND u.is_active = true AND u.is_banned = false';
     } else if (status === 'banned') {
-      query += ' AND u.is_banned = true';
+      where += ' AND u.is_banned = true';
     } else if (status === 'inactive') {
-      query += ' AND u.is_active = false';
+      where += ' AND u.is_active = false';
     }
 
     if (appVersion) {
       params.push(appVersion);
-      query += ` AND u.app_version = $${params.length}`;
+      where += ` AND u.app_version = $${params.length}`;
     }
 
-    query += ` ORDER BY u.last_login_at DESC NULLS LAST, u.created_at DESC
-               LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(limit, offset);
+    const pageQuery = `SELECT u.id, u.support_code, u.support_label, u.email,
+                              u.device_id, u.device_account_key, u.device_model,
+                              u.ip_address, u.app_version, u.is_active, u.is_banned,
+                              u.created_at, u.last_login_at, u.fraud_score,
+                              u.last_fraud_at, u.ban_reason, balance.total AS balance
+                         FROM users u
+                         CROSS JOIN LATERAL (
+                           SELECT COALESCE(SUM(pl.amount), 0) AS total
+                             FROM points_ledger pl
+                            WHERE pl.user_id = u.id
+                         ) balance
+                         ${where}
+                        ORDER BY u.last_login_at DESC NULLS LAST, u.created_at DESC
+                        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
 
-    const result = await db.query(query, params);
+    // Totais sobre a BASE INTEIRA que satisfaz os filtros, sem LIMIT/OFFSET.
+    //
+    // Motivo: o painel calculava os cards a partir do array recebido
+    // (users.length e reduce sobre balance). Como a resposta vinha truncada em
+    // 100 registros, "Usuarios listados" exibia o proprio teto de paginacao e
+    // "Pontos em circulacao" somava apenas a primeira pagina, subestimando o
+    // passivo em pontos do sistema. Agregar no banco elimina a dependencia do
+    // tamanho da pagina.
+    //
+    // A soma de pontos usa um LEFT JOIN agregado em vez de repetir o
+    // CROSS JOIN LATERAL por usuario: uma unica varredura de points_ledger
+    // agrupada por user_id, em lugar de uma subconsulta por linha.
+    const totalsQuery = `SELECT COUNT(*)::bigint AS total_users,
+                                COUNT(*) FILTER (WHERE u.is_banned)::bigint AS banned_users,
+                                COUNT(*) FILTER (WHERE u.is_active AND NOT u.is_banned)::bigint AS active_users,
+                                COALESCE(SUM(balance.total), 0) AS total_points
+                           FROM users u
+                           LEFT JOIN (
+                             SELECT pl.user_id, SUM(pl.amount) AS total
+                               FROM points_ledger pl
+                              GROUP BY pl.user_id
+                           ) balance ON balance.user_id = u.id
+                           ${where}`;
+
+    const [result, totalsResult] = await Promise.all([
+      db.query(pageQuery, [...params, limit, offset]),
+      db.query(totalsQuery, params),
+    ]);
+
+    const totalsRow = totalsResult.rows[0] || {};
+    const totalUsers = Number(totalsRow.total_users || 0);
 
     res.json({
       success: true,
       users: result.rows,
-      pagination: { page, limit, hasMore: result.rows.length === limit }
+      // Refletem todos os usuarios que atendem aos filtros, nao apenas a pagina.
+      totals: {
+        users: totalUsers,
+        banned: Number(totalsRow.banned_users || 0),
+        active: Number(totalsRow.active_users || 0),
+        points: String(totalsRow.total_points ?? '0'),
+      },
+      pagination: {
+        page,
+        limit,
+        total: totalUsers,
+        totalPages: Math.max(Math.ceil(totalUsers / limit), 1),
+        // Derivado do total real: antes era inferido de rows.length === limit,
+        // que reportava outra pagina inexistente quando o ultimo lote enchia
+        // a pagina exatamente.
+        hasMore: offset + result.rows.length < totalUsers,
+      },
     });
   } catch (error) {
     console.error('List users error:', error);
