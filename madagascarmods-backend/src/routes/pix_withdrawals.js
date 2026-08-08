@@ -4,6 +4,7 @@ const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { withdrawalLimiter } = require('../middleware/rateLimits');
+const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
 
 // Mesmo namespace usado em withdrawals.js (FaucetPay).
 // Os dois fluxos debitam o mesmo saldo de pontos, portanto precisam compartilhar o lock:
@@ -219,6 +220,27 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     );
 
     await client.query('COMMIT');
+
+    // ------------------------------------------------------------------------------
+    // Aviso ao admin, DEPOIS do COMMIT.
+    //
+    // A posicao aqui e deliberada: notificar antes do COMMIT produziria alerta de saque
+    // que pode terminar em ROLLBACK, ou seja, aviso de dinheiro que ninguem pediu. Como
+    // notifyAdmin e fire-and-forget, a resposta ao app nao espera o Discord responder.
+    //
+    // Somente a chave MASCARADA e enviada; a chave real fica no painel, atras de login.
+    // ------------------------------------------------------------------------------
+    const pixUserRow = await db.query('SELECT email FROM users WHERE id = $1', [userId])
+      .catch(() => ({ rows: [] }));
+    notifyAdmin('WITHDRAWAL_REQUESTED', {
+      'Metodo': 'PIX',
+      'Valor': `R$ ${amountInReal.toFixed(2)}`,
+      'Pontos': String(pointsToDebit),
+      'Usuario': pixUserRow.rows[0]?.email || userId.substring(0, 8),
+      'Nome': pixAccount.full_name.split(/\s+/)[0],
+      'Chave': pixAccount.pix_key_masked,
+      'Saque ID': withdrawalId.substring(0, 8),
+    }, { link: panelLink('/saques'), footer: 'Aguardando aprovacao manual' });
 
     res.status(201).json({
       success: true,

@@ -22,6 +22,7 @@
  *   - 5+ logins do mesmo IP em 10 min → bloqueio de login
  */
 const db = require('../models/db');
+const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
 
 // Cache em memória para burst detection (complementar ao banco)
 const burstTracker = new Map();
@@ -133,44 +134,23 @@ async function autoBanUser(userId, reason, phantomCount, ip) {
 
     console.warn(`[BotDetection] AUTO-BANNED user ${userId} | Reason: ${reason} | Phantom: ${phantomCount}`);
 
-    // ============ WEBHOOK DE ALERTA ============
-    // Envia notificação para o admin quando um usuário é banido automaticamente.
-    // Configure a URL do webhook via variável de ambiente BAN_WEBHOOK_URL.
-    // Suporta Discord, Telegram Bot API, ou qualquer endpoint que aceite JSON POST.
-    const webhookUrl = process.env.BAN_WEBHOOK_URL;
-    if (webhookUrl) {
-      const payload = webhookUrl.includes('discord.com')
-        ? {
-            embeds: [{
-              title: '⚠️ Auto-Ban Executado',
-              color: 0xFF0000,
-              fields: [
-                { name: 'Usuário', value: userEmail, inline: true },
-                { name: 'ID', value: userId.substring(0, 8) + '...', inline: true },
-                { name: 'Motivo', value: reason },
-                { name: 'Score', value: String(phantomCount), inline: true },
-                { name: 'IP', value: ip || 'N/A', inline: true },
-              ],
-              timestamp: new Date().toISOString()
-            }]
-          }
-        : {
-            event: 'auto_ban',
-            userId,
-            email: userEmail,
-            reason,
-            phantomCount,
-            ip,
-            timestamp: new Date().toISOString()
-          };
-
-      // Fire-and-forget (não bloqueia a resposta)
-      fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      }).catch(err => console.error('[BotDetection] Webhook error:', err.message));
-    }
+    // ============ ALERTA AO ADMIN ============
+    // O envio direto de webhook que existia aqui foi movido para src/utils/adminNotifier.js.
+    // Motivo: o alerta de ban era o unico do sistema e vivia isolado neste arquivo, com a
+    // logica de formatacao do Discord embutida no meio da rotina de banimento. Centralizar
+    // permite que ban, aprovacao de chave e pedido de saque usem os MESMOS canais
+    // (Discord, Telegram, ntfy e webhook generico) sem duplicar codigo.
+    //
+    // Compatibilidade preservada: adminNotifier ainda le BAN_WEBHOOK_URL como fallback
+    // quando ADMIN_DISCORD_WEBHOOK_URL nao esta definida, portanto a configuracao atual
+    // em producao continua funcionando sem alteracao.
+    notifyAdmin('USER_AUTO_BANNED', {
+      'Usuario': userEmail,
+      'ID': userId.substring(0, 8),
+      'Motivo': reason,
+      'Score': String(phantomCount),
+      'IP': ip || 'N/A',
+    }, { link: panelLink('/usuarios') });
   } catch (err) {
     console.error('[BotDetection] autoBanUser error:', err.message);
   }

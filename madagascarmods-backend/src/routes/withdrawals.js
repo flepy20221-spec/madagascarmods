@@ -5,6 +5,7 @@ const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { withdrawalLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
+const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
 
 // Namespace do advisory lock de saque. Precisa ser o MESMO valor usado em
 // pix_withdrawals.js: os dois fluxos consomem o mesmo saldo de pontos e por isso
@@ -326,6 +327,25 @@ router.post('/request', withdrawalLimiter, authenticateToken, antifraudMiddlewar
     );
 
     await client.query('COMMIT');
+
+    // ------------------------------------------------------------------------------
+    // Aviso ao admin, DEPOIS do COMMIT. Ver justificativa detalhada da posicao em
+    // src/routes/pix_withdrawals.js.
+    //
+    // O e-mail FaucetPay de destino trafega MASCARADO (destination.value_masked). A
+    // variavel faucetPayEmail, ja descriptografada acima para gravar em crypto_address,
+    // NAO deve ser usada aqui: e o endereco real de pagamento.
+    // ------------------------------------------------------------------------------
+    const fpUserRow = await db.query('SELECT email FROM users WHERE id = $1', [userId])
+      .catch(() => ({ rows: [] }));
+    notifyAdmin('WITHDRAWAL_REQUESTED', {
+      'Metodo': 'FaucetPay (LTC)',
+      'Valor': `R$ ${amountInReal.toFixed(2)}`,
+      'Pontos': String(pointsToDebit),
+      'Usuario': fpUserRow.rows[0]?.email || userId.substring(0, 8),
+      'Destino': destination.value_masked,
+      'Saque ID': withdrawalId.substring(0, 8),
+    }, { link: panelLink('/saques'), footer: 'Aguardando aprovacao manual' });
 
     res.status(201).json({
       success: true,
