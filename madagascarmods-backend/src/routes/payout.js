@@ -5,6 +5,7 @@ const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { payoutSetupLimiter } = require('../middleware/rateLimits');
 const { encrypt, hashValue, maskEmail } = require('../utils/crypto');
+const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
 
 const router = express.Router();
 
@@ -120,6 +121,19 @@ router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddlewar
        VALUES ($1, 'user', 'PAYOUT_DESTINATION_SUBMITTED', 'payout_destination', $2, $3)`,
       [userId, destId, JSON.stringify({ masked_email: masked, version: newVersion })]
     );
+
+    // ------------------------------------------------------------------------------
+    // Aviso ao admin. O e-mail de destino vai MASCARADO (maskEmail), o mesmo formato que
+    // o painel exibe. A versao e util no alerta: versao > 1 significa que o usuario TROCOU
+    // o destino de pagamento, situacao que merece conferencia mais rigorosa.
+    // ------------------------------------------------------------------------------
+    const userRow = await db.query('SELECT email FROM users WHERE id = $1', [userId]);
+    notifyAdmin('PAYOUT_DESTINATION_SUBMITTED', {
+      'Usuario': userRow.rows[0]?.email || userId.substring(0, 8),
+      'Destino': masked,
+      'Tipo': 'FaucetPay',
+      'Versao': newVersion > 1 ? `${newVersion} (troca de destino)` : String(newVersion),
+    }, { link: panelLink('/contas'), footer: 'Aguardando aprovacao manual' });
 
     res.status(201).json({
       success: true,

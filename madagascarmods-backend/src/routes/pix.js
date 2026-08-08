@@ -5,6 +5,7 @@ const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { payoutSetupLimiter } = require('../middleware/rateLimits');
 const { encrypt, hashValue } = require('../utils/crypto');
+const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
 
 const router = express.Router();
 
@@ -162,6 +163,12 @@ router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddlewar
       [userId]
     );
 
+    // Identificacao do usuario na notificacao ao admin. Nao ha JOIN mais barato aqui:
+    // o painel exibe o e-mail interno device-*@cashpix.local, e e por ele que o admin
+    // localiza a conta na fila de aprovacao.
+    const userRow = await db.query('SELECT email FROM users WHERE id = $1', [userId]);
+    const userEmail = userRow.rows[0]?.email || userId.substring(0, 8);
+
     // Create new PIX account
     const pixId = uuidv4();
     const pixKeyMasked = maskPixKey(pix_key_type, pix_key_value.trim());
@@ -178,6 +185,19 @@ router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddlewar
        VALUES ($1, 'user', 'PIX_ACCOUNT_SUBMITTED', 'pix_account', $2, $3)`,
       [userId, pixId, JSON.stringify({ cpf_masked: maskCpf(cleanCpf), pix_key_type, pix_key_masked: pixKeyMasked })]
     );
+
+    // ------------------------------------------------------------------------------
+    // Aviso ao admin. Somente dados MASCARADOS saem daqui: CPF e chave PIX completos
+    // jamais devem trafegar para Discord ou Telegram. O nome tambem e reduzido ao
+    // primeiro nome, suficiente para conferencia visual na fila de aprovacao.
+    // ------------------------------------------------------------------------------
+    notifyAdmin('PIX_KEY_SUBMITTED', {
+      'Usuario': userEmail,
+      'Nome': full_name.trim().split(/\s+/)[0],
+      'CPF': maskCpf(cleanCpf),
+      'Tipo de chave': pix_key_type.toUpperCase(),
+      'Chave': pixKeyMasked,
+    }, { link: panelLink('/contas-pix'), footer: 'Aguardando aprovacao manual' });
 
     res.status(201).json({
       success: true,
