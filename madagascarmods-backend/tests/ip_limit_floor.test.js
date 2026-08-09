@@ -65,8 +65,8 @@ test('MAX_ACCOUNTS_PER_IP_24H herdado com valor 8 e recusado pelo piso', () => {
   assert.ok(authRoutes.limits, 'A rota de auth deve expor os limites vigentes.');
   assert.strictEqual(
     authRoutes.limits.maxAccountsPerIp24h,
-    30,
-    'Um valor abaixo do piso deve ser elevado ao piso (30), nao aplicado como 8.'
+    200,
+    'Um valor abaixo do piso deve ser elevado ao piso (200), nao aplicado como 8.'
   );
   assert.strictEqual(
     authRoutes.limits.configuredValue,
@@ -76,11 +76,11 @@ test('MAX_ACCOUNTS_PER_IP_24H herdado com valor 8 e recusado pelo piso', () => {
 });
 
 test('valor de ambiente acima do piso e respeitado', () => {
-  const authRoutes = loadWithEnv('src/routes/auth.js', { MAX_ACCOUNTS_PER_IP_24H: 150 });
+  const authRoutes = loadWithEnv('src/routes/auth.js', { MAX_ACCOUNTS_PER_IP_24H: 900 });
 
   assert.strictEqual(
     authRoutes.limits.maxAccountsPerIp24h,
-    150,
+    900,
     'Operacao legitima deve poder elevar o teto acima do padrao.'
   );
 });
@@ -90,8 +90,8 @@ test('ambiente sem a variavel usa o padrao calibrado para CGNAT', () => {
 
   assert.strictEqual(
     authRoutes.limits.maxAccountsPerIp24h,
-    60,
-    'Sem configuracao explicita, o padrao do codigo (60) deve valer.'
+    500,
+    'Sem configuracao explicita, o padrao do codigo (500) deve valer.'
   );
 });
 
@@ -102,10 +102,85 @@ test('valor invalido nao zera o limite nem desliga a protecao', () => {
     const authRoutes = loadWithEnv('src/routes/auth.js', { MAX_ACCOUNTS_PER_IP_24H: invalid });
     assert.strictEqual(
       authRoutes.limits.maxAccountsPerIp24h,
-      60,
-      `Valor invalido (${JSON.stringify(invalid)}) deve cair no padrao 60.`
+      500,
+      `Valor invalido (${JSON.stringify(invalid)}) deve cair no padrao 500.`
     );
   }
+});
+
+// ---------------------------------------------------------------------------------------
+// Regra de rajada: a trava que substituiu o teto acumulado de 24h.
+// ---------------------------------------------------------------------------------------
+
+test('o limite de rajada usa o padrao calibrado com os dados de producao', () => {
+  const authRoutes = loadWithEnv('src/routes/auth.js', {
+    IP_BURST_LIMIT: undefined,
+    IP_BURST_OBSERVE_LIMIT: undefined,
+  });
+
+  assert.strictEqual(authRoutes.limits.ipBurstLimit, 40, 'Teto de rajada padrao: 40.');
+  assert.strictEqual(authRoutes.limits.ipBurstWindowMinutes, 10, 'Janela padrao: 10 minutos.');
+  assert.ok(
+    authRoutes.limits.ipBurstObserveLimit < authRoutes.limits.ipBurstLimit,
+    'A faixa de observacao deve ficar abaixo da faixa de bloqueio.'
+  );
+});
+
+test('IP_BURST_LIMIT abaixo do piso e recusado', () => {
+  // Um valor baixo aqui reproduziria o incidente original, agora numa janela curta.
+  const authRoutes = loadWithEnv('src/routes/auth.js', { IP_BURST_LIMIT: 3 });
+
+  assert.strictEqual(
+    authRoutes.limits.ipBurstLimit,
+    25,
+    'Valor abaixo do piso (25) deve ser recusado.'
+  );
+  assert.strictEqual(authRoutes.limits.ipBurstConfigured, '3', 'Configurado permanece visivel.');
+});
+
+test('a faixa de observacao nunca alcanca a de bloqueio, mesmo se configurada acima', () => {
+  // Se observacao >= bloqueio, o registro antecipado se tornaria inalcancavel e o sistema
+  // perderia justamente o aviso que essa faixa existe para dar.
+  const authRoutes = loadWithEnv('src/routes/auth.js', {
+    IP_BURST_LIMIT: 30,
+    IP_BURST_OBSERVE_LIMIT: 999,
+  });
+
+  assert.ok(
+    authRoutes.limits.ipBurstObserveLimit < authRoutes.limits.ipBurstLimit,
+    `observacao (${authRoutes.limits.ipBurstObserveLimit}) deve ser menor que `
+    + `bloqueio (${authRoutes.limits.ipBurstLimit}).`
+  );
+});
+
+test('a regra de rajada nao teria bloqueado o trafego legitimo observado em producao', () => {
+  // Dados medidos no audit_log e na tabela users antes da correcao:
+  //   - 70 aparelhos distintos no mesmo IP em 24h  (bloqueado pela regra antiga, teto 60)
+  //   - pico real de 3 cadastros no mesmo minuto
+  //   - pico real de 24 cadastros na hora mais movimentada
+  // A regra nova mede 10 minutos. Mesmo concentrando a hora de pico inteira numa unica
+  // janela, 24 < 25 e o cadastro passa.
+  const authRoutes = loadWithEnv('src/routes/auth.js', {
+    IP_BURST_LIMIT: undefined,
+    MAX_ACCOUNTS_PER_IP_24H: undefined,
+  });
+
+  const PICO_HORA_OBSERVADO = 24;
+  const APARELHOS_24H_OBSERVADO = 70;
+
+  // Exige folga, nao apenas aprovacao: um teto alcancado raspando volta a bloquear usuario
+  // legitimo no primeiro dia de divulgacao mais intensa.
+  assert.ok(
+    PICO_HORA_OBSERVADO <= authRoutes.limits.ipBurstLimit * 0.7,
+    `O pico horario real (${PICO_HORA_OBSERVADO}) deve ficar com folga sob o teto de rajada `
+    + `(${authRoutes.limits.ipBurstLimit}), senao o falso positivo se repete.`
+  );
+
+  assert.ok(
+    APARELHOS_24H_OBSERVADO < authRoutes.limits.maxAccountsPerIp24h,
+    `O volume real de 24h (${APARELHOS_24H_OBSERVADO}) deve ficar bem abaixo da rede de `
+    + `seguranca (${authRoutes.limits.maxAccountsPerIp24h}).`
+  );
 });
 
 test('LOGIN_IP_HARD_LIMIT herdado com valor 5 e recusado pelo piso', () => {
