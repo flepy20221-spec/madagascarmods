@@ -112,20 +112,12 @@ const generalLimiter = rateLimit({
 // aparelho, de forma atomica, pelos indices unicos de device_account_key e device_id.
 // Este limiter volta a ser o que deve ser: protecao contra flood de requisicoes.
 // ---------------------------------------------------------------------------
-const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX) > 0
-  ? Number(process.env.AUTH_RATE_LIMIT_MAX)
-  : 120;
-
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: AUTH_RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    error: 'Muitas tentativas de acesso. Aguarde alguns minutos.',
-    code: 'AUTH_RATE_LIMIT'
-  }
-});
+// DEDUPLICACAO: este arquivo mantinha uma segunda definicao do mesmo limiter, com a leitura
+// de AUTH_RATE_LIMIT_MAX repetida. Duas fontes para a mesma regra e como um limite acaba
+// corrigido em um lugar e esquecido no outro; alem disso as duas instancias contavam em
+// buckets separados, de modo que o teto efetivo por IP nao era o valor configurado.
+// O limiter passa a vir de src/middleware/rateLimits.js, onde o piso de seguranca e aplicado.
+const { authLimiter } = require('./middleware/rateLimits');
 
 // O callback SSV vem dos servidores do Google e nao deve ser limitado por IP:
 // um unico IP do Google concentra os callbacks de todos os usuarios.
@@ -134,6 +126,32 @@ app.use('/api/', (req, res, next) => {
   return generalLimiter(req, res, next);
 });
 app.use('/api/auth/', authLimiter);
+
+/**
+ * Limites de rede efetivamente vigentes neste processo.
+ *
+ * Lidos dos proprios modulos que os aplicam, e nao de process.env, porque a diferenca
+ * entre o valor CONFIGURADO e o valor EM USO (quando o piso de seguranca recusa um valor
+ * baixo herdado) e justamente a informacao que faltava para diagnosticar o bloqueio de
+ * cadastro em producao. Nao expoe segredo algum: sao apenas limiares operacionais.
+ */
+function effectiveNetworkLimits() {
+  try {
+    const { loginIpLimits } = require('./middleware/botDetection');
+    const { authRateLimit } = require('./middleware/rateLimits');
+    return {
+      accountsPerIp24h: authRoutes.limits?.maxAccountsPerIp24h ?? null,
+      accountsPerIp24hConfigured: authRoutes.limits?.configuredValue ?? null,
+      accountsPerIp24hFloor: authRoutes.limits?.maxAccountsPerIp24hFloor ?? null,
+      loginIpSoftLimit: loginIpLimits?.softLimit ?? null,
+      loginIpHardLimit: loginIpLimits?.hardLimit ?? null,
+      authRequestsPer15min: authRateLimit?.max ?? null,
+    };
+  } catch (_) {
+    // O health check nunca deve falhar por causa de um campo informativo.
+    return null;
+  }
+}
 
 // ============ HEALTH CHECK AVANÇADO ============
 // Verifica conexão com o banco de dados e retorna status detalhado.
@@ -155,13 +173,20 @@ app.get('/health', async (req, res) => {
 
   res.status(httpCode).json({
     status,
-    version: process.env.APP_VERSION || '1.5.2',
+    // A versao vinha de um literal '1.5.2' escrito aqui, que envelheceu no arquivo e passou
+    // a mentir sobre o que estava em producao. Agora vem do package.json, atualizado junto
+    // com o codigo, e continua sobrescrevivel por APP_VERSION.
+    version: process.env.APP_VERSION || require('../package.json').version,
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()),
     database: {
       status: dbStatus,
       latencyMs: dbLatency
     },
+    // Limites de rede EFETIVAMENTE vigentes no processo. Sem isto, descobrir que uma variavel
+    // de ambiente antiga estava sobrescrevendo o padrao do codigo exigia ler o banco: o
+    // sintoma aparecia no aplicativo do usuario e nao havia como inspecionar o valor em uso.
+    networkLimits: effectiveNetworkLimits(),
     memory: {
       heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024)

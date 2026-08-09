@@ -145,9 +145,26 @@ const payoutSetupLimiter = rateLimit({
  * ao AUTH_RATE_LIMIT_MAX de src/index.js. A contencao de farm de contas continua sendo
  * feita por aparelho (indices unicos de device_account_key e device_id).
  */
-const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX) > 0
-  ? Number(process.env.AUTH_RATE_LIMIT_MAX)
-  : 120;
+// PISO MINIMO: impede que um valor herdado do ambiente (o antigo 10) volte a esgotar a cota
+// de /api/auth/ em segundos sob CGNAT, derrubando login e cadastro de todos os usuarios do IP.
+const MIN_AUTH_RATE_LIMIT = 60;
+
+const AUTH_RATE_LIMIT_MAX = (() => {
+  const raw = process.env.AUTH_RATE_LIMIT_MAX;
+  const parsed = Number(raw);
+
+  if (!raw || !Number.isFinite(parsed) || parsed <= 0) return 120;
+
+  if (parsed < MIN_AUTH_RATE_LIMIT) {
+    console.warn(
+      `[RateLimits] AUTH_RATE_LIMIT_MAX=${raw} esta abaixo do piso de seguranca `
+      + `(${MIN_AUTH_RATE_LIMIT}) e foi ignorado. Valor em uso: ${MIN_AUTH_RATE_LIMIT}.`
+    );
+    return MIN_AUTH_RATE_LIMIT;
+  }
+
+  return parsed;
+})();
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -185,4 +202,11 @@ module.exports = {
   authLimiter,
   configLimiter,
   userOrTokenKey,
+  // Reportado pelo /health: valor efetivo apos a aplicacao do piso de seguranca.
+  authRateLimit: {
+    max: AUTH_RATE_LIMIT_MAX,
+    floor: MIN_AUTH_RATE_LIMIT,
+    windowMinutes: 15,
+    configuredValue: process.env.AUTH_RATE_LIMIT_MAX || null,
+  },
 };
