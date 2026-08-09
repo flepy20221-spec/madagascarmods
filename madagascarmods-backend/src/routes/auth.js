@@ -69,10 +69,50 @@ const MAX_ACCOUNTS_PER_DEVICE = 1;
 //   - MAX_ACCOUNTS_PER_DEVICE = 1 + pg_advisory_xact_lock na criacao
 // Ou seja: criar N contas exige N aparelhos fisicos distintos. O IP passa a ser o que sempre
 // deveria ter sido — um freio contra volume anormal, nao a trava de primeira linha.
+//
+// PISO MINIMO (correcao de configuracao herdada):
+// Elevar o padrao no codigo nao bastou em producao. A variavel de ambiente tem precedencia
+// sobre o padrao, e o servico continuava com MAX_ACCOUNTS_PER_IP_24H=8 herdado da primeira
+// configuracao. O resultado era o bloqueio persistindo mesmo com o codigo corrigido e sem
+// nenhum sinal disso no diff — o tipo de defeito mais custoso de diagnosticar.
+//
+// A partir daqui um valor de ambiente abaixo do piso e RECUSADO, com aviso explicito no log
+// de boot. Configuracao nao pode reintroduzir silenciosamente um defeito ja corrigido; para
+// operar abaixo do piso e preciso mudar o codigo, o que passa por revisao.
 // ============================================================================================
-const MAX_ACCOUNTS_PER_IP_24H = Number(process.env.MAX_ACCOUNTS_PER_IP_24H) > 0
-  ? Number(process.env.MAX_ACCOUNTS_PER_IP_24H)
-  : 60;
+const MIN_ACCOUNTS_PER_IP_24H = 30;
+const DEFAULT_ACCOUNTS_PER_IP_24H = 60;
+
+/**
+ * Resolve um limite numerico vindo do ambiente respeitando um piso de seguranca.
+ *
+ * Valor ausente ou invalido cai no padrao. Valor abaixo do piso e elevado ao piso e o
+ * evento e registrado, para que a divergencia entre o que foi configurado e o que esta
+ * vigente apareca no log em vez de virar bloqueio invisivel de usuario legitimo.
+ */
+function resolveLimit(envName, defaultValue, minimumValue) {
+  const raw = process.env[envName];
+  const parsed = Number(raw);
+
+  if (!raw || !Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+
+  if (parsed < minimumValue) {
+    console.warn(
+      `[Auth] ${envName}=${raw} esta abaixo do piso de seguranca (${minimumValue}) e foi ignorado. `
+      + `Valor em uso: ${minimumValue}. Sob CGNAT de operadora movel, limites baixos por IP `
+      + 'bloqueiam usuario legitimo em massa. O anti-farm efetivo e por aparelho.'
+    );
+    return minimumValue;
+  }
+
+  return parsed;
+}
+
+const MAX_ACCOUNTS_PER_IP_24H = resolveLimit(
+  'MAX_ACCOUNTS_PER_IP_24H',
+  DEFAULT_ACCOUNTS_PER_IP_24H,
+  MIN_ACCOUNTS_PER_IP_24H
+);
 
 // IPs que nunca devem servir de chave de bloqueio: ausentes, loopback ou private range.
 // Sem isto, uma falha na resolucao do IP real colapsaria todos os cadastros num mesmo
@@ -875,4 +915,14 @@ router.post('/logout', authenticateToken, async (req, res) => {
   }
 });
 
+// O router continua sendo a exportacao principal (app.use('/api/auth', authRoutes)).
+// Os limites vigentes acompanham como propriedades para que o /health possa reporta-los
+// sem duplicar a leitura do ambiente nem reimplementar a regra do piso.
 module.exports = router;
+module.exports.limits = {
+  maxAccountsPerIp24h: MAX_ACCOUNTS_PER_IP_24H,
+  maxAccountsPerIp24hDefault: DEFAULT_ACCOUNTS_PER_IP_24H,
+  maxAccountsPerIp24hFloor: MIN_ACCOUNTS_PER_IP_24H,
+  maxAccountsPerDevice: MAX_ACCOUNTS_PER_DEVICE,
+  configuredValue: process.env.MAX_ACCOUNTS_PER_IP_24H || null,
+};

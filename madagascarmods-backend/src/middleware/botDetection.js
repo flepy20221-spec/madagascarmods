@@ -335,13 +335,32 @@ async function botDetectionMiddleware(req, res, next) {
 // device_id, device_account_aliases e MAX_ACCOUNTS_PER_DEVICE em routes/auth.js), alem da
 // deteccao de phantom rewards deste mesmo arquivo, que mede abuso real de recompensa.
 // ============================================================================================
-const LOGIN_IP_SOFT_LIMIT = Number(process.env.LOGIN_IP_SOFT_LIMIT) > 0
-  ? Number(process.env.LOGIN_IP_SOFT_LIMIT)
-  : 40;
+// PISO MINIMO: um valor de ambiente herdado da configuracao antiga (por exemplo
+// LOGIN_IP_HARD_LIMIT=5) tem precedencia sobre o padrao e reintroduz o bloqueio em massa
+// sem aparecer em nenhum diff. Abaixo do piso o valor e recusado, com aviso no log de boot.
+const MIN_LOGIN_IP_HARD_LIMIT = 100;
+const MIN_LOGIN_IP_SOFT_LIMIT = 20;
 
-const LOGIN_IP_HARD_LIMIT = Number(process.env.LOGIN_IP_HARD_LIMIT) > 0
-  ? Number(process.env.LOGIN_IP_HARD_LIMIT)
-  : 200;
+function resolveLimit(envName, defaultValue, minimumValue) {
+  const raw = process.env[envName];
+  const parsed = Number(raw);
+
+  if (!raw || !Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+
+  if (parsed < minimumValue) {
+    console.warn(
+      `[BotDetection] ${envName}=${raw} esta abaixo do piso de seguranca (${minimumValue}) `
+      + `e foi ignorado. Valor em uso: ${minimumValue}. Sob CGNAT de operadora movel, limites `
+      + 'baixos por IP impedem o usuario de acessar a propria carteira.'
+    );
+    return minimumValue;
+  }
+
+  return parsed;
+}
+
+const LOGIN_IP_SOFT_LIMIT = resolveLimit('LOGIN_IP_SOFT_LIMIT', 40, MIN_LOGIN_IP_SOFT_LIMIT);
+const LOGIN_IP_HARD_LIMIT = resolveLimit('LOGIN_IP_HARD_LIMIT', 200, MIN_LOGIN_IP_HARD_LIMIT);
 
 /**
  * IPs que nunca devem servir de chave de bloqueio. Sem esta guarda, uma falha na
@@ -420,4 +439,11 @@ async function loginBotDetection(req, res, next) {
 module.exports = {
   botDetectionMiddleware,
   loginBotDetection,
+  // Reportado pelo /health para tornar visivel o limite realmente em uso no processo.
+  loginIpLimits: {
+    softLimit: LOGIN_IP_SOFT_LIMIT,
+    hardLimit: LOGIN_IP_HARD_LIMIT,
+    hardLimitFloor: MIN_LOGIN_IP_HARD_LIMIT,
+    configuredHardLimit: process.env.LOGIN_IP_HARD_LIMIT || null,
+  },
 };
