@@ -140,6 +140,13 @@ function effectiveNetworkLimits() {
     const { loginIpLimits } = require('./middleware/botDetection');
     const { authRateLimit } = require('./middleware/rateLimits');
     return {
+      // Trava de primeira linha contra automacao: taxa de cadastros em janela curta.
+      // Substituiu o teto acumulado de 24h, que gerava falso positivo em massa sob CGNAT.
+      ipBurstLimit: authRoutes.limits?.ipBurstLimit ?? null,
+      ipBurstObserveLimit: authRoutes.limits?.ipBurstObserveLimit ?? null,
+      ipBurstWindowMinutes: authRoutes.limits?.ipBurstWindowMinutes ?? null,
+      ipBurstConfigured: authRoutes.limits?.ipBurstConfigured ?? null,
+      // Rede de seguranca contra abuso sustentado.
       accountsPerIp24h: authRoutes.limits?.maxAccountsPerIp24h ?? null,
       accountsPerIp24hConfigured: authRoutes.limits?.configuredValue ?? null,
       accountsPerIp24hFloor: authRoutes.limits?.maxAccountsPerIp24hFloor ?? null,

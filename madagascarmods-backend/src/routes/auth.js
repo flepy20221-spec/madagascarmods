@@ -80,8 +80,58 @@ const MAX_ACCOUNTS_PER_DEVICE = 1;
 // de boot. Configuracao nao pode reintroduzir silenciosamente um defeito ja corrigido; para
 // operar abaixo do piso e preciso mudar o codigo, o que passa por revisao.
 // ============================================================================================
-const MIN_ACCOUNTS_PER_IP_24H = 30;
-const DEFAULT_ACCOUNTS_PER_IP_24H = 60;
+// ============================================================================================
+// SEGUNDA CORRECAO — ELEVAR O TETO NAO ERA A SOLUCAO
+//
+// Com o teto em 60, o audit_log de producao registrou 1087 bloqueios, o ultimo minutos antes
+// desta mudanca. Os registros mostram o motivo com precisao:
+//
+//    ip 152.233.23.193 | devicesFromIp 71 | limit 60
+//    ip 152.233.23.194 | devicesFromIp 69 | limit 60
+//
+// A demanda legitima de um unico gateway de CGNAT passou de 60 aparelhos em 24h. Subir para
+// 200 apenas adiaria o mesmo incidente: qualquer teto ACUMULADO sobre um IP compartilhado por
+// milhares de assinantes acaba sendo alcancado por uso normal. O erro estava na metrica, nao
+// no numero.
+//
+// A verificacao de que as contas eram legitimas:
+//    - 70 contas / 70 aparelhos distintos  -> nenhuma conta duplicada por aparelho
+//    - 60 modelos de aparelho distintos     -> farm usa emulador ou poucos aparelhos repetidos
+//    - 37 das 70 voltaram ao app depois     -> farm cria, extrai bonus e abandona
+//
+// O QUE DISTINGUE FARM DE DIVULGACAO ORGANICA E A TAXA, NAO O ACUMULADO.
+// Medido em producao nas 48h anteriores:
+//    - pico por minuto em toda a base: 3 cadastros no mesmo IP
+//    - pico por hora nos IPs afetados: 24 cadastros
+// Divulgacao organica gera volume alto e espalhado; automacao gera dezenas em segundos.
+//
+// Por isso a trava de primeira linha passa a ser uma JANELA CURTA DE RAJADA por IP.
+//
+// CALIBRACAO (validada em tests/ip_burst_replay.test.js):
+// O primeiro valor tentado foi 25, derivado do pico horario de 24. O teste de replay contra o
+// trafego real reprovou: a janela de 10 min mais concentrada compativel com o observado chega
+// a 24 cadastros, deixando folga de UM. Um dia de divulgacao um pouco mais intensa reproduziria
+// o incidente. Um limite que passa raspando nao e um limite calibrado, e uma falha agendada.
+//
+// O teto foi para 40, que mantem folga de 1.7x sobre o pior caso realista e continua muito
+// abaixo do que qualquer automacao produz (um script gera dezenas por minuto). A faixa de
+// observacao em 20 avisa no audit_log bem antes de o bloqueio ser alcancado.
+//
+// O teto de 24h permanece, porem elevado a rede de seguranca (500) contra abuso sustentado de
+// escala industrial. Deixa de ser o mecanismo que decide o cadastro do usuario comum.
+// ============================================================================================
+
+// Janela curta de rajada: o freio que efetivamente distingue automacao de uso real.
+const IP_BURST_WINDOW_MINUTES = 10;
+const MIN_IP_BURST_LIMIT = 25;
+const DEFAULT_IP_BURST_LIMIT = 40;
+// Faixa que apenas REGISTRA no audit_log, sem bloquear. Da visibilidade antecipada de
+// mudanca de padrao sem transformar observacao em punicao.
+const DEFAULT_IP_BURST_OBSERVE = 20;
+
+// Rede de seguranca de 24h. Alto de proposito: nao e mais a trava de primeira linha.
+const MIN_ACCOUNTS_PER_IP_24H = 200;
+const DEFAULT_ACCOUNTS_PER_IP_24H = 500;
 
 /**
  * Resolve um limite numerico vindo do ambiente respeitando um piso de seguranca.
@@ -114,6 +164,20 @@ const MAX_ACCOUNTS_PER_IP_24H = resolveLimit(
   MIN_ACCOUNTS_PER_IP_24H
 );
 
+const IP_BURST_LIMIT = resolveLimit(
+  'IP_BURST_LIMIT',
+  DEFAULT_IP_BURST_LIMIT,
+  MIN_IP_BURST_LIMIT
+);
+
+// A faixa de observacao nunca deve alcancar a de bloqueio: se alcancasse, a faixa que apenas
+// registra se tornaria inalcancavel e o sistema perderia o aviso antecipado que ela existe
+// para dar. Fica no menor valor entre o configurado e 80% do teto de bloqueio.
+const IP_BURST_OBSERVE_LIMIT = Math.min(
+  resolveLimit('IP_BURST_OBSERVE_LIMIT', DEFAULT_IP_BURST_OBSERVE, 5),
+  Math.max(5, Math.floor(IP_BURST_LIMIT * 0.8))
+);
+
 // IPs que nunca devem servir de chave de bloqueio: ausentes, loopback ou private range.
 // Sem isto, uma falha na resolucao do IP real colapsaria todos os cadastros num mesmo
 // bucket (por exemplo "::1") e bloquearia a base inteira apos algumas contas.
@@ -143,6 +207,34 @@ async function countDevicesCreatedByIp(queryable, ip) {
        FROM users
       WHERE ip_address = $1
         AND created_at > NOW() - INTERVAL '24 hours'`,
+    [ip]
+  );
+  return parseInt(result.rows[0].count, 10);
+}
+
+/**
+ * Conta aparelhos que criaram conta neste IP na JANELA CURTA de rajada.
+ *
+ * Esta e a medida que separa automacao de divulgacao organica. Um gateway de CGNAT acumula
+ * dezenas de cadastros legitimos ao longo de um dia, mas espalhados: o pico real medido em
+ * producao foi de 3 cadastros no mesmo minuto e 24 na hora mais movimentada. Um script que
+ * cria contas em serie produz volume muito superior dentro de poucos minutos.
+ *
+ * O intervalo e interpolado como literal por ser um inteiro validado no carregamento do
+ * modulo; o Postgres nao aceita parametro em INTERVAL.
+ *
+ * Retorna null quando o IP nao e confiavel, sinalizando que a checagem deve ser ignorada.
+ */
+async function countIpBurst(queryable, ip) {
+  if (isUnreliableIp(ip)) return null;
+  const minutes = Number.isInteger(IP_BURST_WINDOW_MINUTES) && IP_BURST_WINDOW_MINUTES > 0
+    ? IP_BURST_WINDOW_MINUTES
+    : 10;
+  const result = await queryable.query(
+    `SELECT COUNT(DISTINCT COALESCE(device_account_key, device_id, id::text)) AS count
+       FROM users
+      WHERE ip_address = $1
+        AND created_at > NOW() - INTERVAL '${minutes} minutes'`,
     [ip]
   );
   return parseInt(result.rows[0].count, 10);
@@ -423,15 +515,68 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     }
 
     if (!user) {
-      // Freio por IP contra farm em volume. Ignorado quando o IP nao e confiavel, e
-      // medido em aparelhos distintos com teto compativel com CGNAT de operadora movel.
+      // ======================================================================
+      // FREIO POR REDE — RAJADA, NAO ACUMULADO
+      //
+      // A trava de primeira linha e a taxa de cadastros numa janela curta, porque e ela
+      // que distingue automacao de divulgacao organica. O teto de 24h continua adiante,
+      // como rede de seguranca contra abuso sustentado.
+      //
+      // Ignorado quando o IP nao e confiavel (ausente, loopback): nesse caso todos os
+      // cadastros cairiam num mesmo bucket e a base inteira seria bloqueada.
+      // ======================================================================
+      const burstFromIp = await countIpBurst(client, ip);
+
+      if (burstFromIp !== null && burstFromIp >= IP_BURST_LIMIT) {
+        await client.query('ROLLBACK');
+        await logAuthEvent(
+          'DEVICE_REGISTER_BLOCKED_IP_BURST',
+          null,
+          {
+            ip,
+            burstFromIp,
+            limit: IP_BURST_LIMIT,
+            windowMinutes: IP_BURST_WINDOW_MINUTES,
+          },
+          req
+        );
+        // A espera aqui e de minutos, nao de horas: a janela e curta e desliza. A mensagem
+        // informa o tempo para que o usuario legitimo saiba que basta tentar de novo em
+        // seguida, em vez de concluir que o aplicativo o rejeitou.
+        return res.status(429).json({
+          error: `Muitos cadastros nesta rede em ${IP_BURST_WINDOW_MINUTES} minutos. `
+            + `Aguarde ${IP_BURST_WINDOW_MINUTES} minutos e toque em Tentar novamente.`,
+          code: 'IP_BURST_LIMIT',
+          retryAfterMinutes: IP_BURST_WINDOW_MINUTES,
+        });
+      }
+
+      // Faixa de observacao: registra sem bloquear, para que uma mudanca de padrao apareca
+      // no audit_log antes de virar recusa de usuario.
+      if (burstFromIp !== null && burstFromIp >= IP_BURST_OBSERVE_LIMIT) {
+        await logAuthEvent(
+          'DEVICE_REGISTER_IP_BURST_OBSERVED',
+          null,
+          {
+            ip,
+            burstFromIp,
+            observeLimit: IP_BURST_OBSERVE_LIMIT,
+            blockLimit: IP_BURST_LIMIT,
+            windowMinutes: IP_BURST_WINDOW_MINUTES,
+          },
+          req
+        );
+      }
+
+      // Rede de seguranca de 24h. Teto alto: destina-se a abuso sustentado de escala
+      // industrial, nao ao trafego de um gateway de operadora movel.
       const devicesFromIp = await countDevicesCreatedByIp(client, ip);
       if (devicesFromIp !== null && devicesFromIp >= MAX_ACCOUNTS_PER_IP_24H) {
         await client.query('ROLLBACK');
         await logAuthEvent(
           'DEVICE_REGISTER_BLOCKED_IP_LIMIT',
           null,
-          { ip, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H },
+          { ip, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H, burstFromIp },
           req
         );
         return res.status(429).json({
@@ -648,13 +793,37 @@ router.post('/register', authLimiter, loginBotDetection, async (req, res) => {
       });
     }
 
-    // Limite de contas por IP em 24h (anti-farm)
+    // Freio por rede: mesma regra da rota por aparelho. Rajada em janela curta como trava de
+    // primeira linha, teto de 24h como rede de seguranca. Manter as duas rotas coerentes evita
+    // que um cliente antigo continue sofrendo o falso positivo ja corrigido na rota nova.
+    const burstFromIp = await countIpBurst(db, ip);
+    if (burstFromIp !== null && burstFromIp >= IP_BURST_LIMIT) {
+      await logAuthEvent(
+        'REGISTER_BLOCKED_IP_BURST',
+        null,
+        {
+          ip,
+          email: normalizedEmail,
+          burstFromIp,
+          limit: IP_BURST_LIMIT,
+          windowMinutes: IP_BURST_WINDOW_MINUTES,
+        },
+        req
+      );
+      return res.status(429).json({
+        error: `Muitos cadastros nesta rede em ${IP_BURST_WINDOW_MINUTES} minutos. `
+          + `Aguarde ${IP_BURST_WINDOW_MINUTES} minutos e tente novamente.`,
+        code: 'IP_BURST_LIMIT',
+        retryAfterMinutes: IP_BURST_WINDOW_MINUTES,
+      });
+    }
+
     const devicesFromIp = await countDevicesCreatedByIp(db, ip);
     if (devicesFromIp !== null && devicesFromIp >= MAX_ACCOUNTS_PER_IP_24H) {
       await logAuthEvent(
         'REGISTER_BLOCKED_IP_LIMIT',
         null,
-        { ip, email: normalizedEmail, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H },
+        { ip, email: normalizedEmail, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H, burstFromIp },
         req
       );
       return res.status(429).json({
@@ -739,12 +908,36 @@ router.post('/login', authLimiter, loginBotDetection, async (req, res) => {
         });
       }
 
+      // Este ponto cria conta durante o login (auto-registro de cliente legado), portanto
+      // segue a mesma regra de rede das rotas de cadastro: rajada primeiro, teto de 24h depois.
+      const burstFromIp = await countIpBurst(db, ip);
+      if (burstFromIp !== null && burstFromIp >= IP_BURST_LIMIT) {
+        await logAuthEvent(
+          'LOGIN_BLOCKED_IP_BURST',
+          null,
+          {
+            ip,
+            email: normalizedEmail,
+            burstFromIp,
+            limit: IP_BURST_LIMIT,
+            windowMinutes: IP_BURST_WINDOW_MINUTES,
+          },
+          req
+        );
+        return res.status(429).json({
+          error: `Muitos cadastros nesta rede em ${IP_BURST_WINDOW_MINUTES} minutos. `
+            + `Aguarde ${IP_BURST_WINDOW_MINUTES} minutos e tente novamente.`,
+          code: 'IP_BURST_LIMIT',
+          retryAfterMinutes: IP_BURST_WINDOW_MINUTES,
+        });
+      }
+
       const devicesFromIp = await countDevicesCreatedByIp(db, ip);
       if (devicesFromIp !== null && devicesFromIp >= MAX_ACCOUNTS_PER_IP_24H) {
         await logAuthEvent(
           'LOGIN_BLOCKED_IP_LIMIT',
           null,
-          { ip, email: normalizedEmail, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H },
+          { ip, email: normalizedEmail, devicesFromIp, limit: MAX_ACCOUNTS_PER_IP_24H, burstFromIp },
           req
         );
         return res.status(429).json({
@@ -920,6 +1113,12 @@ router.post('/logout', authenticateToken, async (req, res) => {
 // sem duplicar a leitura do ambiente nem reimplementar a regra do piso.
 module.exports = router;
 module.exports.limits = {
+  // Trava de primeira linha: rajada em janela curta.
+  ipBurstLimit: IP_BURST_LIMIT,
+  ipBurstObserveLimit: IP_BURST_OBSERVE_LIMIT,
+  ipBurstWindowMinutes: IP_BURST_WINDOW_MINUTES,
+  ipBurstConfigured: process.env.IP_BURST_LIMIT || null,
+  // Rede de seguranca de 24h.
   maxAccountsPerIp24h: MAX_ACCOUNTS_PER_IP_24H,
   maxAccountsPerIp24hDefault: DEFAULT_ACCOUNTS_PER_IP_24H,
   maxAccountsPerIp24hFloor: MIN_ACCOUNTS_PER_IP_24H,
