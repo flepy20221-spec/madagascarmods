@@ -200,13 +200,39 @@ test('LOGIN_IP_HARD_LIMIT herdado com valor 5 e recusado pelo piso', () => {
   );
 });
 
-test('AUTH_RATE_LIMIT_MAX herdado com valor 10 e recusado pelo piso', () => {
+test('AUTH_RATE_LIMIT_MAX herdado com valor 10 e recusado pelo piso do fallback', () => {
+  // MUDANCA DE SEMANTICA, e o motivo desta assercao ter sido reescrita:
+  // o limiter de /api/auth/* passou a contar por APARELHO (device_account_key), nao por IP.
+  // A justificativa completa esta no cabecalho de src/middleware/rateLimits.js, e o
+  // comportamento novo e coberto por tests/device_rate_limit.test.js.
+  //
+  // AUTH_RATE_LIMIT_MAX conservou o nome por causa da variavel ja configurada no Railway, mas
+  // governa apenas o FALLBACK por IP, aplicado quando a requisicao nao identifica o aparelho.
+  // O piso desse fallback subiu de 60 para 300: um bucket compartilhado por um gateway inteiro
+  // de CGNAT nao pode operar com o teto que faz sentido para um aparelho isolado.
   const rateLimits = loadWithEnv('src/middleware/rateLimits.js', { AUTH_RATE_LIMIT_MAX: 10 });
 
   assert.strictEqual(
+    rateLimits.authRateLimit.ipFallback.max,
+    300,
+    'O teto do fallback por IP deve ser elevado ao piso (300).'
+  );
+  assert.strictEqual(
+    rateLimits.authRateLimit.ipFallback.configuredValue,
+    '10',
+    'O valor configurado deve permanecer visivel para diagnostico, mesmo recusado.'
+  );
+
+  // O teto por aparelho e independente dessa variavel e permanece no padrao calibrado.
+  assert.strictEqual(
     rateLimits.authRateLimit.max,
-    60,
-    'O teto de requisicoes em /api/auth/ deve ser elevado ao piso (60).'
+    30,
+    'O teto por aparelho nao deve ser afetado por AUTH_RATE_LIMIT_MAX.'
+  );
+  assert.strictEqual(
+    rateLimits.authRateLimit.keyedBy,
+    'device_account_key',
+    'O /health deve declarar SOBRE O QUE o limite conta, nao apenas quanto.'
   );
 });
 

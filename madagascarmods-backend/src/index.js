@@ -87,37 +87,102 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-// Rate limiting geral (por IP). Limites por usuario nas rotas sensiveis
-// ficam em src/middleware/rateLimits.js.
+// ---------------------------------------------------------------------------
+// Rate limiting geral
+//
+// ESTE ERA O LIMITER QUE BLOQUEAVA O USUARIO EM PRODUCAO.
+//
+// A mensagem "Too many requests, please try again later." relatada pelo usuario vinha daqui,
+// e nao do limiter de autenticacao: confirmado por header em producao, /api/config respondia
+// com `ratelimit-limit: 300`. Como este middleware roda antes de todas as rotas de /api/ e
+// contava por IP, ele era o teto mais baixo de toda a cadeia sob CGNAT.
+//
+// A aritmetica do bloqueio: cada abertura do aplicativo consome cerca de quatro requisicoes
+// (/config/app, /auth/device e as chamadas de sessao). Trezentas por IP significam por volta
+// de setenta aberturas por gateway de operadora em quinze minutos — numero alcancado por uso
+// normal quando 137 aparelhos compartilham o mesmo IPv4, como foi medido.
+//
+// CORRECAO: a chave passa a ser o usuario autenticado, ou o aparelho quando a requisicao o
+// identifica, com o IP apenas como ultimo recurso. `userOrTokenKey` ja resolvia o usuario a
+// partir do JWT sem precisar validar assinatura; `deviceIdentifierFromBody` cobre o bootstrap,
+// que acontece antes de existir token. O teto por IP sobe para 1200 porque, no caminho residual
+// em que ele ainda se aplica (requisicao anonima e sem identificacao de aparelho), o bucket
+// continua compartilhado por todo o CGNAT.
+//
+// Por que isso nao afrouxa a protecao: o objetivo deste limiter e conter flood de requisicoes,
+// e contra flood a chave por usuario/aparelho e mais eficaz — um unico cliente em laco atinge
+// o proprio teto sem consumir a cota de terceiros, que era precisamente o efeito colateral
+// indesejado da contagem por IP.
+// ---------------------------------------------------------------------------
+const {
+  userOrTokenKey,
+  deviceIdentifierFromBody,
+} = require('./middleware/rateLimits');
+
+const GENERAL_LIMIT_PER_IDENTITY = 300;
+const GENERAL_LIMIT_PER_IP = 1200;
+
+/**
+ * Chave do limiter geral: usuario > aparelho > IP.
+ *
+ * `userOrTokenKey` devolve `ip:<endereco>` quando nao consegue identificar o usuario. Esse
+ * retorno e o sinal de que ainda ha uma chance de identificar o aparelho pelo corpo da
+ * requisicao, caminho usado pelo bootstrap.
+ */
+function generalLimiterKey(req) {
+  const identity = userOrTokenKey(req);
+  if (!identity.startsWith('ip:')) return identity;
+
+  const deviceKey = deviceIdentifierFromBody(req);
+  return deviceKey || identity;
+}
+
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300,
+  limit: (req) => (
+    generalLimiterKey(req).startsWith('ip:')
+      ? GENERAL_LIMIT_PER_IP
+      : GENERAL_LIMIT_PER_IDENTITY
+  ),
+  keyGenerator: generalLimiterKey,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' }
+  // Mensagem em portugues e com codigo, como no restante da API. A versao anterior era a
+  // string padrao da biblioteca, em ingles e sem codigo: o aplicativo nao tinha como
+  // distinguir este bloqueio de qualquer outro 429 e exibia texto cru ao usuario.
+  message: {
+    error: 'Muitas requisicoes. Aguarde alguns minutos e tente novamente.',
+    code: 'GENERAL_RATE_LIMIT'
+  }
 });
 
 // ---------------------------------------------------------------------------
-// Limite das rotas de autenticacao (por IP)
+// Limite das rotas de autenticacao
 //
-// CORRECAO DE FALSO POSITIVO EM MASSA (CGNAT):
-// O valor anterior era 10 requests / 15 min por IP. Este limiter roda ANTES de qualquer
-// rota, portanto era a trava mais restritiva de toda a cadeia: sob CGNAT de operadora
-// movel, onde milhares de celulares compartilham um mesmo IPv4 publico, dez requisicoes
-// esgotavam a cota em segundos e derrubavam login e cadastro para todos os usuarios
-// daquele IP durante 15 minutos.
+// O limiter mora em src/middleware/rateLimits.js e agora conta POR APARELHO. A justificativa
+// completa da troca de chave esta documentada la.
 //
-// O login do app nao usa senha (ver VULN-05 em routes/auth.js), logo nao existe forca
-// bruta de credencial a conter aqui. O abuso possivel (farm de contas) e barrado por
-// aparelho, de forma atomica, pelos indices unicos de device_account_key e device_id.
-// Este limiter volta a ser o que deve ser: protecao contra flood de requisicoes.
+// ESTE ARQUIVO NAO O APLICA MAIS.
+//
+// Havia um `app.use('/api/auth/', authLimiter)` aqui, e as rotas /device, /login e /register
+// ja declaram o MESMO limiter na propria cadeia. O efeito era invisivel no codigo e grave na
+// pratica: express-rate-limit incrementa o contador uma vez por passagem, de modo que cada
+// requisicao consumia DOIS hits do mesmo bucket. O teto efetivo era a metade do configurado
+// — 120 por IP viravam 60 reais.
+//
+// Reproduzido em laboratorio com a mesma versao da biblioteca (7.5.1) e limite 4:
+//
+//     req 1 -> 200, remaining=2      (dois hits consumidos)
+//     req 2 -> 200, remaining=0
+//     req 3 -> 429                   (bloqueio na terceira, nao na quinta)
+//
+// A biblioteca detecta a situacao pela validacao `singleCount` e registra ERR_ERL_DOUBLE_COUNT
+// no console, sem interromper a requisicao — por isso o defeito nunca apareceu como erro.
+//
+// A aplicacao permanece apenas nas rotas (routes/auth.js), que e o lugar correto: /auth/refresh
+// e /auth/logout nao precisam do limiter de tentativa de acesso, e aplicar em '/api/auth/'
+// inteiro os incluia sem necessidade.
 // ---------------------------------------------------------------------------
-// DEDUPLICACAO: este arquivo mantinha uma segunda definicao do mesmo limiter, com a leitura
-// de AUTH_RATE_LIMIT_MAX repetida. Duas fontes para a mesma regra e como um limite acaba
-// corrigido em um lugar e esquecido no outro; alem disso as duas instancias contavam em
-// buckets separados, de modo que o teto efetivo por IP nao era o valor configurado.
-// O limiter passa a vir de src/middleware/rateLimits.js, onde o piso de seguranca e aplicado.
-const { authLimiter } = require('./middleware/rateLimits');
 
 // O callback SSV vem dos servidores do Google e nao deve ser limitado por IP:
 // um unico IP do Google concentra os callbacks de todos os usuarios.
@@ -125,7 +190,6 @@ app.use('/api/', (req, res, next) => {
   if (req.path.startsWith('/ssv/')) return next();
   return generalLimiter(req, res, next);
 });
-app.use('/api/auth/', authLimiter);
 
 /**
  * Limites de rede efetivamente vigentes neste processo.
@@ -152,7 +216,17 @@ function effectiveNetworkLimits() {
       accountsPerIp24hFloor: authRoutes.limits?.maxAccountsPerIp24hFloor ?? null,
       loginIpSoftLimit: loginIpLimits?.softLimit ?? null,
       loginIpHardLimit: loginIpLimits?.hardLimit ?? null,
+      // Limiter das rotas de autenticacao. `authKeyedBy` e o campo que faltava no diagnostico
+      // anterior: sem ele, um limite de 30 exibido aqui era indistinguivel entre "30 por
+      // aparelho" (politica atual, apertada e isolada) e "30 por IP" (politica antiga, que
+      // derrubaria toda uma operadora). O numero sozinho nao descreve a regra.
+      authKeyedBy: authRateLimit?.keyedBy ?? null,
       authRequestsPer15min: authRateLimit?.max ?? null,
+      authRequestsPer15minConfigured: authRateLimit?.configuredValue ?? null,
+      authIpFallbackPer15min: authRateLimit?.ipFallback?.max ?? null,
+      // Limiter geral de /api/, que foi a origem real do "Too many requests" relatado.
+      generalPerIdentityPer15min: GENERAL_LIMIT_PER_IDENTITY,
+      generalPerIpPer15min: GENERAL_LIMIT_PER_IP,
     };
   } catch (_) {
     // O health check nunca deve falhar por causa de um campo informativo.
