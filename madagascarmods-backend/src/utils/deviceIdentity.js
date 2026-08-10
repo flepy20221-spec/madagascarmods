@@ -35,6 +35,47 @@ function normalizeDeviceAccountKey(value) {
   return DEVICE_ACCOUNT_KEY_PATTERN.test(normalized) ? normalized : null;
 }
 
+/**
+ * Normaliza o alias secundario derivado do ANDROID_ID.
+ *
+ * ============================================================================
+ * POR QUE EXISTE UM SEGUNDO IDENTIFICADOR DO MESMO APARELHO
+ *
+ * `device_account_key` e o SHA-256 de uma string que inclui um numero de versao
+ * de escopo:
+ *
+ *     sha256('cashpix|com.madagascarmods|v2|' + androidId)
+ *
+ * Esse `v2` cumpre um proposito legitimo (permitir invalidar chaves antigas de
+ * proposito), mas cria um efeito colateral indesejado: toda evolucao do formato
+ * troca a identidade de TODOS os aparelhos de uma vez. Foi assim que a base
+ * chegou a 537 contas com zero aliases secundarios — nenhuma conta jamais foi
+ * reconhecida por uma chave anterior, porque nao havia caminho alternativo.
+ *
+ * `android_id_key` remove o numero de versao do escopo:
+ *
+ *     sha256('cashpix-android-id|' + androidId)
+ *
+ * O valor continua sendo um hash: o ANDROID_ID bruto nunca e transmitido nem
+ * gravado, e o hash nao permite reconstrui-lo.
+ *
+ * LIMITE QUE PRECISA ESTAR CLARO: quando a chave de assinatura do APK muda, o
+ * proprio ANDROID_ID muda (comportamento do Android 8+), e os DOIS hashes mudam
+ * juntos. Este alias nao protege contra troca de keystore. Ele protege contra
+ * mudanca de escopo do aplicativo, que era o unico dos dois casos que estava sob
+ * o controle deste codigo.
+ * ============================================================================
+ */
+function normalizeAndroidIdKey(value) {
+  // Mesmo formato e mesma validacao da chave principal: 64 caracteres hex. A
+  // funcao e separada em vez de reaproveitar normalizeDeviceAccountKey para que
+  // a intencao apareca na chamada e para que os dois formatos possam divergir no
+  // futuro sem alterar o comportamento de um ao mexer no outro.
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  return DEVICE_ACCOUNT_KEY_PATTERN.test(normalized) ? normalized : null;
+}
+
 function buildDeviceAccountEmail(deviceAccountKey) {
   const normalized = normalizeDeviceAccountKey(deviceAccountKey);
   if (!normalized) {
@@ -89,6 +130,7 @@ module.exports = {
   DEVICE_ACCOUNT_KEY_PATTERN,
   INSTALLATION_STATE,
   normalizeDeviceAccountKey,
+  normalizeAndroidIdKey,
   buildDeviceAccountEmail,
   normalizeInstallationState,
   generateDeviceBindingToken,

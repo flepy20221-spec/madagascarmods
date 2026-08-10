@@ -15,6 +15,13 @@ test('reconcilia conta duplicada sem perder saldo ou historico', { skip: !hasDat
   const missionId = randomUUID();
   const targetKey = 'a'.repeat(64);
   const sourceKey = 'b'.repeat(64);
+  // As duas contas recebem android_id_key preenchido de proposito. Este e o
+  // cenario real de duas contas do MESMO aparelho, e o unico que exercita o
+  // indice unico parcial criado pela migracao 010. Sem o ajuste em userMerge.js
+  // (zerar o valor da origem antes de promove-lo), o UPDATE de promocao violaria
+  // a unicidade e o merge falharia justamente no caso mais comum.
+  const targetAndroidKey = 'c'.repeat(64);
+  const sourceAndroidKey = 'd'.repeat(64);
 
   t.after(async () => {
     client.release();
@@ -31,19 +38,19 @@ test('reconcilia conta duplicada sem perder saldo ou historico', { skip: !hasDat
 
     const target = await client.query(
       `INSERT INTO users (
-         id, email, device_id, device_account_key, device_model,
+         id, email, device_id, device_account_key, android_id_key, device_model,
          ip_address, app_version, support_label, last_login_at
-       ) VALUES ($1, $2, $3, $3, 'Moto G60', '127.0.0.1', '1.6.0+8', 'Conta principal', NOW() - INTERVAL '1 day')
+       ) VALUES ($1, $2, $3, $3, $4, 'Moto G60', '127.0.0.1', '1.6.0+8', 'Conta principal', NOW() - INTERVAL '1 day')
        RETURNING support_code`,
-      [targetId, `target-${targetId}@test.local`, targetKey]
+      [targetId, `target-${targetId}@test.local`, targetKey, targetAndroidKey]
     );
 
     await client.query(
       `INSERT INTO users (
-         id, email, device_id, device_account_key, device_model,
+         id, email, device_id, device_account_key, android_id_key, device_model,
          ip_address, app_version, last_login_at
-       ) VALUES ($1, $2, $3, $3, 'Moto G60', '127.0.0.1', '1.7.1+10', NOW())`,
-      [sourceId, `source-${sourceId}@test.local`, sourceKey]
+       ) VALUES ($1, $2, $3, $3, $4, 'Moto G60', '127.0.0.1', '1.7.1+10', NOW())`,
+      [sourceId, `source-${sourceId}@test.local`, sourceKey, sourceAndroidKey]
     );
 
     await client.query(
@@ -107,7 +114,7 @@ test('reconcilia conta duplicada sem perder saldo ou historico', { skip: !hasDat
 
     const users = await client.query(
       `SELECT id, is_active, merged_into_user_id, device_id, device_account_key,
-              device_model, app_version
+              android_id_key, device_model, app_version
          FROM users WHERE id = ANY($1::uuid[]) ORDER BY id`,
       [[targetId, sourceId]]
     );
@@ -117,6 +124,11 @@ test('reconcilia conta duplicada sem perder saldo ou historico', { skip: !hasDat
     assert.equal(source.merged_into_user_id, targetId);
     assert.equal(source.device_id, null);
     assert.equal(source.device_account_key, null);
+    // O alias de ANDROID_ID segue a mesma regra da chave principal: zerado na
+    // origem e promovido para a conta principal, porque e a origem que representa
+    // o aparelho em uso agora.
+    assert.equal(source.android_id_key, null);
+    assert.equal(canonical.android_id_key, sourceAndroidKey);
     assert.equal(canonical.device_account_key, sourceKey);
     assert.equal(canonical.device_model, 'Moto G60');
     assert.equal(canonical.app_version, '1.7.1+10');

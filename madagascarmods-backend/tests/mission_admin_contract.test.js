@@ -60,6 +60,14 @@ test('cria missão aceitando o formato snake_case usado pelo painel antigo', asy
 
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.success, true);
+
+  // A migracao 010 acrescentou cinco parametros ao INSERT. Os valores esperados
+  // abaixo das posicoes 9 a 13 sao os defaults, e a asercao existe justamente
+  // para travar esses defaults: uma missao comum criada pelo painel antigo
+  // precisa continuar com verificacao automatica, anuncio obrigatorio, sem
+  // cooldown e sem espera. Qualquer mudanca acidental nesses padroes alteraria o
+  // comportamento das missoes ja em producao, e este teste falha antes disso
+  // chegar ao deploy.
   assert.deepEqual(capturedParams, [
     'Assistir 5 anúncios',
     'Teste',
@@ -70,6 +78,11 @@ test('cria missão aceitando o formato snake_case usado pelo painel antigo', asy
     true,
     true,
     1,
+    'auto',  // verification_mode
+    null,    // action_url
+    true,    // requires_ad
+    null,    // cooldown_days
+    0,       // min_seconds_before_claim
   ]);
 });
 

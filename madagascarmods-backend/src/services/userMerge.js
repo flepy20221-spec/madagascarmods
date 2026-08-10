@@ -45,8 +45,8 @@ async function mergeUserAccounts({
 
   const locked = await client.query(
     `SELECT id, email, support_code, support_label, device_id,
-            device_account_key, device_model, ip_address, app_version,
-            is_active, is_banned, referred_by, merged_into_user_id,
+            device_account_key, android_id_key, device_model, ip_address,
+            app_version, is_active, is_banned, referred_by, merged_into_user_id,
             created_at, last_login_at
        FROM users
       WHERE id = ANY($1::uuid[])
@@ -291,11 +291,22 @@ async function mergeUserAccounts({
   const newPrimaryKey = source.device_account_key || target.device_account_key;
   const newDeviceId = source.device_id || newPrimaryKey || target.device_id;
 
+  // O alias de ANDROID_ID segue a mesma regra da chave principal: prevalece o da
+  // conta de origem, porque e ela que representa o aparelho em uso agora.
+  //
+  // Este trecho e obrigatorio a partir da migracao 010. `users.android_id_key`
+  // tem indice unico parcial, e o merge de duas contas do MESMO aparelho e
+  // exatamente o caso em que as duas linhas tem esse valor preenchido. Sem zerar
+  // o da origem antes de promover, o UPDATE seguinte violaria a unicidade e o
+  // merge falharia justamente no cenario mais comum.
+  const newAndroidIdKey = source.android_id_key || target.android_id_key;
+
   // Libera os indices unicos antes de promover a chave atual para a conta principal.
   await client.query(
     `UPDATE users
         SET device_id = NULL,
             device_account_key = NULL,
+            android_id_key = NULL,
             is_active = false,
             merged_into_user_id = $1,
             merged_at = NOW(),
@@ -308,19 +319,21 @@ async function mergeUserAccounts({
     `UPDATE users
         SET device_id = COALESCE($1, device_id),
             device_account_key = COALESCE($2, device_account_key),
-            device_model = COALESCE($3, device_model),
-            ip_address = COALESCE($4, ip_address),
-            app_version = COALESCE($5, app_version),
-            support_label = COALESCE(support_label, $6),
-            last_login_at = GREATEST(last_login_at, $7),
+            android_id_key = COALESCE($3, android_id_key),
+            device_model = COALESCE($4, device_model),
+            ip_address = COALESCE($5, ip_address),
+            app_version = COALESCE($6, app_version),
+            support_label = COALESCE(support_label, $7),
+            last_login_at = GREATEST(last_login_at, $8),
             referral_count = (
-              SELECT COUNT(*) FROM users referred WHERE referred.referred_by = $8
+              SELECT COUNT(*) FROM users referred WHERE referred.referred_by = $9
             ),
             updated_at = NOW()
-      WHERE id = $8`,
+      WHERE id = $9`,
     [
       newDeviceId,
       newPrimaryKey,
+      newAndroidIdKey,
       source.device_model,
       source.ip_address,
       source.app_version,
@@ -344,6 +357,7 @@ async function mergeUserAccounts({
         sourceSupportCode: source.support_code,
         sourceEmail: source.email,
         sourceDeviceKey: source.device_account_key,
+        sourceAndroidIdKey: source.android_id_key,
         reason: safeReason,
       }),
       JSON.stringify({
@@ -351,6 +365,7 @@ async function mergeUserAccounts({
         targetSupportCode: target.support_code,
         targetEmail: target.email,
         promotedDeviceKey: newPrimaryKey,
+        promotedAndroidIdKey: newAndroidIdKey,
       }),
       requestIp || null,
     ]

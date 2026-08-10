@@ -36,6 +36,7 @@ const { clientIp, antifraudMiddleware } = require('../middleware/antiFraud');
 const { loginBotDetection } = require('../middleware/botDetection');
 const {
   normalizeDeviceAccountKey,
+  normalizeAndroidIdKey,
   buildDeviceAccountEmail,
   generateDeviceBindingToken,
   hashDeviceBindingToken,
@@ -309,6 +310,7 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
   try {
     const {
       device_account_key,
+      android_id_key,
       legacy_device_id,
       migration_refresh_token,
       device_binding_token,
@@ -324,6 +326,22 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
         code: 'INVALID_DEVICE_ACCOUNT_KEY',
       });
     }
+
+    // Alias secundario do mesmo aparelho, derivado do ANDROID_ID sem numero de
+    // versao no escopo. Ver normalizeAndroidIdKey em utils/deviceIdentity.js.
+    //
+    // Opcional de proposito: builds anteriores a 1.7.4 nao enviam este campo e
+    // precisam continuar entrando exatamente como antes. Um valor ausente ou mal
+    // formado vira null e simplesmente nao participa da busca nem do registro.
+    const androidIdKey = normalizeAndroidIdKey(android_id_key);
+
+    // Guarda contra um erro de cliente que anularia o proposito do alias: se o
+    // aplicativo enviar o MESMO hash nos dois campos, o alias secundario nao
+    // agrega caminho de reconhecimento algum e ainda ocuparia uma linha
+    // redundante na tabela de aliases. Tratado como ausente.
+    const distinctAndroidIdKey = androidIdKey && androidIdKey !== deviceAccountKey
+      ? androidIdKey
+      : null;
 
     const legacyDeviceId = typeof legacy_device_id === 'string'
       ? legacy_device_id.trim().slice(0, 255)
@@ -383,6 +401,36 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
     let accountCreated = false;
     let accountMigrated = false;
     let migrationMethod = user ? (user.alias_source === 'device_account_key' ? 'device_account_key' : 'device_alias') : null;
+
+    // ==========================================================================
+    // BUSCA PELO ALIAS DE ANDROID_ID
+    //
+    // Este caminho vem ANTES do token de vinculo por um motivo pratico: ele e o
+    // unico que funciona quando a instalacao perdeu todo o armazenamento local
+    // (desinstalacao) mas o aparelho e a assinatura do APK continuam os mesmos.
+    // Nesse cenario o `device_account_key` muda apenas se o escopo mudou, e o
+    // `android_id_key` permanece identico.
+    //
+    // O alias e uma PROVA DE POSSE legitima e do mesmo grau que a chave
+    // principal: ambos derivam do ANDROID_ID, que so pode ser lido por um
+    // aplicativo executando naquele aparelho. Nao ha aqui nenhum afrouxamento
+    // do criterio de seguranca — IP e modelo de aparelho continuam nao
+    // associando conta alguma.
+    // ==========================================================================
+    if (!user && distinctAndroidIdKey) {
+      const aliasUser = await client.query(
+        `SELECT u.id, u.email, u.is_active, u.is_banned, u.device_account_key
+           FROM device_account_aliases a
+           JOIN users u ON u.id = a.user_id
+          WHERE a.device_account_key = $1
+            AND u.merged_into_user_id IS NULL
+          LIMIT 1
+          FOR UPDATE OF u`,
+        [distinctAndroidIdKey]
+      );
+      user = aliasUser.rows[0] || null;
+      if (user) migrationMethod = 'android_id_key';
+    }
 
     // Primeiro caminho de migracao, e agora o mais confiavel: token de vinculo
     // dedicado. Diferente do refresh token, ele nao e rotacionado pelo ciclo de
@@ -458,7 +506,13 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       const rotationProved = migrationMethod === 'binding_token'
         || migrationMethod === 'refresh_token'
         || migrationMethod === 'legacy_device_id'
-        || migrationMethod === 'device_alias';
+        || migrationMethod === 'device_alias'
+        // O alias de ANDROID_ID entra na lista pelo mesmo fundamento dos demais:
+        // so quem esta executando o aplicativo naquele aparelho consegue produzir
+        // o hash. E precisamente este caso — chave principal trocada, aparelho
+        // inalterado — que fazia o servidor recusar a rotacao e, na sequencia,
+        // criar a conta duplicada com saldo zero.
+        || migrationMethod === 'android_id_key';
 
       if (!rotationProved) {
         await client.query('ROLLBACK');
@@ -641,6 +695,72 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       });
     }
 
+    // ==========================================================================
+    // REGISTRO DO ALIAS DE ANDROID_ID
+    //
+    // Executado para toda conta que apresente o campo, inclusive contas antigas
+    // reconhecidas pela chave principal. E este passo que faz a migracao da base
+    // acontecer sozinha: no primeiro acesso apos o deploy, a conta ja e
+    // localizada pelo caminho de sempre e ganha o alias novo de brinde. Nenhum
+    // backfill manual e necessario, e nenhuma conta precisa ser tocada em massa.
+    //
+    // O tratamento do conflito difere do alias principal de proposito. Aqui um
+    // alias pertencente a OUTRA conta nao interrompe o login: a conta atual foi
+    // legitimamente identificada por outro caminho, e recusar o acesso agora
+    // deixaria o usuario de fora por causa de um dado meramente auxiliar. O caso
+    // e apenas registrado no audit_log, porque ele indica duas contas disputando
+    // o mesmo aparelho — material para a reconciliacao pelo painel.
+    // ==========================================================================
+    if (distinctAndroidIdKey) {
+      const androidAliasResult = await client.query(
+        `INSERT INTO device_account_aliases (
+           device_account_key, user_id, source, first_seen_at, last_seen_at, metadata
+         )
+         VALUES ($1, $2, 'android_id_key', NOW(), NOW(), $3::jsonb)
+         ON CONFLICT (device_account_key) DO UPDATE
+            SET last_seen_at = NOW()
+          WHERE device_account_aliases.user_id = EXCLUDED.user_id
+         RETURNING user_id`,
+        [
+          distinctAndroidIdKey,
+          user.id,
+          JSON.stringify({ appVersion: safeAppVersion, deviceModel: safeDeviceModel }),
+        ]
+      );
+
+      if (androidAliasResult.rows.length === 0) {
+        // Nao ha ROLLBACK aqui. Ver justificativa no comentario acima.
+        await client.query(
+          `INSERT INTO audit_log (
+             actor_id, actor_type, action, target_type, target_id, new_value, ip_address
+           )
+           VALUES ($1, 'system', 'ANDROID_ID_ALIAS_CONFLICT', 'user', $1, $2, $3)`,
+          [
+            user.id,
+            JSON.stringify({
+              androidIdKey: distinctAndroidIdKey,
+              migrationMethod,
+              note: 'Alias de ANDROID_ID pertence a outra conta. Login mantido; '
+                + 'candidato a reconciliacao no painel.',
+            }),
+            ip,
+          ]
+        );
+      } else {
+        // Espelha o alias na coluna da tabela users. A tabela de aliases continua
+        // sendo a fonte de verdade para a busca; a coluna existe para permitir
+        // diagnostico direto ("quantas contas ja passaram pelo mecanismo novo")
+        // sem precisar de JOIN, e e escrita apenas quando o alias e realmente
+        // desta conta.
+        await client.query(
+          `UPDATE users SET android_id_key = $1, updated_at = NOW()
+            WHERE id = $2
+              AND (android_id_key IS NULL OR android_id_key <> $1)`,
+          [distinctAndroidIdKey, user.id]
+        );
+      }
+    }
+
     if (user.is_banned) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Conta suspensa.', code: 'BANNED' });
@@ -713,6 +833,10 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
           appVersion: safeAppVersion,
           installationState,
           bindingTokenIssued: Boolean(issuedBindingToken),
+          // Permite medir a adocao do mecanismo novo sem consultar a tabela de
+          // aliases: uma contagem no audit_log ja mostra quantos bootstraps
+          // chegaram com o campo preenchido.
+          androidIdKeyPresent: Boolean(distinctAndroidIdKey),
         }),
         ip,
       ]
