@@ -881,17 +881,44 @@ router.get('/users', authenticateAdmin, async (req, res) => {
       where += ` AND u.app_version = $${params.length}`;
     }
 
+    // O nome do titular da chave PIX entra apenas como AUXILIO DE IDENTIFICACAO
+    // no painel. Antes, uma conta sem `support_label` — o que ocorre em toda a
+    // base, porque o rotulo e manual e nunca foi preenchido — aparecia como
+    // "Sem apelido de suporte" e so podia ser distinguida pelo UUID ou pelo
+    // e-mail sintetico `device-<hash>@cashpix.local`, ilegivel para o operador.
+    //
+    // Nao sobrescreve `support_label`: aquele campo e curadoria manual do
+    // suporte e continua tendo precedencia. Este e um campo derivado, somente
+    // leitura, resolvido por consulta.
+    //
+    // O LATERAL com LIMIT 1 garante resultado estavel para o usuario que possui
+    // mais de uma pix_account (existe um caso na base): prefere APPROVED e,
+    // entre elas, a mais recente. Sem essa ordenacao explicita o nome exibido
+    // oscilaria entre recargas da pagina. LEFT JOIN preserva as 375 contas sem
+    // chave PIX, que continuam vindo com pix_holder_name nulo.
     const pageQuery = `SELECT u.id, u.support_code, u.support_label, u.email,
                               u.device_id, u.device_account_key, u.device_model,
                               u.ip_address, u.app_version, u.is_active, u.is_banned,
                               u.created_at, u.last_login_at, u.fraud_score,
-                              u.last_fraud_at, u.ban_reason, balance.total AS balance
+                              u.last_fraud_at, u.ban_reason, balance.total AS balance,
+                              pix.full_name AS pix_holder_name,
+                              pix.status AS pix_holder_status
                          FROM users u
                          CROSS JOIN LATERAL (
                            SELECT COALESCE(SUM(pl.amount), 0) AS total
                              FROM points_ledger pl
                             WHERE pl.user_id = u.id
                          ) balance
+                         LEFT JOIN LATERAL (
+                           SELECT pa.full_name, pa.status
+                             FROM pix_accounts pa
+                            WHERE pa.user_id = u.id
+                              AND COALESCE(pa.full_name, '') <> ''
+                            ORDER BY (pa.status = 'APPROVED') DESC,
+                                     pa.reviewed_at DESC NULLS LAST,
+                                     pa.submitted_at DESC
+                            LIMIT 1
+                         ) pix ON TRUE
                          ${where}
                         ORDER BY u.last_login_at DESC NULLS LAST, u.created_at DESC
                         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
