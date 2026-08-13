@@ -54,6 +54,7 @@ function httpJson(method, url, body, headers) {
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        'User-Agent': 'CashPix-Backend/1.0',
         ...headers,
       },
     };
