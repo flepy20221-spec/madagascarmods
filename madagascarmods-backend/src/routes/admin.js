@@ -988,8 +988,8 @@ router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
     const balance = await asaas.getBalance();
     res.json({
       success: balance.success,
-      balance: balance.balance || null,
-      balanceFormatted: balance.balanceFormatted || null,
+      balance: balance.balance ?? null,
+      balanceFormatted: balance.balanceFormatted ?? null,
       message: balance.success ? undefined : balance.message,
     });
   } catch (error) {

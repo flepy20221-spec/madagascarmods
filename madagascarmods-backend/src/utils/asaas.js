@@ -87,19 +87,16 @@ async function getBalance() {
   if (!ASAAS_API_KEY) {
     return { success: false, message: 'ASAAS_API_KEY nao configurada' };
   }
-  const res = await httpJson('GET', `${ASAAS_API_URL}/myAccount`, null, {
+  // O endpoint /myAccount nao retorna o saldo; o saldo disponivel fica em /finance/balance.
+  const res = await httpJson('GET', `${ASAAS_API_URL}/finance/balance`, null, {
     access_token: ASAAS_API_KEY,
   });
-  if (res.statusCode === 200 && res.body) {
-    // A conta pode informar saldo disponivel em campos diferentes conforme a versao da API.
-    const balance = parseFloat(
-      res.body.availableBalance || res.body.balance || res.body.balanceAvailable || 0
-    );
+  if (res.statusCode === 200 && res.body && typeof res.body.balance === 'number') {
+    const balance = res.body.balance;
     return {
       success: true,
       balance,
       balanceFormatted: `R$ ${balance.toFixed(2)}`,
-      account: res.body,
     };
   }
   const message = (res.body && res.body.errors && res.body.errors[0] && res.body.errors[0].description)
