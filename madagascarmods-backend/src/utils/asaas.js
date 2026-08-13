@@ -155,6 +155,24 @@ async function sendPixPayment({ pixKeyValue, pixKeyType, amountBRL, withdrawalId
 
     // Sucesso: Asaas retorna 200/201 com { id, status, value, ... }
     if (res.statusCode < 300 && res.body && res.body.id) {
+      // Registrar a transferencia na fila de pendencias para o webhook de
+      // validacao de saques da Asaas (routes/asaas_webhook.js). A marcacao
+      // usada=true libera o webhook para aprovar somente esta transferencia,
+      // e evita que qualquer transferencia estranha a este backend seja
+      // aprovada. Falhar na gravação do registro não impede o pagamento:
+      // o webhook recusaria, e o administrador pode aprovar manualmente.
+      try {
+        const db = require('../models/db');
+        await db.query(
+          `INSERT INTO asaas_pending_transfers
+             (transfer_id, withdrawal_id, value_cents, pix_address_key, used)
+           VALUES ($1, $2, $3, $4, false)
+           ON CONFLICT (transfer_id) DO NOTHING`,
+          [res.body.id, withdrawalId, Math.round(value * 100), String(pixKeyValue).trim().toLowerCase()]
+        );
+      } catch (persistErr) {
+        console.error('[asaas] falha ao registrar pendencia do webhook:', persistErr?.message || persistErr);
+      }
       return {
         success: true,
         transferId: res.body.id,

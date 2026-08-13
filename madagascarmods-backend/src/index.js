@@ -187,8 +187,11 @@ const generalLimiter = rateLimit({
 
 // O callback SSV vem dos servidores do Google e nao deve ser limitado por IP:
 // um unico IP do Google concentra os callbacks de todos os usuarios.
+// O webhook de validacao de saques da Asaas tambem vem da infraestrutura do Asaas
+// e nao deve ser limitado por IP (uma unica origem concentra todas as validacoes).
 app.use('/api/', (req, res, next) => {
   if (req.path.startsWith('/ssv/')) return next();
+  if (req.path.startsWith('/asaas/')) return next();
   return generalLimiter(req, res, next);
 });
 
@@ -349,6 +352,12 @@ app.use('/api/referral', referralRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/missions', missionsRoutes);
 app.use('/api/', myIpRoutes);
+
+// Webhook de validacao de saques da Asaas (validacao automatica sem SMS/App):
+// o Asaas POSTa aqui ~5s apos cada transferencia via API; o endpoint valida
+// o token e o payload contra a fila de pendencias e responde APPROVED/REFUSED.
+const asaasWebhookRoutes = require('./routes/asaas_webhook');
+app.use('/api/', asaasWebhookRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
