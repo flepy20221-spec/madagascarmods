@@ -26,6 +26,7 @@ const checkinRoutes = require('./routes/checkin');
 const referralRoutes = require('./routes/referral');
 const pushRoutes = require('./routes/push');
 const missionsRoutes = require('./routes/missions');
+const myIpRoutes = require('./routes/myip');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -347,6 +348,7 @@ app.use('/api/checkin', checkinRoutes);
 app.use('/api/referral', referralRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/missions', missionsRoutes);
+app.use('/api/', myIpRoutes);
 
 // Error handler
 app.use((err, req, res, next) => {
