@@ -1276,26 +1276,7 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Abandoned users error:', error);
-    res.status(500).json({ error: 'Erro ao listar contas em observacao', detail: String(error.message || error) });
-  }
-});
-
-// TEMP debug: testa a query de abandoned diretamente no banco.
-router.get('/debug/abandoned-query', authenticateAdmin, async (req, res) => {
-  try {
-    const r = await db.query(
-      `SELECT u.id, u.email, u.support_code, u.created_at, u.last_login_at
-         FROM users u
-        WHERE u.merged_into_user_id IS NULL
-          AND (u.last_login_at IS NULL
-               OR u.last_login_at < NOW() - make_interval(days => $1))
-          AND (u.created_at < NOW() - make_interval(days => $1))
-        LIMIT 5`,
-      [15],
-    );
-    res.json({ ok: true, count: r.rows.length, rows: r.rows });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: String(error.message || error) });
+    res.status(500).json({ error: 'Erro ao listar contas em observacao' });
   }
 });
 

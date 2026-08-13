@@ -33,6 +33,13 @@
 - Adicionar rota no App.tsx/router se nova página
 - Depois: tsc --noEmit, commit, push
 
+### Estado backend (fase 4 em andamento)
+- Commits: relatório c998d51 (testado OK em produção), exclusão 90fa8a9 + 4d066dc, debug abandoned 5c60bb8+8c6... (rota abandoned CORRIGIDA e TESTADA OK em produção: retorna 0 contas, query valida)
+- BUG INTRODUZIDO: removi a rota debug com sed mas deletei tb a linha `router.get('/asaas/balance', authenticateAdmin, async (req, res) => {` — precisa reinsert antes de `  try {
+    const balance = await asaas.getBalance();`
+- Remover também o `detail:` da rota abandoned (deixar limpo): "Erro ao listar contas em observacao"
+- Depois: git add/commit/push backend; esperar deploy; testar DELETE /users/:id com usuário fake; avançar para UI frontend
+
 ### Deploy/teste
 - Backend: https://madagascarmods-production.up.railway.app (Railway auto-deploy via GitHub push)
 - Admin: https://cashpix-admin-production.up.railway.app

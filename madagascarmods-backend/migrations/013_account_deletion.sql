@@ -36,14 +36,14 @@ BEGIN
 
   DELETE FROM device_account_aliases WHERE user_id = target_user_id;
 
-  DELETE FROM payout_destinations WHERE user_id = target_user_id;
-
   DELETE FROM pix_accounts WHERE user_id = target_user_id;
 
   DELETE FROM push_tokens WHERE user_id = target_user_id;
 
   SELECT COUNT(*) INTO v_withdrawals FROM withdrawals WHERE user_id = target_user_id;
   DELETE FROM withdrawals WHERE user_id = target_user_id;
+
+  DELETE FROM payout_destinations WHERE user_id = target_user_id;
 
   DELETE FROM reward_events WHERE user_id = target_user_id;
 
