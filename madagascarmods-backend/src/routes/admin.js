@@ -982,58 +982,6 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/debug/firebase - Debug temporario: verifica se a variavel
-// FIREBASE_SERVICE_ACCOUNT esta presente no processo e se o JSON eh valido.
-// (nao expoe o conteudo da chave)
-router.get('/debug/firebase', authenticateAdmin, async (req, res) => {
-  try {
-    const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
-    let parsed = null;
-    let parseError = null;
-    if (sa) {
-      try {
-        const obj = JSON.parse(sa);
-        parsed = { project_id: obj.project_id, client_email: obj.client_email };
-      } catch (e) {
-        parseError = e.message;
-      }
-    }
-    let initError = null;
-    if (sa && !parseError) {
-      try {
-        const admin = require('firebase-admin');
-        admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
-      } catch (e) {
-        initError = e.message;
-      }
-    }
-    res.json({ success: true, present: !!sa, length: sa ? sa.length : 0, parsed, parseError, initError });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// GET /api/admin/debug/create-cleanup-table - Debug temporario: cria a tabela
-// push_token_cleanup_log caso nao exista (migration on-the-fly).
-router.get('/debug/create-cleanup-table', authenticateAdmin, async (req, res) => {
-  try {
-    const db = require('../models/db');
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS push_token_cleanup_log (
-        id SERIAL PRIMARY KEY,
-        scanned INT NOT NULL DEFAULT 0,
-        deactivated INT NOT NULL DEFAULT 0,
-        still_valid INT NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`);
-    const lc = await db.query(
-      `SELECT id, scanned, deactivated, still_valid, created_at FROM push_token_cleanup_log ORDER BY created_at DESC LIMIT 1`
-    );
-    res.json({ success: true, tableCreated: true, lastRow: lc.rows[0] || null });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
 // GET /api/admin/asaas/balance - Check Asaas balance
 router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
