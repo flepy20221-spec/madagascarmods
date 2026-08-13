@@ -982,6 +982,28 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/debug/firebase - Debug temporario: verifica se a variavel
+// FIREBASE_SERVICE_ACCOUNT esta presente no processo e se o JSON eh valido.
+// (nao expoe o conteudo da chave)
+router.get('/debug/firebase', authenticateAdmin, async (req, res) => {
+  try {
+    const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
+    let parsed = null;
+    let parseError = null;
+    if (sa) {
+      try {
+        const obj = JSON.parse(sa);
+        parsed = { project_id: obj.project_id, client_email: obj.client_email };
+      } catch (e) {
+        parseError = e.message;
+      }
+    }
+    res.json({ success: true, present: !!sa, length: sa ? sa.length : 0, parsed, parseError });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // GET /api/admin/asaas/balance - Check Asaas balance
 router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
   try {
