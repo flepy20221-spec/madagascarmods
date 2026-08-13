@@ -998,7 +998,16 @@ router.get('/debug/firebase', authenticateAdmin, async (req, res) => {
         parseError = e.message;
       }
     }
-    res.json({ success: true, present: !!sa, length: sa ? sa.length : 0, parsed, parseError });
+    let initError = null;
+    if (sa && !parseError) {
+      try {
+        const admin = require('firebase-admin');
+        admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
+      } catch (e) {
+        initError = e.message;
+      }
+    }
+    res.json({ success: true, present: !!sa, length: sa ? sa.length : 0, parsed, parseError, initError });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
