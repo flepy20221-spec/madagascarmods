@@ -23,19 +23,27 @@
 
 const db = require('../models/db');
 
-// Firebase Admin SDK (mesma inicializacao lazy de routes/push.js)
+// Firebase Admin SDK: reutiliza a inicializacao feita por routes/push.js.
+// Nao pode chamar initializeApp() de novo (erro 'default app already exists').
 let firebaseAdmin = null;
 function getFirebase() {
   if (firebaseAdmin) return firebaseAdmin;
   try {
     const admin = require('firebase-admin');
+    // Usa o app ja inicializado pelo push.js (ou o app default do sistema)
+    const apps = admin.apps || [];
+    if (apps.length > 0 && apps[0].name === '[DEFAULT]') {
+      firebaseAdmin = admin;
+      return firebaseAdmin;
+    }
+    // Fallback: inicializa somente se nenhum app default existir
     const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
     if (sa) {
       admin.initializeApp({ credential: admin.credential.cert(JSON.parse(sa)) });
       firebaseAdmin = admin;
     }
   } catch (e) {
-    console.error('[PushCleanup] Erro ao inicializar Firebase:', e.message);
+    console.error('[PushCleanup] Erro ao obter Firebase:', e.message);
   }
   return firebaseAdmin;
 }
