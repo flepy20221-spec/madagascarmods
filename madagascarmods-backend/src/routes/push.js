@@ -226,6 +226,55 @@ router.get('/admin/history', authenticateAdmin, async (req, res) => {
 });
 
 /**
+ * GET /api/admin/push/coverage
+ * Cobertura real de push: quantos usuarios sao alcancaveis hoje.
+ * Inclui o resultado da ultima limpeza automatica (job diario).
+ */
+router.get('/admin/coverage', authenticateAdmin, async (req, res) => {
+  try {
+    const { getCoverageStats } = require('../services/pushTokenCleanup');
+    const coverage = await getCoverageStats();
+    let lastCleanup = null;
+    try {
+      const lc = await db.query(
+        `SELECT scanned, deactivated, still_valid, created_at
+         FROM push_token_cleanup_log ORDER BY created_at DESC LIMIT 1`
+      );
+      if (lc.rows.length > 0) lastCleanup = lc.rows[0];
+    } catch (_) {
+      // tabela ainda nao criada pela primeira execucao do job
+    }
+    res.json({ success: true, coverage, lastCleanup });
+  } catch (error) {
+    console.error('Push coverage error:', error);
+    res.status(500).json({ error: 'Erro ao buscar cobertura de push' });
+  }
+});
+
+/**
+ * POST /api/admin/push/cleanup
+ * Executa a limpeza de tokens mortos manualmente (admin). Mesma logica do job
+ * diario: desativa tokens que o FCM confirma como invalidos.
+ */
+router.post('/admin/cleanup', authenticateAdmin, async (req, res) => {
+  try {
+    const { cleanupDeadTokens } = require('../services/pushTokenCleanup');
+    const result = await cleanupDeadTokens();
+    if (result.error) {
+      return res.status(503).json({ success: false, message: result.error, ...result });
+    }
+    res.json({
+      success: true,
+      message: `Verificados ${result.scanned} tokens: ${result.deactivated} mortos desativados, ${result.stillValid} validos`,
+      ...result,
+    });
+  } catch (error) {
+    console.error('Push cleanup error:', error);
+    res.status(500).json({ error: 'Erro ao limpar tokens push' });
+  }
+});
+
+/**
  * GET /api/admin/push/stats
  * Estatísticas gerais de push (admin only)
  */

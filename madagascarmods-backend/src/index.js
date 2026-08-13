@@ -350,6 +350,13 @@ app.use('/api/ssv', ssvRoutes);
 app.use('/api/checkin', checkinRoutes);
 app.use('/api/referral', referralRoutes);
 app.use('/api/push', pushRoutes);
+
+// Limpeza diaria de tokens push mortos (03:30 Brasilia). Sem mexer no app:
+// tokens que o FCM reporta como invalidos (desinstalacao, reinstalacao,
+// aparelho trocado) sao desativados automaticamente, mantendo o contador de
+// "dispositivos ativos" do painel fiel e as campanhas com menos falhas.
+const { startDailyJob } = require('./services/pushTokenCleanup');
+startDailyJob();
 app.use('/api/missions', missionsRoutes);
 app.use('/api/', myIpRoutes);
 
