@@ -1064,27 +1064,27 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
       where += ` AND w.payment_method = ANY($${params.length}::text[])`;
     }
 
-    const setTz = await db.query(`SET LOCAL TimeZone = 'America/Sao_Paulo'`);
+    await db.query(`SET LOCAL TimeZone = 'America/Sao_Paulo'`);
 
     const [totals, byMethod, byStatus, byDay] = await Promise.all([
       db.query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::float AS amount
                 FROM withdrawals w ${where}`,
-        params.slice(1)),
+        params),
       db.query(`SELECT w.payment_method AS method, COUNT(*)::int AS count,
                        COALESCE(SUM(w.amount), 0)::float AS amount
                 FROM withdrawals w ${where}
                 GROUP BY w.payment_method ORDER BY amount DESC`,
-        params.slice(1)),
+        params),
       db.query(`SELECT w.status, COUNT(*)::int AS count,
                        COALESCE(SUM(w.amount), 0)::float AS amount
                 FROM withdrawals w ${where}
                 GROUP BY w.status ORDER BY count DESC`,
-        params.slice(1)),
+        params),
       db.query(`SELECT w.created_at::date AS day, COUNT(*)::int AS count,
                        COALESCE(SUM(w.amount), 0)::float AS amount
                 FROM withdrawals w ${where}
                 GROUP BY w.created_at::date ORDER BY day DESC`,
-        params.slice(1)),
+        params),
     ]);
 
     res.json({
@@ -1102,7 +1102,7 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Withdrawals report error:', error);
-    res.status(500).json({ error: 'Erro ao gerar relatorio de saques', detail: String(error.message || error) });
+    res.status(500).json({ error: 'Erro ao gerar relatorio de saques'});
   }
 });
 
@@ -1144,7 +1144,7 @@ router.get('/withdrawals/report/csv', authenticateAdmin, async (req, res) => {
          JOIN users u ON u.id = w.user_id
          ${where}
          ORDER BY w.created_at DESC`,
-      params.slice(1),
+      params,
     );
 
     const esc = (v) => {
