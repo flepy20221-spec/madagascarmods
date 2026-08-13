@@ -2429,6 +2429,49 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 // Remover apos o diagnostico.
 // GET /api/admin/users/:id/ads-diagnostics?hours=168
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ROTA TEMPORARIA — "refresh" da conta (Ingrid, CP-BC0C-36F6-CBF8).
+// POST /api/admin/users/:id/reset-session
+// Invalida tokens/sessoes antigos e gera novos; o app faz login automatico
+// com o device_id e recebe os tokens novos na proxima abertura.
+// ---------------------------------------------------------------------------
+router.post('/users/:id/reset-session', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userCheck = await db.query(
+      'SELECT id, support_code, email FROM users WHERE id = $1',
+      [id],
+    );
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+    const { generateTokens } = require('../middleware/auth');
+    const user = userCheck.rows[0];
+    const tokens = generateTokens(user.id, user.email);
+    await db.query(
+      `UPDATE users SET token = $1, refresh_token = $2, updated_at = NOW() WHERE id = $3`,
+      [tokens.accessToken, tokens.refreshToken, user.id],
+    );
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'admin', 'ACCOUNT_SESSION_RESET', 'user', $2, $3, $4)`,
+      [
+        req.admin.id,
+        user.id,
+        JSON.stringify({ support_code: user.support_code, reason: req.body?.reason || 'Refresh solicitado pelo admin' }),
+        clientIp(req),
+      ],
+    );
+    res.json({
+      success: true,
+      message: `Sessao da conta ${user.support_code} resetada. Tokens novos emitidos; o app recebera os tokens na proxima abertura.`,
+    });
+  } catch (error) {
+    console.error('Reset session error:', error);
+    res.status(500).json({ error: 'Erro ao resetar sessao' });
+  }
+});
+
 router.get('/users/:id/ads-diagnostics', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
