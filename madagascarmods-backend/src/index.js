@@ -357,6 +357,13 @@ app.use('/api/push', pushRoutes);
 // "dispositivos ativos" do painel fiel e as campanhas com menos falhas.
 const { startDailyJob } = require('./services/pushTokenCleanup');
 startDailyJob();
+
+// Exclusao automatica de contas abandonadas (04:00 Brasilia): conta sem login
+// ha 20+ dias (e sem saque pago/processando) e excluida com registro em
+// audit_log (ACCOUNT_DELETED_AUTO), no maximo 50 exclusoes por dia.
+const { scheduleJob: scheduleAbandonedJob } = require('./services/abandonedAccounts');
+scheduleAbandonedJob();
+
 app.use('/api/missions', missionsRoutes);
 app.use('/api/', myIpRoutes);
 

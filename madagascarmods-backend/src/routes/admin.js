@@ -1178,6 +1178,107 @@ router.get('/withdrawals/report/csv', authenticateAdmin, async (req, res) => {
   }
 });
 
+// DELETE /api/admin/users/:id - Exclusao de conta pelo admin.
+// Remove TODOS os dados operacionais da conta (alias de aparelho, destinos,
+// chave PIX, tokens push, saques, eventos de recompensa, ledger) e o usuario.
+// O audit_log registra a acao como ACCOUNT_DELETED com o saldo anterior,
+// o numero de saques e lancamentos removidos, e o motivo informado.
+router.delete('/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { reason } = req.body || {};
+    if (!reason || String(reason).trim().length < 5) {
+      return res.status(400).json({ error: 'Informe um motivo com no minimo 5 caracteres' });
+    }
+    const target = await db.query(
+      `SELECT id, email, support_code, is_banned FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (target.rows.length === 0) {
+      return res.status(404).json({ error: 'Conta nao encontrada' });
+    }
+    const user = target.rows[0];
+    const result = await db.query(`SELECT * FROM delete_user_safely($1)`, [userId]);
+    const { previous_balance, deleted_ledger_rows, deleted_withdrawals } = result.rows[0];
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        req.admin ? req.admin.id : null,
+        req.admin ? 'admin' : 'system',
+        'ACCOUNT_DELETED',
+        'user',
+        userId,
+        JSON.stringify({
+          email: user.email,
+          support_code: user.support_code,
+          reason: String(reason).trim(),
+          source: 'admin_manual',
+          previous_balance_points: previous_balance,
+          deleted_withdrawals,
+          deleted_ledger_rows,
+          deleted_at: new Date().toISOString(),
+        }),
+        clientIp(req),
+      ],
+    );
+    res.json({
+      success: true,
+      message: 'Conta excluida com sucesso',
+      user: { email: user.email, support_code: user.support_code },
+      removed: { previous_balance_points: previous_balance, withdrawals: deleted_withdrawals, ledger_rows: deleted_ledger_rows },
+    });
+  } catch (error) {
+    console.error('Delete user error:', error);
+    res.status(500).json({ error: String(error.message || error) });
+  }
+});
+
+// GET /api/admin/users/abandoned - Contas em observacao (abandonadas).
+// Observacao: conta SEM login nem saque aprovado/pago nos ultimos
+// OBSERVATION_DAYS dias (default 15). A exclusao automatica acontece apenas
+// apos EXCLUSION_DAYS (default 20) sem atividade.
+router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
+  try {
+    const observationDays = parseInt(req.query.observationDays) || 15;
+    const exclusionDays = parseInt(req.query.exclusionDays) || 20;
+    // Contas em observacao: dentro da janela (sem atividade ha >= observation
+    // dias, mas ainda nao atingiram exclusion dias — ou passaram e nao foram
+    // excluidas por nao rodar o job).
+    const rows = await db.query(
+      `SELECT u.id, u.email, u.support_code, u.created_at, u.last_login_at,
+              (SELECT MAX(created_at) FROM withdrawals w WHERE w.user_id = u.id
+                 AND w.status IN ('PAID','PROCESSING')) AS last_withdrawal_at,
+              (SELECT COALESCE(SUM(amount), 0)::float FROM points_ledger pl
+                 WHERE pl.user_id = u.id) AS balance
+         FROM users u
+        WHERE u.merged_into_user_id IS NULL
+          AND (u.last_login_at IS NULL
+               OR u.last_login_at < NOW() - make_interval(days => $1))
+          AND (u.created_at < NOW() - make_interval(days => $1))
+        ORDER BY COALESCE(u.last_login_at, u.created_at) DESC NULLS FIRST
+        LIMIT 200`,
+      [observationDays],
+    );
+    const pendingExclusion = rows.filter((r) => {
+      const last = r.last_login_at || r.created_at;
+      return new Date() - new Date(last) >= exclusionDays * 24 * 3600 * 1000;
+    });
+    res.json({
+      success: true,
+      observationDays,
+      exclusionDays,
+      count: rows.length,
+      pendingExclusion: pendingExclusion.length,
+      users: rows,
+    });
+  } catch (error) {
+    console.error('Abandoned users error:', error);
+    res.status(500).json({ error: 'Erro ao listar contas em observacao' });
+  }
+});
+
 router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
   try {
     const balance = await asaas.getBalance();
