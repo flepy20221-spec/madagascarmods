@@ -982,8 +982,41 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
   }
 });
 
-
 // GET /api/admin/asaas/balance - Check Asaas balance
+// GET /api/admin/users/activity - Atividade dos usuarios do app (agregado).
+// - activeToday: usuarios distintos com last_login_at nas ultimas 24h (quem
+//   entrou no app hoje).
+// - onlineNow: usuarios distintos com last_login_at nos ultimos 15 minutos
+//   (proxy de "online agora", ja que o app nao expoe heartbeat persistente).
+// - lastHour: usuarios distintos que entraram na ultima hora.
+// - active7d: usuarios distintos com acesso nos ultimos 7 dias.
+// A coluna users.last_login_at e atualizada em todos os caminhos de login do
+// app (auth.js), incluindo o primeiro acesso apos reinstalacao.
+router.get('/users/activity', authenticateAdmin, async (req, res) => {
+  try {
+    const [today, lastHour, quarterHour, last7d, total] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '24 hours'`),
+      db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '1 hour'`),
+      db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '15 minutes'`),
+      db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '7 days'`),
+      db.query(`SELECT COUNT(*)::int AS n FROM users`),
+    ]);
+    res.json({
+      success: true,
+      activity: {
+        activeToday: today.rows[0].n,
+        lastHour: lastHour.rows[0].n,
+        onlineNow: quarterHour.rows[0].n,
+        active7d: last7d.rows[0].n,
+        totalUsers: total.rows[0].n,
+      },
+    });
+  } catch (error) {
+    console.error('Users activity error:', error);
+    res.status(500).json({ error: 'Erro ao consultar atividade dos usuarios' });
+  }
+});
+
 router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
   try {
     const balance = await asaas.getBalance();
