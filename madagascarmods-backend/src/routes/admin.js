@@ -1275,7 +1275,7 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Abandoned users error:', error);
-    res.status(500).json({ error: 'Erro ao listar contas em observacao' });
+    res.status(500).json({ error: 'Erro ao listar contas em observacao', detail: String(error.message || error) });
   }
 });
 
