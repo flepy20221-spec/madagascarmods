@@ -8,6 +8,7 @@ const { authenticateAdmin, requireRole, JWT_SECRET } = require('../middleware/au
 const { adminLoginLimiter } = require('../middleware/rateLimits');
 const { decrypt } = require('../utils/crypto');
 const faucetpay = require('../utils/faucetpay');
+const asaas = require('../utils/asaas');
 const { UserMergeError, mergeUserAccounts } = require('../services/userMerge');
 // IP real do cliente atras do proxy. Padroniza o registro em audit_log: antes cada
 // ponto usava req.headers['x-forwarded-for'] diretamente, gravando a lista inteira
@@ -16,6 +17,27 @@ const { UserMergeError, mergeUserAccounts } = require('../services/userMerge');
 const { clientIp } = require('../middleware/antiFraud');
 
 const router = express.Router();
+
+/**
+ * Extrai os dados da chave PIX do snapshot gravado em w.crypto_address.
+ * Saques PIX gravam um JSON: { pix_account_id, cpf, full_name, pix_key_type, pix_key_value }.
+ * Saques legados ou FaucetPay usam o campo como endereco de carteira (string).
+ */
+function parsePixData(cryptoAddress) {
+  if (!cryptoAddress) return null;
+  let parsed = null;
+  try {
+    parsed = typeof cryptoAddress === 'string' ? JSON.parse(cryptoAddress) : cryptoAddress;
+  } catch (e) {
+    return null; // nao e um snapshot PIX: e endereco de carteira FaucetPay
+  }
+  if (!parsed || !parsed.pix_key_value || !parsed.pix_key_type) return null;
+  return {
+    pixKeyValue: parsed.pix_key_value,
+    pixKeyType: parsed.pix_key_type,
+    holderName: parsed.full_name || null,
+  };
+}
 
 // Registra tentativas de acesso administrativo negadas, para investigacao posterior.
 async function logSecurityEvent(action, detail, req) {
@@ -369,17 +391,32 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
 
     const w = claimed.rows[0];
 
-    // Now process FaucetPay payment automatically
+    // Now process payment automatically.
+    // Saques PIX pagam pela Asaas (transferencia para a chave PIX cadastrada);
+    // saques FaucetPay continuam pelo fluxo LTC original.
     const amountBRL = parseFloat(w.amount);
     let paymentResult = null;
     let finalStatus = 'APPROVED';
 
+    const isPix = w.payment_method === 'pix';
+    const pixData = isPix ? parsePixData(w.crypto_address) : null;
+
     try {
-      paymentResult = await faucetpay.sendPayment({
-        to: w.crypto_address,
-        amountBRL: amountBRL,
-        referralId: id,
-      });
+      if (isPix && pixData) {
+        paymentResult = await asaas.sendPixPayment({
+          pixKeyValue: pixData.pixKeyValue,
+          pixKeyType: pixData.pixKeyType,
+          amountBRL,
+          withdrawalId: id,
+          holderName: pixData.holderName,
+        });
+      } else {
+        paymentResult = await faucetpay.sendPayment({
+          to: w.crypto_address,
+          amountBRL: amountBRL,
+          referralId: id,
+        });
+      }
 
       if (paymentResult.success) {
         // Pagamento confirmado: PROCESSING -> PAID
@@ -395,17 +432,17 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
             updated_at = NOW() 
           WHERE id = $5 AND status = 'PROCESSING'`,
           [
-            paymentResult.ltcAmount,
-            paymentResult.exchangeRate,
-            paymentResult.tx_hash || paymentResult.payout_hash || null,
+            isPix ? paymentResult.value : paymentResult.ltcAmount,
+            isPix ? null : paymentResult.exchangeRate,
+            isPix ? (paymentResult.transferId || null) : (paymentResult.tx_hash || paymentResult.payout_hash || null),
             JSON.stringify(paymentResult),
             id
           ]
         );
       } else {
-        // O provedor recusou de forma explicita (saldo insuficiente, e-mail invalido...).
+        // O provedor recusou de forma explicita (saldo insuficiente, chave invalida...).
         // Nao houve envio de valor, entao o saque volta para APPROVED e o admin pode
-        // reprocessar por /process-faucetpay.
+        // reprocessar por /process-faucetpay ou /process-pix, conforme o metodo.
         finalStatus = 'APPROVED';
         await db.query(
           `UPDATE withdrawals SET status = 'APPROVED', gateway_response = $1, updated_at = NOW()
@@ -418,8 +455,8 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
       // O pagamento pode ter sido efetivado sem que a confirmacao chegasse. Liberar o saque
       // para reprocessamento automatico neste estado e justamente o que causa pagamento em
       // duplicidade. Por isso o saque fica em PAYMENT_UNCONFIRMED, exigindo que o admin
-      // confira o extrato da FaucetPay antes de decidir.
-      console.error('[Approve] FaucetPay payment error:', payErr.message);
+      // confira o extrato do provedor (FaucetPay ou Asaas) antes de decidir.
+      console.error('[Approve] Payment error:', payErr.message);
       finalStatus = 'PAYMENT_UNCONFIRMED';
       await db.query(
         `UPDATE withdrawals SET status = 'PAYMENT_UNCONFIRMED', gateway_response = $1, updated_at = NOW()
@@ -448,17 +485,21 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
     if (finalStatus === 'PAID') {
       res.json({
         success: true,
-        message: `Saque aprovado e pago! ${paymentResult.ltcAmount} LTC enviado.`,
+        message: isPix
+          ? `Saque aprovado e pago! R$ ${amountBRL.toFixed(2)} enviados via PIX (Asaas).`
+          : `Saque aprovado e pago! ${paymentResult.ltcAmount} LTC enviado.`,
         status: 'PAID',
         ltcAmount: paymentResult.ltcAmount,
         exchangeRate: paymentResult.exchangeRate,
-        txHash: paymentResult.tx_hash || paymentResult.payout_hash
+        pixValue: isPix ? paymentResult.value : null,
+        transferId: isPix ? paymentResult.transferId : null,
+        txHash: isPix ? paymentResult.transferId : (paymentResult.tx_hash || paymentResult.payout_hash)
       });
     } else if (finalStatus === 'PAYMENT_UNCONFIRMED') {
       res.json({
         success: false,
-        message: 'A conexao com a FaucetPay falhou e nao foi possivel confirmar o pagamento. ' +
-                 'VERIFIQUE O EXTRATO DA FAUCETPAY antes de reenviar: o valor pode ter sido pago. ' +
+        message: `A conexao com o provedor de pagamento (${isPix ? 'Asaas' : 'FaucetPay'}) falhou e nao foi possivel confirmar o pagamento. ` +
+                 `VERIFIQUE O EXTRATO DO PROVEDOR antes de reenviar: o valor pode ter sido pago. ` +
                  'O saque ficou marcado como PAYMENT_UNCONFIRMED.',
         status: 'PAYMENT_UNCONFIRMED',
         requiresManualCheck: true
@@ -466,7 +507,7 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
     } else {
       res.json({
         success: true,
-        message: `Saque aprovado, mas a FaucetPay recusou o pagamento: ${paymentResult ? paymentResult.message : 'erro desconhecido'}. Use "Enviar FaucetPay" para tentar novamente.`,
+        message: `Saque aprovado, mas o provedor de pagamento recusou (${isPix ? 'Asaas' : 'FaucetPay'}): ${paymentResult ? paymentResult.message : 'erro desconhecido'}. Use "${isPix ? 'Pagar via PIX' : 'Enviar FaucetPay'}" para tentar novamente.`,
         status: 'APPROVED',
         paymentError: paymentResult ? paymentResult.message : 'Erro de conexao'
       });
@@ -743,6 +784,184 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
   }
 });
 
+// POST /api/admin/withdrawals/:id/process-pix - Process PIX payment via Asaas
+//
+// Mesma disciplina anti-duplicidade de /process-faucetpay (VULN-07): a transicao
+// PENDING/APPROVED -> PROCESSING e atomica e condicional, e o status PROCESSING
+// bloqueia qualquer novo envio. Erro de rede vira PAYMENT_UNCONFIRMED em vez de
+// liberar o saque para reprocessamento automatico (pagamento em duplicidade).
+router.post('/withdrawals/:id/process-pix', authenticateAdmin, requireRole('finance'), async (req, res) => {
+  const client = await db.getClient();
+
+  try {
+    const { id } = req.params;
+
+    await client.query('BEGIN');
+
+    const withdrawal = await client.query(
+      `SELECT w.id, w.user_id, w.status, w.amount, w.payment_method, w.crypto_address,
+              w.idempotency_key, w.ledger_reservation_id
+       FROM withdrawals w WHERE w.id = $1 FOR UPDATE`,
+      [id]
+    );
+
+    if (withdrawal.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Saque nao encontrado' });
+    }
+
+    const w = withdrawal.rows[0];
+
+    if (w.payment_method !== 'pix') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Este saque nao e via PIX; use a rota correspondente ao metodo de pagamento.',
+        code: 'INVALID_PAYMENT_METHOD',
+        payment_method: w.payment_method
+      });
+    }
+
+    if (!['PENDING', 'APPROVED'].includes(w.status)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: w.status === 'PAYMENT_UNCONFIRMED'
+          ? 'Este saque teve um envio sem confirmacao. Verifique o extrato da Asaas: se o pagamento saiu, use "Marcar como pago"; se nao saiu, rejeite e refaca.'
+          : `Nao e possivel processar saque com status: ${w.status}`,
+        code: 'INVALID_STATUS',
+        status: w.status
+      });
+    }
+
+    const claimed = await client.query(
+      `UPDATE withdrawals SET status = 'PROCESSING', updated_at = NOW()
+        WHERE id = $1 AND status IN ('PENDING', 'APPROVED')
+        RETURNING id`,
+      [id]
+    );
+
+    if (claimed.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Este saque ja esta sendo processado por outra requisicao',
+        code: 'ALREADY_PROCESSING'
+      });
+    }
+
+    await client.query('COMMIT');
+
+    const pixData = parsePixData(w.crypto_address);
+    if (!pixData) {
+      await db.query(
+        `UPDATE withdrawals SET status = 'PENDING', gateway_response = $1, updated_at = NOW()
+          WHERE id = $2 AND status = 'PROCESSING'`,
+        [JSON.stringify({ error: 'Dados da chave PIX ausentes no saque', requiresManualCheck: true }), id]
+      );
+      return res.status(400).json({
+        success: false,
+        message: 'Dados da chave PIX ausentes no saque. Verifique a conta PIX do usuario.',
+        status: 'failed'
+      });
+    }
+
+    const amountBRL = parseFloat(w.amount);
+    const paymentResult = await asaas.sendPixPayment({
+      pixKeyValue: pixData.pixKeyValue,
+      pixKeyType: pixData.pixKeyType,
+      amountBRL,
+      withdrawalId: id,
+      holderName: pixData.holderName,
+    });
+
+    if (paymentResult.success) {
+      await db.query(
+        `UPDATE withdrawals SET
+          status = 'PAID',
+          crypto_amount = $1,
+          tx_hash = $2,
+          gateway_response = $3,
+          processed_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $4 AND status = 'PROCESSING'`,
+        [paymentResult.value, paymentResult.transferId || null, JSON.stringify(paymentResult), id]
+      );
+
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ($1, 'admin', 'ASAAS_PIX_PAYMENT_SUCCESS', 'withdrawal', $2, $3, $4)`,
+        [
+          req.admin.id,
+          id,
+          JSON.stringify({ amount_brl: amountBRL, transfer_id: paymentResult.transferId, pix_key_type: pixData.pixKeyType }),
+          clientIp(req)
+        ]
+      );
+
+      res.json({
+        success: true,
+        message: paymentResult.message,
+        status: 'completed',
+        transfer_id: paymentResult.transferId,
+        pix_value: paymentResult.value,
+      });
+    } else {
+      // Recusa explicita do provedor: nao houve envio de valor, volta para PENDING.
+      await db.query(
+        `UPDATE withdrawals SET status = 'PENDING', gateway_response = $1, updated_at = NOW()
+          WHERE id = $2 AND status = 'PROCESSING'`,
+        [JSON.stringify(paymentResult), id]
+      );
+
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ($1, 'admin', 'ASAAS_PIX_PAYMENT_FAILED', 'withdrawal', $2, $3, $4)`,
+        [
+          req.admin.id,
+          id,
+          JSON.stringify({ error: paymentResult.message, errorCode: paymentResult.errorCode }),
+          clientIp(req)
+        ]
+      );
+
+      res.json({
+        success: false,
+        message: paymentResult.message || 'Falha no pagamento PIX (Asaas)',
+        status: 'failed',
+      });
+    }
+  } catch (error) {
+    // Erro de rede/timeout: nao se sabe se a Asaas processou a transferencia.
+    // O saque fica em PAYMENT_UNCONFIRMED, exigindo conferencia do extrato.
+    try {
+      await db.query(
+        `UPDATE withdrawals SET status = 'PAYMENT_UNCONFIRMED',
+                gateway_response = $2, updated_at = NOW()
+          WHERE id = $1 AND status = 'PROCESSING'`,
+        [req.params.id, JSON.stringify({ error: error.message, requiresManualCheck: true })]
+      );
+      await db.query(
+        `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+         VALUES ($1, 'admin', 'ASAAS_PIX_PAYMENT_UNCONFIRMED', 'withdrawal', $2, $3, $4)`,
+        [req.admin.id, req.params.id,
+         JSON.stringify({ error: error.message, requiresManualCheck: true }),
+         clientIp(req)]
+      );
+    } catch (revertErr) {
+      console.error('Failed to mark withdrawal as unconfirmed:', revertErr);
+    }
+
+    console.error('Process PIX error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erro de comunicacao com a Asaas',
+      message: 'Nao foi possivel confirmar o pagamento. O saque foi marcado como PAYMENT_UNCONFIRMED. ' +
+               'VERIFIQUE O EXTRATO DA ASAAS antes de reenviar.',
+      requiresManualCheck: true
+    });
+  } finally {
+    client.release();
+  }
+});
+
 // GET /api/admin/faucetpay/balance - Check FaucetPay LTC balance
 router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
   try {
@@ -760,6 +979,22 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
   } catch (error) {
     console.error('FaucetPay balance error:', error);
     res.status(500).json({ error: error.message || 'Falha ao consultar saldo FaucetPay' });
+  }
+});
+
+// GET /api/admin/asaas/balance - Check Asaas balance
+router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
+  try {
+    const balance = await asaas.getBalance();
+    res.json({
+      success: balance.success,
+      balance: balance.balance || null,
+      balanceFormatted: balance.balanceFormatted || null,
+      message: balance.success ? undefined : balance.message,
+    });
+  } catch (error) {
+    console.error('Asaas balance error:', error);
+    res.status(500).json({ error: error.message || 'Falha ao consultar saldo Asaas' });
   }
 });
 
