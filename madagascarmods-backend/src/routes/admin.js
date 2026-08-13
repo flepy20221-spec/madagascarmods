@@ -1017,6 +1017,167 @@ router.get('/users/activity', authenticateAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/withdrawals/report - Relatorio de saques por periodo.
+// Query params:
+//   from / to     - intervalo de datas (YYYY-MM-DD, inclusive; default: ultimos 30 dias)
+//   status       - status ou comma-separated (ex: PAID,REJECTED; default: todos)
+//   method       - payment_method ou comma-separated (ex: pix,faucetpay; default: todos)
+// Retorno:
+//   period      - intervalo aplicado
+//   totals      - total geral (count, amount BRL)
+//   byMethod    - soma e quantidade por payment_method
+//   byStatus    - soma e quantidade por status
+//   byDay       - distribuicao diaria (dia, count, amount)
+//   detail      - lista paginada dos saques do periodo (para exportacao)
+router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
+  try {
+    // -------------------------------------------------------------
+    // Parse do intervalo. Fuso de Brasilia (UTC-3): o dia em BRT
+    // equivale a [dia 00:00-3] .. [dia+1 00:00-3] em UTC. Usar a
+    // aritmetica de DATE (sem tz) do Postgres, que opera na tz da
+    // sessao; forcar a sessao para America/Sao_Paulo antes.
+    // -------------------------------------------------------------
+    const today = new Date();
+    const fmtDate = (d) => d.toISOString().slice(0, 10);
+    let fromDate = req.query.from;
+    let toDate = req.query.to;
+    if (!fromDate) {
+      const start = new Date(today);
+      start.setDate(start.getDate() - 29);
+      fromDate = fmtDate(start);
+    }
+    if (!toDate) toDate = fmtDate(today);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+      return res.status(400).json({ error: 'Datas devem estar no formato YYYY-MM-DD' });
+    }
+    const statusList = String(req.query.status || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const methodList = String(req.query.method || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+    const params = [fromDate, toDate];
+    let where = `WHERE w.created_at::date >= $1::date AND w.created_at::date <= $2::date`;
+    if (statusList.length > 0) {
+      params.push(statusList);
+      where += ` AND w.status = ANY($${params.length}::text[])`;
+    }
+    if (methodList.length > 0) {
+      params.push(methodList);
+      where += ` AND w.payment_method = ANY($${params.length}::text[])`;
+    }
+
+    const setTz = await db.query(`SET LOCAL TimeZone = 'America/Sao_Paulo'`);
+
+    const [totals, byMethod, byStatus, byDay] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::float AS amount
+                FROM withdrawals w ${where}`,
+        params.slice(1)),
+      db.query(`SELECT w.payment_method AS method, COUNT(*)::int AS count,
+                       COALESCE(SUM(w.amount), 0)::float AS amount
+                FROM withdrawals w ${where}
+                GROUP BY w.payment_method ORDER BY amount DESC`,
+        params.slice(1)),
+      db.query(`SELECT w.status, COUNT(*)::int AS count,
+                       COALESCE(SUM(w.amount), 0)::float AS amount
+                FROM withdrawals w ${where}
+                GROUP BY w.status ORDER BY count DESC`,
+        params.slice(1)),
+      db.query(`SELECT w.created_at::date AS day, COUNT(*)::int AS count,
+                       COALESCE(SUM(w.amount), 0)::float AS amount
+                FROM withdrawals w ${where}
+                GROUP BY w.created_at::date ORDER BY day DESC`,
+        params.slice(1)),
+    ]);
+
+    res.json({
+      success: true,
+      report: {
+        period: { from: fromDate, to: toDate },
+        totals: {
+          count: totals.rows[0].count,
+          amount: totals.rows[0].amount,
+        },
+        byMethod: byMethod.rows,
+        byStatus: byStatus.rows,
+        byDay: byDay.rows,
+      },
+    });
+  } catch (error) {
+    console.error('Withdrawals report error:', error);
+    res.status(500).json({ error: 'Erro ao gerar relatorio de saques' });
+  }
+});
+
+// GET /api/admin/withdrawals/report/csv - Exportacao CSV do mesmo relatorio.
+// Aceita os mesmos parametros (from, to, status, method) e retorna texto/csv.
+router.get('/withdrawals/report/csv', authenticateAdmin, async (req, res) => {
+  try {
+    const today = new Date();
+    const fmtDate = (d) => d.toISOString().slice(0, 10);
+    let fromDate = req.query.from;
+    let toDate = req.query.to;
+    if (!fromDate) {
+      const start = new Date(today);
+      start.setDate(start.getDate() - 29);
+      fromDate = fmtDate(start);
+    }
+    if (!toDate) toDate = fmtDate(today);
+    const statusList = String(req.query.status || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+    const methodList = String(req.query.method || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+    const params = [fromDate, toDate];
+    let where = `WHERE w.created_at::date >= $1::date AND w.created_at::date <= $2::date`;
+    if (statusList.length > 0) {
+      params.push(statusList);
+      where += ` AND w.status = ANY($${params.length}::text[])`;
+    }
+    if (methodList.length > 0) {
+      params.push(methodList);
+      where += ` AND w.payment_method = ANY($${params.length}::text[])`;
+    }
+
+    await db.query(`SET LOCAL TimeZone = 'America/Sao_Paulo'`);
+
+    const detail = await db.query(
+      `SELECT w.created_at AT TIME ZONE 'America/Sao_Paulo' AS created_at_br,
+              w.amount, w.points_debited, w.payment_method, w.status, w.tx_hash,
+              u.email AS user_email, u.support_code
+         FROM withdrawals w
+         JOIN users u ON u.id = w.user_id
+         ${where}
+         ORDER BY w.created_at DESC`,
+      params.slice(1),
+    );
+
+    const esc = (v) => {
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = 'data_hora_br;usuario;support_code;valor_brl;pontos;metodo;status;tx_hash\n';
+    const rows = detail.rows
+      .map((r) =>
+        [
+          new Date(r.created_at_br).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
+          r.user_email,
+          r.support_code,
+          r.amount.toString(),
+          r.points_debited,
+          r.payment_method,
+          r.status,
+          r.tx_hash,
+        ].map(esc).join(';'),
+      )
+      .join('\n');
+
+    const bom = '\uFEFF'; // Excel abre UTF-8 corretamente
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="saques-${fromDate}-a-${toDate}.csv"`);
+    res.send(bom + header + (rows ? rows + '\n' : ''));
+  } catch (error) {
+    console.error('Withdrawals report csv error:', error);
+    res.status(500).json({ error: 'Erro ao exportar relatorio' });
+  }
+});
+
 router.get('/asaas/balance', authenticateAdmin, async (req, res) => {
   try {
     const balance = await asaas.getBalance();
