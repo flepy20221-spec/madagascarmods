@@ -137,9 +137,22 @@ async function sendPixPayment({ pixKeyValue, pixKeyType, amountBRL, withdrawalId
     return { success: false, message: e.message, errorCode: 'UNSUPPORTED_PIX_TYPE' };
   }
 
-  const description = holderName
-    ? `Saque CashPix - ${holderName} (saque ${withdrawalId.substring(0, 8)})`
-    : `Saque CashPix (saque ${withdrawalId.substring(0, 8)})`;
+  // A API da Asaas limita o campo description a 100 BYTES (UTF-8). A mensagem de
+  // agradecimento do App CashPix e incluida em todos os pagamentos PIX.
+  const fixedPart = `Saque CashPix - ${holderName || 'usuario'} 🎮🔥 Obrigado por utilizar o App CashPix 🎮🔥`;
+  const MAX_DESC_BYTES = 100;
+  let description = fixedPart;
+  if (Buffer.byteLength(description, 'utf8') > MAX_DESC_BYTES) {
+    const fixedTail = ` 🎮🔥 Obrigado por utilizar o App CashPix 🎮🔥`;
+    const fixedTailBytes = Buffer.byteLength(fixedTail, 'utf8');
+    const prefix = 'Saque CashPix - ';
+    const maxNameBytes = MAX_DESC_BYTES - fixedTailBytes - Buffer.byteLength(prefix, 'utf8');
+    let name = holderName || 'usuario';
+    while (Buffer.byteLength(name, 'utf8') > maxNameBytes && name.length > 0) {
+      name = name.slice(0, -1);
+    }
+    description = `${prefix}${name}${fixedTail}`;
+  }
 
   const payload = {
     pixAddressKey: String(pixKeyValue).trim(),
