@@ -2424,4 +2424,65 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
   }
 });
 
+// ---------------------------------------------------------------------------
+// ROTA TEMPORARIA — diagnostico de ads por usuario (Ingrid, CP-BC0C-36F6-CBF8).
+// Remover apos o diagnostico.
+// GET /api/admin/users/:id/ads-diagnostics?hours=168
+// ---------------------------------------------------------------------------
+router.get('/users/:id/ads-diagnostics', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const hours = Math.max(parseInt(req.query.hours) || 168, 1);
+
+    const [recent, daily, ssv, limit, user] = await Promise.all([
+      db.query(
+        `SELECT id, ad_type, points_awarded, ssv_verified, ssv_transaction_id,
+                reward_session_id, created_at
+           FROM reward_events
+          WHERE user_id = $1
+          ORDER BY created_at DESC
+          LIMIT 50`,
+        [id],
+      ),
+      db.query(
+        `SELECT created_at::date AS day, COUNT(*) AS count,
+                COALESCE(SUM(points_awarded), 0)::int AS points
+           FROM reward_events
+          WHERE user_id = $1 AND created_at > NOW() - make_interval(hours => $2)
+          GROUP BY created_at::date ORDER BY day DESC`,
+        [id, hours],
+      ),
+      db.query(
+        `SELECT created_at::date AS day,
+                COUNT(*) AS count, COUNT(*) FILTER (WHERE ssv_verified) AS verified
+           FROM reward_events
+          WHERE created_at > NOW() - make_interval(hours => $1)
+          GROUP BY created_at::date ORDER BY day DESC
+          LIMIT 7`,
+        [hours],
+      ),
+      db.query(
+        "SELECT value FROM system_config WHERE key = 'dailyAdLimitRewarded'",
+      ),
+      db.query(
+        'SELECT id, is_banned, is_active, merged_into_user_id FROM users WHERE id = $1',
+        [id],
+      ),
+    ]);
+
+    res.json({
+      success: true,
+      hours,
+      user: user.rows[0] || null,
+      dailyPerDay: daily.rows,
+      recentEvents: recent.rows,
+      platformTrend: ssv.rows,
+      dailyLimitConfig: limit.rows[0]?.value ?? '100 (default)',
+    });
+  } catch (error) {
+    console.error('Ads diagnostics error:', error);
+    res.status(500).json({ error: 'Erro no diagnostico de ads' });
+  }
+});
+
 module.exports = router;
