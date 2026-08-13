@@ -1102,7 +1102,7 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Withdrawals report error:', error);
-    res.status(500).json({ error: 'Erro ao gerar relatorio de saques' });
+    res.status(500).json({ error: 'Erro ao gerar relatorio de saques', detail: String(error.message || error) });
   }
 });
 
