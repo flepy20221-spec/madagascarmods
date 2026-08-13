@@ -258,11 +258,12 @@ router.get('/admin/coverage', authenticateAdmin, async (req, res) => {
  */
 router.post('/admin/cleanup', authenticateAdmin, async (req, res) => {
   try {
-    const { cleanupDeadTokens } = require('../services/pushTokenCleanup');
+    const { cleanupDeadTokens, logCleanupResult } = require('../services/pushTokenCleanup');
     const result = await cleanupDeadTokens();
     if (result.error) {
       return res.status(503).json({ success: false, message: result.error, ...result });
     }
+    await logCleanupResult(result);
     res.json({
       success: true,
       message: `Verificados ${result.scanned} tokens: ${result.deactivated} mortos desativados, ${result.stillValid} validos`,

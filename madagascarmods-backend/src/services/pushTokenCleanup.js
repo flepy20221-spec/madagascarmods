@@ -136,17 +136,15 @@ async function getCoverageStats() {
 }
 
 /**
- * Job diario: executa a limpeza e grava o resultado em push_token_cleanup_log.
+ * Grava o resultado de uma limpeza em push_token_cleanup_log.
  */
-async function runDailyCleanupJob() {
+async function logCleanupResult(result) {
   try {
-    const result = await cleanupDeadTokens();
     await db.query(
       `INSERT INTO push_token_cleanup_log (scanned, deactivated, still_valid)
        VALUES ($1, $2, $3)`,
       [result.scanned, result.deactivated, result.stillValid]
     ).catch(async () => {
-      // Tabela pode nao existir ainda (migration pendente); cria e regrava
       await db.query(`
         CREATE TABLE IF NOT EXISTS push_token_cleanup_log (
           id SERIAL PRIMARY KEY,
@@ -161,6 +159,18 @@ async function runDailyCleanupJob() {
         [result.scanned, result.deactivated, result.stillValid]
       );
     });
+  } catch (e) {
+    console.error('[PushCleanup] Falha ao gravar log da limpeza:', e.message);
+  }
+}
+
+/**
+ * Job diario: executa a limpeza e grava o resultado em push_token_cleanup_log.
+ */
+async function runDailyCleanupJob() {
+  try {
+    const result = await cleanupDeadTokens();
+    await logCleanupResult(result);
     console.log(
       `[PushCleanup] Job diario: ${result.scanned} verificados, ${result.deactivated} mortos desativados, ${result.stillValid} validos`
     );
@@ -193,4 +203,4 @@ function startDailyJob() {
   console.log('[PushCleanup] Job diario de limpeza de tokens agendado (03:30 Brasilia).');
 }
 
-module.exports = { cleanupDeadTokens, getCoverageStats, runDailyCleanupJob, startDailyJob };
+module.exports = { cleanupDeadTokens, getCoverageStats, logCleanupResult, runDailyCleanupJob, startDailyJob };
