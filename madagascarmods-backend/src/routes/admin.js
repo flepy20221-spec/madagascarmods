@@ -1246,11 +1246,11 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
     // Contas em observacao: dentro da janela (sem atividade ha >= observation
     // dias, mas ainda nao atingiram exclusion dias — ou passaram e nao foram
     // excluidas por nao rodar o job).
-    const rows = await db.query(
+    const result = await db.query(
       `SELECT u.id, u.email, u.support_code, u.created_at, u.last_login_at,
-              (SELECT MAX(created_at) FROM withdrawals w WHERE w.user_id = u.id
+              (SELECT MAX(w.created_at) FROM withdrawals w WHERE w.user_id = u.id
                  AND w.status IN ('PAID','PROCESSING')) AS last_withdrawal_at,
-              (SELECT COALESCE(SUM(amount), 0)::float FROM points_ledger pl
+              (SELECT COALESCE(SUM(pl.amount), 0)::float FROM points_ledger pl
                  WHERE pl.user_id = u.id) AS balance
          FROM users u
         WHERE u.merged_into_user_id IS NULL
@@ -1261,6 +1261,7 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
         LIMIT 200`,
       [observationDays],
     );
+    const rows = result && result.rows ? result.rows : [];
     const pendingExclusion = rows.filter((r) => {
       const last = r.last_login_at || r.created_at;
       return new Date() - new Date(last) >= exclusionDays * 24 * 3600 * 1000;
@@ -1276,6 +1277,25 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
   } catch (error) {
     console.error('Abandoned users error:', error);
     res.status(500).json({ error: 'Erro ao listar contas em observacao', detail: String(error.message || error) });
+  }
+});
+
+// TEMP debug: testa a query de abandoned diretamente no banco.
+router.get('/debug/abandoned-query', authenticateAdmin, async (req, res) => {
+  try {
+    const r = await db.query(
+      `SELECT u.id, u.email, u.support_code, u.created_at, u.last_login_at
+         FROM users u
+        WHERE u.merged_into_user_id IS NULL
+          AND (u.last_login_at IS NULL
+               OR u.last_login_at < NOW() - make_interval(days => $1))
+          AND (u.created_at < NOW() - make_interval(days => $1))
+        LIMIT 5`,
+      [15],
+    );
+    res.json({ ok: true, count: r.rows.length, rows: r.rows });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: String(error.message || error) });
   }
 });
 
