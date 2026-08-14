@@ -520,24 +520,6 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Missão ainda não foi completada' });
     }
 
-    // ========================================================================
-    // REGRA DO NIVEL ATUAL (decisao do admin, ago/2026)
-    //
-    // Para missoes de nivel (reach_level), o usuario resgata APENAS a
-    // recompensa do nivel em que esta atualmente. Missoes de niveis
-    // anteriores ficam bloqueadas, mesmo que ele tenha passado por elas:
-    // quem ja chegou ao Nivel 4 nao pode voltar para resgatar a do Nivel 3.
-    //
-    // A missao do nivel atual permanece resgavel porque currentValue
-    // (nivel real) == target_value (nivel da missao).
-    // ========================================================================
-    if (m.type === 'reach_level' && currentValue > m.target_value) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: 'Esta recompensa só pode ser resgatada no nível correspondente. Você já passou deste marco e pode resgatar a recompensa do seu nível atual.',
-                code: 'LEVEL_PAST_MILESTONE',
-      });
-    }
     // Upsert progress e marcar como claimed.
     //
     // `started_at` e preservado com COALESCE: ele e o registro historico de
