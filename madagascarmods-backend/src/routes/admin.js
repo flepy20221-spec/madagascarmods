@@ -2443,14 +2443,10 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 router.get('/users/levels', authenticateAdmin, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT FLOOR(total_ads / 50) AS level, COUNT(*) AS users
-         FROM (
-           SELECT u.id, COUNT(re.id)::bigint AS total_ads
-             FROM users u
-             LEFT JOIN reward_events re ON re.user_id = u.id
-            GROUP BY u.id
-         ) per_user
-        GROUP BY FLOOR(total_ads / 50)
+      `SELECT FLOOR(COUNT(re.id) / 50) AS level, COUNT(DISTINCT u.id) AS users
+         FROM users u
+         LEFT JOIN reward_events re ON re.user_id = u.id
+        GROUP BY FLOOR(COUNT(re.id) / 50)
         ORDER BY level DESC`,
     );
     const total = await db.query('SELECT COUNT(*) AS users FROM users');
