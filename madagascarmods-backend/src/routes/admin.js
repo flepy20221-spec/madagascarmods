@@ -2438,6 +2438,7 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 // ---------------------------------------------------------------------------
 // ROTA TEMPORARIA — distribuicao de usuarios por nivel (para planejar missoes
 // de nivel). GET /api/admin/users/levels
+// ATENCAO: registrada ANTES de /users/:id para nao ser casada por id="levels"
 // ---------------------------------------------------------------------------
 router.get('/users/levels', authenticateAdmin, async (req, res) => {
   try {
