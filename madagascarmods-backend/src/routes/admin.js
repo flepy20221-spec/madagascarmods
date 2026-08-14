@@ -2098,6 +2098,7 @@ router.get('/users/levels', authenticateAdmin, async (req, res) => {
   }
 });
 // ============ USER DETAIL ============
+// GET /api/admin/users/:id - Get full user details
 router.get('/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
