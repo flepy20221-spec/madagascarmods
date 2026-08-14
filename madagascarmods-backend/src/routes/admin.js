@@ -2072,6 +2072,32 @@ router.post('/users/:id/allow-device-change', authenticateAdmin, requireRole('su
 // ============ USER DETAIL ============
 
 // GET /api/admin/users/:id - Get full user details
+// ROTA TEMPORARIA — distribuicao de usuarios por nivel (para planejar missoes
+// de nivel). GET /api/admin/users/levels
+// ATENCAO: registrada ANTES de /users/:id para nao ser casada por id="levels"
+// ---------------------------------------------------------------------------
+router.get('/users/levels', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await db.query(
+      `WITH per_user AS (
+         SELECT u.id AS uid, COUNT(re.id) AS total_ads
+           FROM users u
+           LEFT JOIN reward_events re ON re.user_id = u.id
+          GROUP BY u.id
+       )
+       SELECT FLOOR(total_ads / 50) AS level, COUNT(*) AS users
+         FROM per_user
+        GROUP BY FLOOR(total_ads / 50)
+        ORDER BY level DESC`,
+    );
+    const total = await db.query('SELECT COUNT(*) AS users FROM users');
+    res.json({ success: true, distribution: result.rows, totalUsers: parseInt(total.rows[0].users) });
+  } catch (error) {
+    console.error('Levels distribution error:', error);
+    res.status(500).json({ error: 'Erro ao calcular niveis' });
+  }
+});
+// ============ USER DETAIL ============
 router.get('/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2432,35 +2458,6 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 // ---------------------------------------------------------------------------
 // ROTA TEMPORARIA — "refresh" da conta (Ingrid, CP-BC0C-36F6-CBF8).
 // POST /api/admin/users/:id/reset-session
-// Invalida tokens/sessoes antigos e gera novos; o app faz login automatico
-// com o device_id e recebe os tokens novos na proxima abertura.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// ROTA TEMPORARIA — distribuicao de usuarios por nivel (para planejar missoes
-// de nivel). GET /api/admin/users/levels
-// ATENCAO: registrada ANTES de /users/:id para nao ser casada por id="levels"
-// ---------------------------------------------------------------------------
-router.get('/users/levels', authenticateAdmin, async (req, res) => {
-  try {
-    const result = await db.query(
-      `WITH per_user AS (
-         SELECT u.id AS uid, COUNT(re.id) AS total_ads
-           FROM users u
-           LEFT JOIN reward_events re ON re.user_id = u.id
-          GROUP BY u.id
-       )
-       SELECT FLOOR(total_ads / 50) AS level, COUNT(*) AS users
-         FROM per_user
-        GROUP BY FLOOR(total_ads / 50)
-        ORDER BY level DESC`,
-    );
-    const total = await db.query('SELECT COUNT(*) AS users FROM users');
-    res.json({ success: true, distribution: result.rows, totalUsers: parseInt(total.rows[0].users) });
-  } catch (error) {
-    console.error('Levels distribution error:', error);
-    res.status(500).json({ error: 'Erro ao calcular niveis' });
-  }
-});
 
 router.post('/users/:id/reset-session', authenticateAdmin, async (req, res) => {
   try {
