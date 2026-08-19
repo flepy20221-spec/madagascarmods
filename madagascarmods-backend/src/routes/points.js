@@ -63,8 +63,9 @@ router.get(
             WHERE user_id = $1
               AND ad_type = 'rewarded'
               AND ssv_verified = true
-              AND created_at > NOW() - INTERVAL '24 hours'`,
-          [userId]
+              AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
+              AND created_at <  ($2::date + INTERVAL '1 day')::timestamptz AT TIME ZONE 'America/Sao_Paulo'`,
+          [userId, require('../utils/adDailyLimit').todayBr()]
         )
       ]);
 
@@ -206,8 +207,9 @@ router.post(
       const dailyCount = await db.query(
         `SELECT COUNT(*) as count FROM reward_events
           WHERE user_id = $1 AND ad_type = 'rewarded' AND ssv_verified = true
-            AND created_at > NOW() - INTERVAL '24 hours'`,
-        [userId]
+            AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
+            AND created_at <  ($2::date + 1)::date::timestamptz AT TIME ZONE 'America/Sao_Paulo'`,
+        [userId, require('../utils/adDailyLimit').todayBr()]
       );
 
       if (recentSsv.rows.length === 0) {
@@ -259,13 +261,13 @@ router.post(
     );
     const currentBalance = parseInt(balanceResult.rows[0].balance, 10);
 
-    const dailyCount = await db.query(
+      const dailyCount = await db.query(
       `SELECT COUNT(*) as count FROM reward_events
         WHERE user_id = $1 AND ad_type = 'rewarded' AND ssv_verified = true
-          AND created_at > NOW() - INTERVAL '24 hours'`,
-      [userId]
+          AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
+          AND created_at <  ($2::date + INTERVAL '1 day')::timestamptz AT TIME ZONE 'America/Sao_Paulo'`,
+      [userId, require('../utils/adDailyLimit').todayBr()]
     );
-
     // Responde sucesso (o app nao precisa saber que nao creditou)
     // Isso evita que o app mostre erro ao usuario apos assistir interstitial
     res.json({
@@ -352,8 +354,10 @@ router.get('/stats', authenticateToken, async (req, res) => {
         COALESCE(SUM(points_awarded), 0) as today_earned,
         COUNT(*) as today_views
        FROM reward_events 
-       WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
-      [req.user.userId]
+       WHERE user_id = $1
+         AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
+         AND created_at <  ($2::date + INTERVAL '1 day')::timestamptz AT TIME ZONE 'America/Sao_Paulo'`,
+      [req.user.userId, require('../utils/adDailyLimit').todayBr()]
     );
 
     // Sistema de níveis visual (puramente cosmético)

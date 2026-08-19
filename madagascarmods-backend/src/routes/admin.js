@@ -2146,11 +2146,19 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
       [id]
     );
 
+    // Reset diario a meia-noite (horario de Brasilia) — igual ao limite do app.
+    const { countDailyAds, todayBr } = require('../utils/adDailyLimit');
+    const todayCount = await countDailyAds(id);
     const todayResult = await db.query(
-      `SELECT COUNT(*) as count, COALESCE(SUM(points_awarded), 0) as total
-       FROM reward_events WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
-      [id]
+      `SELECT COALESCE(SUM(points_awarded), 0) as total
+       FROM reward_events
+      WHERE user_id = $1
+        AND ad_type = 'rewarded' AND ssv_verified = true
+        AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
+        AND created_at <  ($2::date + INTERVAL '1 day')::timestamptz AT TIME ZONE 'America/Sao_Paulo'`,
+      [id, todayBr()]
     );
+    todayResult.rows[0] = { ...todayResult.rows[0], count: todayCount };
 
     // Payout destinations
     const payoutResult = await db.query(

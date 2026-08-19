@@ -321,7 +321,12 @@ router.get('/callback', async (req, res) => {
     }
 
     // ---------------------------------------------------------------------------
-    // Verificacao de limite diario
+    // Verificacao de limite diario (RESET A MEIA-NOITE, horario de Brasilia)
+    //
+    // Antes: janela rolante de 24h (`created_at > NOW() - 24h`).
+    // Agora: dia de calendario no fuso America/Sao_Paulo (UTC-3), igual as
+    // missoes diarias — o contador de todos os usuarios zera na virada da
+    // meia-noite (ads assistidos no dia continuam contados ate la).
     //
     // CORRECAO: antes, o limite diario era apenas informativo — aparecia na
     // resposta de /points/reward-status como `dailyLimit: 100`, mas NUNCA era
@@ -330,31 +335,12 @@ router.get('/callback', async (req, res) => {
     // (o app deveria bloquear localmente, mas race conditions e versoes antigas
     // nao aplicavam o bloqueio corretamente).
     //
-    // Agora o limite e aplicado aqui, no servidor, que e a autoridade final.
+    // O limite e aplicado aqui, no servidor, que e a autoridade final.
     // O callback e aceito (200) mas os pontos NAO sao creditados.
     // ---------------------------------------------------------------------------
-    const DAILY_LIMIT_DEFAULT = 100;
-    let dailyLimit = DAILY_LIMIT_DEFAULT;
-    try {
-      const limitConfig = await db.query(
-        "SELECT value FROM system_config WHERE key = 'dailyAdLimitRewarded'"
-      );
-      if (limitConfig.rows.length > 0) {
-        const parsed = Number(JSON.parse(limitConfig.rows[0].value));
-        if (Number.isFinite(parsed) && parsed > 0) dailyLimit = parsed;
-      }
-    } catch (_) { /* usa o default */ }
-
-    const dailyCountResult = await db.query(
-      `SELECT COUNT(*) AS count
-         FROM reward_events
-        WHERE user_id = $1
-          AND ad_type = 'rewarded'
-          AND ssv_verified = true
-          AND created_at > NOW() - INTERVAL '24 hours'`,
-      [userId]
-    );
-    const dailyCount = parseInt(dailyCountResult.rows[0].count, 10);
+    const { getDailyLimit, countDailyAds } = require('../utils/adDailyLimit');
+    const dailyLimit = await getDailyLimit();
+    const dailyCount = await countDailyAds(userId);
 
     if (dailyCount >= dailyLimit) {
       console.warn('[SSV] Daily limit reached for user', { userId, dailyCount, dailyLimit });
