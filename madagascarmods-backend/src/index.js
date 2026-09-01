@@ -57,9 +57,14 @@ app.use(helmet());
 // restritivo: sem ALLOWED_ORIGINS, apenas requests sem Origin (apps nativos) e o
 // painel admin local passam. (auditoria VULN-12)
 // ---------------------------------------------------------------------------
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
-  : [];
+const allowedOrigins = [
+  process.env.ALLOWED_ORIGINS,
+  process.env.PUBLIC_ALLOWED_ORIGINS,
+]
+  .filter(Boolean)
+  .flatMap(value => value.split(','))
+  .map(origin => origin.trim())
+  .filter(Boolean);
 
 app.use(cors({
   origin(origin, callback) {
