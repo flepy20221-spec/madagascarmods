@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const db = require('../src/models/db');
 const evidenceRouter = require('../src/routes/missionEvidence');
+const { createMissionProofToken } = require('../src/utils/missionProofToken');
 
 function finalHandler(path, method) {
   const layer = evidenceRouter.stack.find(
@@ -37,6 +38,7 @@ function responseRecorder() {
 }
 
 const submitEvidence = finalHandler('/submit', 'post');
+const confirmSession = finalHandler('/session', 'post');
 const approveEvidence = finalHandler('/admin/:id/approve', 'post');
 const rejectEvidence = finalHandler('/admin/:id/reject', 'post');
 
@@ -61,6 +63,84 @@ test('rejeita conteudo que declara PNG mas nao possui assinatura de imagem', asy
 
   assert.equal(res.statusCode, 400);
   assert.equal(res.body.code, 'INVALID_EVIDENCE_CONTENT');
+});
+
+test('sessao por token confirma somente o codigo de suporte e o estado da missao', async (t) => {
+  const originalQuery = db.query;
+  const mission = {
+    id: 'mission-1',
+    reward_points: 500,
+    minimum_external_credits: 1800,
+    target_value: 1,
+  };
+  db.query = async (sql, params) => {
+    if (sql.includes('FROM missions')) return { rows: [mission] };
+    if (sql.includes('FROM users')) {
+      assert.equal(params[0], 'user-1');
+      return { rows: [{ id: 'user-1', email: null, support_code: 'CP-ABCD-1234-EF56' }] };
+    }
+    if (sql.includes('FROM mission_evidence_submissions')) return { rows: [] };
+    throw new Error(`Consulta inesperada: ${sql}`);
+  };
+  t.after(() => {
+    db.query = originalQuery;
+  });
+
+  const token = createMissionProofToken({ userId: 'user-1', missionId: mission.id });
+  const res = responseRecorder();
+  await confirmSession(
+    { body: { mission_slug: 'manus-account-proof', access_token: token } },
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.account.supportCode, 'CP-ABCD-1234-EF56');
+  assert.equal(Object.hasOwn(res.body.account, 'email'), false);
+  assert.equal(res.body.mission.rewardPoints, 500);
+  assert.equal(res.body.submission, null);
+});
+
+test('sessao recusa token adulterado e expirado', async (t) => {
+  const originalQuery = db.query;
+  db.query = async (sql) => {
+    if (sql.includes('FROM missions')) {
+      return {
+        rows: [{
+          id: 'mission-1',
+          reward_points: 500,
+          minimum_external_credits: 1800,
+          target_value: 1,
+        }],
+      };
+    }
+    throw new Error('Token invalido nao deve consultar usuario.');
+  };
+  t.after(() => {
+    db.query = originalQuery;
+  });
+
+  const valid = createMissionProofToken({ userId: 'user-1', missionId: 'mission-1' });
+  const tampered = `${valid.slice(0, -1)}${valid.endsWith('a') ? 'b' : 'a'}`;
+  const tamperedResponse = responseRecorder();
+  await confirmSession(
+    { body: { mission_slug: 'manus-account-proof', access_token: tampered } },
+    tamperedResponse
+  );
+  assert.equal(tamperedResponse.statusCode, 401);
+  assert.equal(tamperedResponse.body.code, 'INVALID_PROOF_TOKEN');
+
+  const expired = createMissionProofToken({
+    userId: 'user-1',
+    missionId: 'mission-1',
+    now: Date.now() - 7 * 60 * 60 * 1000,
+  });
+  const expiredResponse = responseRecorder();
+  await confirmSession(
+    { body: { mission_slug: 'manus-account-proof', access_token: expired } },
+    expiredResponse
+  );
+  assert.equal(expiredResponse.statusCode, 410);
+  assert.equal(expiredResponse.body.code, 'EXPIRED_PROOF_TOKEN');
 });
 
 test('aprovar evidencia completa a missao sem creditar pontos diretamente', async (t) => {

@@ -4,6 +4,10 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const db = require('../models/db');
 const { authenticateAdmin, requireRole } = require('../middleware/auth');
+const {
+  proofTokenRateKey,
+  verifyMissionProofToken,
+} = require('../utils/missionProofToken');
 
 const router = express.Router();
 const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
@@ -26,7 +30,9 @@ const submissionLimiter = rateLimit({
   limit: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => normalizeSupportCode(req.body?.support_code) || 'missing-support-code',
+  keyGenerator: (req) => proofTokenRateKey(
+    req.body?.access_token || normalizeSupportCode(req.body?.support_code)
+  ),
   message: {
     error: 'Muitas tentativas para este codigo de suporte. Aguarde antes de enviar novamente.',
     code: 'EVIDENCE_RATE_LIMIT',
@@ -38,7 +44,9 @@ const statusLimiter = rateLimit({
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => normalizeSupportCode(req.body?.support_code) || 'missing-support-code',
+  keyGenerator: (req) => proofTokenRateKey(
+    req.body?.access_token || normalizeSupportCode(req.body?.support_code)
+  ),
   message: {
     error: 'Muitas consultas. Aguarde alguns minutos e tente novamente.',
     code: 'EVIDENCE_STATUS_RATE_LIMIT',
@@ -124,6 +132,53 @@ async function findPortalUser(queryable, email, supportCode) {
   return result.rows[0] || null;
 }
 
+async function findPortalUserById(queryable, userId) {
+  const result = await queryable.query(
+    `SELECT id, email, support_code
+       FROM users
+      WHERE id = $1
+        AND is_active = true
+        AND is_banned = false
+        AND merged_into_user_id IS NULL
+      LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
+async function resolvePortalAccess(queryable, body, mission) {
+  const token = typeof body?.access_token === 'string' ? body.access_token : '';
+  if (token) {
+    const payload = verifyMissionProofToken(token);
+    if (payload.missionId !== mission.id) {
+      const error = new Error('Este link pertence a outra missao.');
+      error.code = 'INVALID_PROOF_TOKEN';
+      throw error;
+    }
+    return findPortalUserById(queryable, payload.userId);
+  }
+
+  // Compatibilidade curta para abas antigas. A nova interface nao solicita
+  // estes campos e usa apenas o link personalizado emitido pelo CashPix.
+  const email = normalizeEmail(body?.email);
+  const supportCode = normalizeSupportCode(body?.support_code);
+  if (validIdentity(email, supportCode)) {
+    return findPortalUser(queryable, email, supportCode);
+  }
+
+  const error = new Error('Abra esta missao novamente pelo aplicativo CashPix.');
+  error.code = 'INVALID_PROOF_TOKEN';
+  throw error;
+}
+
+function proofAccessError(res, error) {
+  const expired = error?.code === 'EXPIRED_PROOF_TOKEN';
+  return res.status(expired ? 410 : 401).json({
+    error: error?.message || 'Link de identificacao invalido.',
+    code: error?.code || 'INVALID_PROOF_TOKEN',
+  });
+}
+
 async function findActiveMission(queryable) {
   const result = await queryable.query(
     `SELECT id, reward_points, minimum_external_credits, target_value
@@ -139,17 +194,9 @@ async function findActiveMission(queryable) {
 }
 
 router.post('/submit', receiveEvidence, submissionLimiter, async (req, res) => {
-  const email = normalizeEmail(req.body?.email);
-  const supportCode = normalizeSupportCode(req.body?.support_code);
   const missionSlug = String(req.body?.mission_slug || '');
   const attestationAccepted = String(req.body?.attestation || '').toLowerCase() === 'true';
 
-  if (!validIdentity(email, supportCode)) {
-    return res.status(400).json({
-      error: 'Confira o e-mail e o codigo de suporte da sua conta CashPix.',
-      code: 'INVALID_CASHPIX_IDENTITY',
-    });
-  }
   if (missionSlug !== MISSION_SLUG) {
     return res.status(400).json({ error: 'Missao invalida.', code: 'INVALID_MISSION' });
   }
@@ -177,21 +224,21 @@ router.post('/submit', receiveEvidence, submissionLimiter, async (req, res) => {
   const client = await db.getClient();
   try {
     await client.query('BEGIN');
-    const user = await findPortalUser(client, email, supportCode);
     const mission = await findActiveMission(client);
 
-    if (!user) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({
-        error: 'Nao foi possivel confirmar a conta CashPix com os dados informados.',
-        code: 'CASHPIX_ACCOUNT_NOT_FOUND',
-      });
-    }
     if (!mission) {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: 'Esta missao ainda nao esta disponivel para envios.',
         code: 'MISSION_NOT_AVAILABLE',
+      });
+    }
+    const user = await resolvePortalAccess(client, req.body, mission);
+    if (!user) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        error: 'Esta conta CashPix nao esta disponivel para a missao.',
+        code: 'CASHPIX_ACCOUNT_NOT_FOUND',
       });
     }
 
@@ -275,6 +322,9 @@ router.post('/submit', receiveEvidence, submissionLimiter, async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.code === 'INVALID_PROOF_TOKEN' || error.code === 'EXPIRED_PROOF_TOKEN') {
+      return proofAccessError(res, error);
+    }
     if (error.code === '23505') {
       return res.status(409).json({
         error: 'Ja existe uma solicitacao ativa ou esta imagem ja foi utilizada.',
@@ -288,20 +338,77 @@ router.post('/submit', receiveEvidence, submissionLimiter, async (req, res) => {
   }
 });
 
+router.post('/session', statusLimiter, async (req, res) => {
+  const missionSlug = String(req.body?.mission_slug || '');
+  if (missionSlug !== MISSION_SLUG) {
+    return res.status(400).json({ error: 'Missao invalida.', code: 'INVALID_MISSION' });
+  }
+
+  try {
+    const mission = await findActiveMission(db);
+    if (!mission) {
+      return res.status(409).json({
+        error: 'Esta missao ainda nao esta disponivel.',
+        code: 'MISSION_NOT_AVAILABLE',
+      });
+    }
+    const user = await resolvePortalAccess(db, req.body, mission);
+    if (!user) {
+      return res.status(404).json({
+        error: 'Esta conta CashPix nao esta disponivel para a missao.',
+        code: 'CASHPIX_ACCOUNT_NOT_FOUND',
+      });
+    }
+
+    const result = await db.query(
+      `SELECT s.id, s.public_protocol, s.status, s.submitted_at,
+              s.reviewed_at, s.rejection_reason,
+              m.reward_points, m.minimum_external_credits
+         FROM mission_evidence_submissions s
+         JOIN missions m ON m.id = s.mission_id
+        WHERE s.user_id = $1 AND s.mission_id = $2
+        ORDER BY s.submitted_at DESC
+        LIMIT 1`,
+      [user.id, mission.id]
+    );
+
+    return res.json({
+      success: true,
+      account: { supportCode: user.support_code },
+      mission: {
+        rewardPoints: Number(mission.reward_points || 500),
+        minimumCredits: Number(mission.minimum_external_credits || 1800),
+      },
+      submission: result.rows[0] ? publicSubmission(result.rows[0]) : null,
+    });
+  } catch (error) {
+    if (error.code === 'INVALID_PROOF_TOKEN' || error.code === 'EXPIRED_PROOF_TOKEN') {
+      return proofAccessError(res, error);
+    }
+    console.error('Mission evidence session error:', error);
+    return res.status(500).json({ error: 'Erro ao confirmar acesso da missao.' });
+  }
+});
+
 router.post('/status', statusLimiter, async (req, res) => {
-  const email = normalizeEmail(req.body?.email);
-  const supportCode = normalizeSupportCode(req.body?.support_code);
   const missionSlug = String(req.body?.mission_slug || '');
 
-  if (!validIdentity(email, supportCode) || missionSlug !== MISSION_SLUG) {
+  if (missionSlug !== MISSION_SLUG) {
     return res.status(400).json({
-      error: 'Confira os dados informados.',
+      error: 'Missao invalida.',
       code: 'INVALID_STATUS_LOOKUP',
     });
   }
 
   try {
-    const user = await findPortalUser(db, email, supportCode);
+    const mission = await findActiveMission(db);
+    if (!mission) {
+      return res.status(409).json({
+        error: 'Esta missao ainda nao esta disponivel.',
+        code: 'MISSION_NOT_AVAILABLE',
+      });
+    }
+    const user = await resolvePortalAccess(db, req.body, mission);
     if (!user) {
       return res.status(404).json({
         error: 'Nenhuma solicitacao foi encontrada para os dados informados.',
@@ -329,6 +436,9 @@ router.post('/status', statusLimiter, async (req, res) => {
     }
     return res.json({ success: true, submission: publicSubmission(result.rows[0]) });
   } catch (error) {
+    if (error.code === 'INVALID_PROOF_TOKEN' || error.code === 'EXPIRED_PROOF_TOKEN') {
+      return proofAccessError(res, error);
+    }
     console.error('Mission evidence status error:', error);
     return res.status(500).json({ error: 'Erro ao consultar comprovacao.' });
   }

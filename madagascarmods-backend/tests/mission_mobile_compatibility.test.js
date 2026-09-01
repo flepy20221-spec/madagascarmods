@@ -75,7 +75,9 @@ test('expõe alias legado somente quando a APK deve mostrar abrir ou resgatar', 
   await listMissions({ user: { userId: 'user-1' } }, notSubmitted);
   assert.equal(notSubmitted.body.missions[0].type, 'app_review');
   assert.equal(notSubmitted.body.missions[0].verificationMode, 'self_declared');
-  assert.equal(notSubmitted.body.missions[0].actionUrl, manualMission.action_url);
+  const listActionUrl = new URL(notSubmitted.body.missions[0].actionUrl);
+  assert.equal(listActionUrl.origin, new URL(manualMission.action_url).origin);
+  assert.ok(listActionUrl.searchParams.get('access'));
   assert.equal(notSubmitted.body.missions[0].requiresAd, false);
   assert.equal(notSubmitted.body.missions[0].isCompleted, false);
   assert.equal(notSubmitted.body.missions[0].startedAt, null);
@@ -141,7 +143,9 @@ test('start da missão manual devolve o portal sem criar progresso', async (t) =
   );
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.actionUrl, manualMission.action_url);
+  const startActionUrl = new URL(res.body.actionUrl);
+  assert.equal(startActionUrl.origin, new URL(manualMission.action_url).origin);
+  assert.ok(startActionUrl.searchParams.get('access'));
   assert.equal(res.body.requiresAd, false);
   assert.equal(res.body.verificationMode, 'manual_evidence');
   assert.equal(calls.find((call) => call.sql.includes('SELECT * FROM missions')).params[0], manualMission.id);

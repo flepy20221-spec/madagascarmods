@@ -3,6 +3,10 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken, authenticateAdmin } = require('../middleware/auth');
+const {
+  appendProofToken,
+  createMissionProofToken,
+} = require('../utils/missionProofToken');
 
 function compatibleField(body, camelCase, snakeCase) {
   if (Object.prototype.hasOwnProperty.call(body, camelCase)) {
@@ -329,6 +333,12 @@ router.get('/', authenticateToken, async (req, res) => {
       const mobileMissionId = exposeLegacyExternalAction && evidenceStatus !== 'approved'
         ? `${mission.id}${MOBILE_ACTION_SEPARATOR}${uuidv4()}`
         : mission.id;
+      const mobileActionUrl = isManualEvidence
+        ? appendProofToken(
+            mission.action_url || MANUS_PROOF_PORTAL_URL,
+            createMissionProofToken({ userId, missionId: mission.id })
+          )
+        : (mission.action_url || null);
 
       enrichedMissions.push({
         id: mobileMissionId,
@@ -345,7 +355,7 @@ router.get('/', authenticateToken, async (req, res) => {
         // Campos novos. Clientes antigos ignoram propriedades desconhecidas no
         // JSON, portanto acrescenta-los nao afeta nenhuma versao ja publicada.
         verificationMode: mobileVerificationMode,
-        actionUrl: mission.action_url || null,
+        actionUrl: mobileActionUrl,
         requiresAd: isManualEvidence ? false : mission.requires_ad !== false,
         cooldownDays: mission.cooldown_days || null,
         minSecondsBeforeClaim: mission.min_seconds_before_claim || 0,
@@ -420,11 +430,15 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
       // progresso, nao conclui a missao e nao libera pontos. A fonte de verdade
       // continua sendo a aprovacao em mission_evidence_submissions.
       await client.query('COMMIT');
+      const proofToken = createMissionProofToken({ userId, missionId: mission.id });
       return res.json({
         success: true,
         startedAt: new Date().toISOString(),
         minSecondsBeforeClaim: 0,
-        actionUrl: mission.action_url || MANUS_PROOF_PORTAL_URL,
+        actionUrl: appendProofToken(
+          mission.action_url || MANUS_PROOF_PORTAL_URL,
+          proofToken
+        ),
         requiresAd: false,
         verificationMode: 'manual_evidence',
       });
