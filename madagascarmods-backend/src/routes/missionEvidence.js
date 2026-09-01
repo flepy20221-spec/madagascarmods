@@ -13,12 +13,17 @@ const router = express.Router();
 const MAX_EVIDENCE_BYTES = 8 * 1024 * 1024;
 const MISSION_SLUG = 'manus-account-proof';
 
+function canonicalImageMime(value) {
+  if (value === 'image/jpg' || value === 'image/pjpeg') return 'image/jpeg';
+  return value;
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { files: 1, fileSize: MAX_EVIDENCE_BYTES, fields: 8 },
   fileFilter: (_req, file, callback) => {
     const accepted = new Set(['image/jpeg', 'image/png', 'image/webp']);
-    if (!accepted.has(file.mimetype)) {
+    if (!accepted.has(canonicalImageMime(file.mimetype))) {
       return callback(new Error('UNSUPPORTED_EVIDENCE_TYPE'));
     }
     return callback(null, true);
@@ -214,7 +219,7 @@ router.post('/submit', receiveEvidence, submissionLimiter, async (req, res) => {
   }
 
   const actualMime = detectedImageMime(req.file.buffer);
-  if (!actualMime || actualMime !== req.file.mimetype) {
+  if (!actualMime || actualMime !== canonicalImageMime(req.file.mimetype)) {
     return res.status(400).json({
       error: 'O conteudo do arquivo nao corresponde a uma imagem JPG, PNG ou WebP valida.',
       code: 'INVALID_EVIDENCE_CONTENT',
@@ -654,5 +659,7 @@ router.post(
     }
   }
 );
+
+router._test = { canonicalImageMime, detectedImageMime };
 
 module.exports = router;

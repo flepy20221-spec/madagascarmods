@@ -198,6 +198,16 @@ const generalLimiter = rateLimit({
 app.use('/api/', (req, res, next) => {
   if (req.path.startsWith('/ssv/')) return next();
   if (req.path.startsWith('/asaas/')) return next();
+  // O portal envia imagens multipart e possui limitadores proprios por token nas
+  // rotas /session e /submit. Passar antes pelo bucket geral por IP fazia usuarios
+  // sob o mesmo CGNAT de operadora compartilharem a cota; se a cota terminasse
+  // enquanto o celular ainda transmitia o arquivo, alguns navegadores Android
+  // exibiam apenas "Failed to fetch" em vez do JSON 429. As rotas continuam
+  // protegidas pelos limitadores dedicados em missionEvidence.js.
+  if (
+    req.path === '/mission-evidence/session'
+    || req.path === '/mission-evidence/submit'
+  ) return next();
   return generalLimiter(req, res, next);
 });
 
