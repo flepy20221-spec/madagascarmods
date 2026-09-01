@@ -63,6 +63,8 @@ const MANUAL_EVIDENCE_TYPES = new Set(['manus_proof']);
 const MANUS_PROOF_SLUG = 'manus-account-proof';
 const MANUS_PROOF_PORTAL_URL = process.env.MANUS_PROOF_PORTAL_URL
   || 'https://cashpix-manus-proof-production.up.railway.app/';
+const DEFAULT_MANUS_INVITATION_URL =
+  'https://manus.im/invitation/56OCV3XMLKTLC?utm_source=invitation&utm_medium=social&utm_campaign=copy_link';
 
 // A APK guarda `startedAt` em memoria pela chave `id`. Como ela marca localmente
 // qualquer acao externa como concluida logo depois de abrir o navegador, o mesmo
@@ -107,6 +109,28 @@ function normalizeActionUrl(value) {
   // Play Store nativa por intent de qualquer forma. Um unico formato aceito
   // mantem a validacao simples e o comportamento previsivel.
   return isPlayStorePage || isManusProofPortal ? parsed.toString() : false;
+}
+
+function normalizeInvitationUrl(value) {
+  if (value === undefined) return undefined;
+  if (value === null || (typeof value === 'string' && value.trim() === '')) return null;
+  if (typeof value !== 'string') return false;
+
+  try {
+    const parsed = new URL(value.trim());
+    const host = parsed.hostname.toLowerCase();
+    const pathParts = parsed.pathname.split('/').filter(Boolean);
+    const isOfficialInvitation = parsed.protocol === 'https:'
+      && !parsed.username
+      && !parsed.password
+      && (host === 'manus.im' || host === 'www.manus.im')
+      && pathParts.length === 2
+      && pathParts[0] === 'invitation'
+      && /^[A-Za-z0-9_-]+$/.test(pathParts[1]);
+    return isOfficialInvitation ? parsed.toString() : false;
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -765,6 +789,9 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
       compatibleField(req.body, 'minimumExternalCredits', 'minimum_external_credits')
     );
     const instructions = compatibleField(req.body, 'instructions', 'instructions');
+    const invitationUrl = normalizeInvitationUrl(
+      compatibleField(req.body, 'invitationUrl', 'invitation_url')
+    );
 
     if (!title || !type || targetValue === undefined || rewardPoints === undefined) {
       return res.status(400).json({ error: 'Campos obrigatórios: title, type, targetValue, rewardPoints' });
@@ -808,6 +835,11 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
           + 'no formato https://play.google.com/store/apps/details?id=SEU.PACOTE',
       });
     }
+    if (invitationUrl === false) {
+      return res.status(400).json({
+        error: 'O link de convite deve usar https://manus.im/invitation/CODIGO.',
+      });
+    }
 
     // `app_review` implica verificacao autodeclarada. Derivar isso do tipo em vez
     // de aceitar do cliente evita a combinacao incoerente de uma missao de
@@ -832,10 +864,10 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
          is_active, is_daily, sort_order,
          verification_mode, action_url, requires_ad, cooldown_days,
          min_seconds_before_claim, slug, evidence_required,
-         minimum_external_credits, instructions
+         minimum_external_credits, instructions, invitation_url
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-               $15, $16, $17, $18) RETURNING *`,
+               $15, $16, $17, $18, $19) RETURNING *`,
       [
         title, description || '', type, targetValue, rewardPoints, icon || 'star',
         isActive !== false, isDaily !== false, sortOrder ?? 0,
@@ -851,6 +883,9 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
         verificationMode === 'manual_evidence' ? true : (evidenceRequired ?? false),
         minimumExternalCredits ?? (verificationMode === 'manual_evidence' ? 1800 : 0),
         instructions ? JSON.stringify(instructions) : JSON.stringify({}),
+        verificationMode === 'manual_evidence'
+          ? (invitationUrl ?? DEFAULT_MANUS_INVITATION_URL)
+          : null,
       ]
     );
 
@@ -894,6 +929,9 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
       compatibleField(req.body, 'minimumExternalCredits', 'minimum_external_credits')
     );
     const instructions = compatibleField(req.body, 'instructions', 'instructions');
+    const invitationUrl = normalizeInvitationUrl(
+      compatibleField(req.body, 'invitationUrl', 'invitation_url')
+    );
 
     // Cooldown difere dos outros inteiros: `null` explicito e um valor valido,
     // significa "remover o cooldown". Por isso nao passa por
@@ -947,6 +985,11 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
           + 'no formato https://play.google.com/store/apps/details?id=SEU.PACOTE',
       });
     }
+    if (invitationUrl === false) {
+      return res.status(400).json({
+        error: 'O link de convite deve usar https://manus.im/invitation/CODIGO.',
+      });
+    }
 
     // O modo de verificacao acompanha o tipo quando o tipo e informado, pelo mesmo
     // motivo do endpoint de criacao. Quando o tipo nao vem no corpo (edicao
@@ -977,6 +1020,7 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
         evidence_required = COALESCE($20, evidence_required),
         minimum_external_credits = COALESCE($21, minimum_external_credits),
         instructions = COALESCE($22::jsonb, instructions),
+        invitation_url = CASE WHEN $23::boolean THEN $24::text ELSE invitation_url END,
         updated_at = NOW()
        WHERE id = $10 RETURNING *`,
       [
@@ -994,6 +1038,8 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
         verificationMode === 'manual_evidence' ? true : evidenceRequired,
         minimumExternalCredits,
         instructions ? JSON.stringify(instructions) : null,
+        invitationUrl !== undefined,
+        invitationUrl ?? null,
       ]
     );
 

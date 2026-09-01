@@ -181,7 +181,7 @@ function proofAccessError(res, error) {
 
 async function findActiveMission(queryable) {
   const result = await queryable.query(
-    `SELECT id, reward_points, minimum_external_credits, target_value
+    `SELECT id, reward_points, minimum_external_credits, target_value, invitation_url
        FROM missions
       WHERE slug = $1
         AND verification_mode = 'manual_evidence'
@@ -378,6 +378,8 @@ router.post('/session', statusLimiter, async (req, res) => {
       mission: {
         rewardPoints: Number(mission.reward_points || 500),
         minimumCredits: Number(mission.minimum_external_credits || 1800),
+        invitationUrl: mission.invitation_url
+          || 'https://manus.im/invitation/56OCV3XMLKTLC?utm_source=invitation&utm_medium=social&utm_campaign=copy_link',
       },
       submission: result.rows[0] ? publicSubmission(result.rows[0]) : null,
     });

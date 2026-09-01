@@ -87,6 +87,7 @@ test('cria missão aceitando o formato snake_case usado pelo painel antigo', asy
     false,   // evidence_required
     0,       // minimum_external_credits
     '{}',    // instructions
+    null,    // invitation_url
   ]);
 });
 
@@ -124,6 +125,7 @@ test('cria missão Manus com comprovacao manual e defaults seguros', async (t) =
   assert.equal(capturedParams[14], 'manus-account-proof');
   assert.equal(capturedParams[15], true);
   assert.equal(capturedParams[16], 1800);
+  assert.match(capturedParams[18], /^https:\/\/manus\.im\/invitation\//);
 });
 
 test('cria missão aceitando o formato camelCase enviado pelo painel corrigido', async (t) => {
@@ -202,6 +204,47 @@ test('edita meta e recompensa e alterna status nos dois formatos', async (t) => 
   assert.equal(statusUpdate.statusCode, 200);
   assert.equal(calls[1][6], false);
   assert.equal(calls[1][9], 'mission-3');
+});
+
+test('edita o link oficial de convite e rejeita domínio externo', async (t) => {
+  const originalQuery = db.query;
+  let capturedParams;
+  let queryCount = 0;
+  db.query = async (_sql, params) => {
+    queryCount += 1;
+    capturedParams = params;
+    return { rows: [{ id: params[9], invitation_url: params[23] }] };
+  };
+  t.after(() => {
+    db.query = originalQuery;
+  });
+
+  const valid = responseRecorder();
+  await updateMission(
+    {
+      params: { id: 'mission-manus' },
+      body: { invitationUrl: 'https://manus.im/invitation/NOVO_CODIGO?utm_source=admin' },
+    },
+    valid
+  );
+  assert.equal(valid.statusCode, 200);
+  assert.equal(capturedParams[22], true);
+  assert.equal(
+    capturedParams[23],
+    'https://manus.im/invitation/NOVO_CODIGO?utm_source=admin'
+  );
+
+  const invalid = responseRecorder();
+  await updateMission(
+    {
+      params: { id: 'mission-manus' },
+      body: { invitationUrl: 'https://example.com/invitation/falso' },
+    },
+    invalid
+  );
+  assert.equal(invalid.statusCode, 400);
+  assert.match(invalid.body.error, /manus\.im\/invitation/);
+  assert.equal(queryCount, 1);
 });
 
 test('rejeita meta ou recompensa inválida antes de consultar o banco', async (t) => {

@@ -136,6 +136,7 @@ test('sessao por token confirma somente o codigo de suporte e o estado da missao
     reward_points: 500,
     minimum_external_credits: 1800,
     target_value: 1,
+    invitation_url: 'https://manus.im/invitation/LINK_CONFIGURADO?utm_source=admin',
   };
   db.query = async (sql, params) => {
     if (sql.includes('FROM missions')) return { rows: [mission] };
@@ -161,6 +162,10 @@ test('sessao por token confirma somente o codigo de suporte e o estado da missao
   assert.equal(res.body.account.supportCode, 'CP-ABCD-1234-EF56');
   assert.equal(Object.hasOwn(res.body.account, 'email'), false);
   assert.equal(res.body.mission.rewardPoints, 500);
+  assert.equal(
+    res.body.mission.invitationUrl,
+    'https://manus.im/invitation/LINK_CONFIGURADO?utm_source=admin'
+  );
   assert.equal(res.body.submission, null);
 });
 
