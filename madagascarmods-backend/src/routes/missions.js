@@ -259,6 +259,8 @@ router.get('/', authenticateToken, async (req, res) => {
       let evidenceStatus = null;
       let evidenceProtocol = null;
       let evidenceRejectionReason = null;
+      const isManualEvidence = MANUAL_EVIDENCE_TYPES.has(mission.type)
+        || mission.verification_mode === 'manual_evidence';
 
       if (SELF_DECLARED_TYPES.has(mission.type) || mission.verification_mode === 'self_declared') {
         const activeClaim = await findActiveClaim(db, userId, mission, today);
@@ -281,9 +283,9 @@ router.get('/', authenticateToken, async (req, res) => {
         }
       }
 
-      if (MANUAL_EVIDENCE_TYPES.has(mission.type) || mission.verification_mode === 'manual_evidence') {
+      if (isManualEvidence) {
         const evidence = await db.query(
-          `SELECT status, public_protocol, rejection_reason
+          `SELECT status, public_protocol, rejection_reason, submitted_at, reviewed_at
              FROM mission_evidence_submissions
             WHERE user_id = $1 AND mission_id = $2
             ORDER BY submitted_at DESC
@@ -295,15 +297,30 @@ router.get('/', authenticateToken, async (req, res) => {
         evidenceProtocol = latestEvidence?.public_protocol || null;
         evidenceRejectionReason = latestEvidence?.rejection_reason || null;
         currentValue = evidenceStatus === 'approved' ? mission.target_value : 0;
+        // A APK publicada so exibe uma acao externa para o contrato legado de
+        // avaliacao. Depois da aprovacao, um instante conhecido tambem faz essa
+        // mesma APK trocar o botao de abertura pelo botao de resgate.
+        startedAt = evidenceStatus === 'approved'
+          ? (latestEvidence?.reviewed_at || latestEvidence?.submitted_at || null)
+          : null;
       }
 
       const isCompleted = currentValue >= mission.target_value;
+      // Compatibilidade exclusiva da resposta mobile: a definicao persistida
+      // continua sendo `manual_evidence`, portanto /claim jamais herda a regra
+      // autodeclarada. Enquanto o envio esta pendente, o alias e retirado para a
+      // APK nao oferecer resgate antes da decisao administrativa.
+      const exposeLegacyExternalAction = isManualEvidence && evidenceStatus !== 'pending';
+      const mobileType = exposeLegacyExternalAction ? 'app_review' : mission.type;
+      const mobileVerificationMode = exposeLegacyExternalAction
+        ? 'self_declared'
+        : (mission.verification_mode || 'auto');
 
       enrichedMissions.push({
         id: mission.id,
         title: mission.title,
         description: mission.description,
-        type: mission.type,
+        type: mobileType,
         targetValue: mission.target_value,
         rewardPoints: mission.reward_points,
         icon: mission.icon,
@@ -313,9 +330,9 @@ router.get('/', authenticateToken, async (req, res) => {
         isClaimed,
         // Campos novos. Clientes antigos ignoram propriedades desconhecidas no
         // JSON, portanto acrescenta-los nao afeta nenhuma versao ja publicada.
-        verificationMode: mission.verification_mode || 'auto',
+        verificationMode: mobileVerificationMode,
         actionUrl: mission.action_url || null,
-        requiresAd: mission.requires_ad !== false,
+        requiresAd: isManualEvidence ? false : mission.requires_ad !== false,
         cooldownDays: mission.cooldown_days || null,
         minSecondsBeforeClaim: mission.min_seconds_before_claim || 0,
         startedAt: startedAt ? new Date(startedAt).toISOString() : null,
@@ -372,12 +389,30 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
     const mission = missionResult.rows[0];
     const isSelfDeclared = SELF_DECLARED_TYPES.has(mission.type)
       || mission.verification_mode === 'self_declared';
+    const isManualEvidence = MANUAL_EVIDENCE_TYPES.has(mission.type)
+      || mission.verification_mode === 'manual_evidence';
 
-    if (!isSelfDeclared) {
+    if (!isSelfDeclared && !isManualEvidence) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: 'Esta missao nao possui acao externa.',
         code: 'MISSION_NOT_STARTABLE',
+      });
+    }
+
+    if (isManualEvidence) {
+      // A APK existente chama /start antes de abrir qualquer URL externa. Para
+      // a missao Manus, a chamada serve apenas para devolver o portal: nao cria
+      // progresso, nao conclui a missao e nao libera pontos. A fonte de verdade
+      // continua sendo a aprovacao em mission_evidence_submissions.
+      await client.query('COMMIT');
+      return res.json({
+        success: true,
+        startedAt: new Date().toISOString(),
+        minSecondsBeforeClaim: 0,
+        actionUrl: mission.action_url || MANUS_PROOF_PORTAL_URL,
+        requiresAd: false,
+        verificationMode: 'manual_evidence',
       });
     }
 
