@@ -27,11 +27,14 @@ test('rotas publicas de comprovante usam limiter dedicado e nao o bucket geral p
 });
 
 test('normaliza variantes JPEG enviadas por navegadores Android', () => {
-  const { canonicalImageMime, detectedImageMime } = missionEvidenceRouter._test;
+  const { canonicalImageMime, detectedImageMime, safeExtension } = missionEvidenceRouter._test;
   assert.equal(canonicalImageMime('image/jpg'), 'image/jpeg');
   assert.equal(canonicalImageMime('image/pjpeg'), 'image/jpeg');
   assert.equal(canonicalImageMime('image/png'), 'image/png');
   assert.equal(detectedImageMime(Buffer.from([0xff, 0xd8, 0xff, 0xd9, 0, 0, 0, 0, 0, 0, 0, 0])), 'image/jpeg');
+  assert.equal(detectedImageMime(Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63])), 'image/heic');
+  assert.equal(detectedImageMime(Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66])), 'image/avif');
+  assert.equal(safeExtension('1000020154.JPG'), 'jpg');
 });
 
 test('multer devolve JSON claro para imagem acima de 8 MB', async () => {

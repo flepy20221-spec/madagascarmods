@@ -101,7 +101,18 @@ function detectedImageMime(buffer) {
     buffer.subarray(0, 4).toString('ascii') === 'RIFF'
     && buffer.subarray(8, 12).toString('ascii') === 'WEBP'
   ) return 'image/webp';
+  if (buffer.subarray(4, 8).toString('ascii') === 'ftyp') {
+    const brand = buffer.subarray(8, 12).toString('ascii').toLowerCase();
+    if (['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) return 'image/heic';
+    if (['avif', 'avis'].includes(brand)) return 'image/avif';
+  }
   return null;
+}
+
+function safeExtension(filename) {
+  if (typeof filename !== 'string') return null;
+  const match = filename.toLowerCase().match(/\.([a-z0-9]{1,8})$/);
+  return match ? match[1] : null;
 }
 
 function safeFilename(value) {
@@ -220,6 +231,18 @@ router.post('/submit', receiveEvidence, submissionLimiter, async (req, res) => {
 
   const actualMime = detectedImageMime(req.file.buffer);
   if (!actualMime || actualMime !== canonicalImageMime(req.file.mimetype)) {
+    console.warn('Mission evidence rejected: incompatible image content', {
+      declaredMime: canonicalImageMime(req.file.mimetype) || null,
+      detectedMime: actualMime,
+      extension: safeExtension(req.file.originalname),
+      sizeBytes: req.file.size,
+    });
+    if (actualMime === 'image/heic' || actualMime === 'image/avif') {
+      return res.status(400).json({
+        error: 'A imagem esta em um formato do celular que nao foi convertido. Abra a imagem na galeria, tire uma nova captura de tela e envie a nova captura.',
+        code: 'EVIDENCE_MOBILE_FORMAT_NOT_CONVERTED',
+      });
+    }
     return res.status(400).json({
       error: 'O conteudo do arquivo nao corresponde a uma imagem JPG, PNG ou WebP valida.',
       code: 'INVALID_EVIDENCE_CONTENT',
@@ -660,6 +683,6 @@ router.post(
   }
 );
 
-router._test = { canonicalImageMime, detectedImageMime };
+router._test = { canonicalImageMime, detectedImageMime, safeExtension };
 
 module.exports = router;
