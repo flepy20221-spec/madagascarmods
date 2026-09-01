@@ -65,6 +65,70 @@ test('rejeita conteudo que declara PNG mas nao possui assinatura de imagem', asy
   assert.equal(res.body.code, 'INVALID_EVIDENCE_CONTENT');
 });
 
+test('envia comprovante com token sem solicitar email ou codigo no formulario', async (t) => {
+  const originalGetClient = db.getClient;
+  const mission = {
+    id: 'mission-1',
+    reward_points: 500,
+    minimum_external_credits: 1800,
+    target_value: 1,
+  };
+  const calls = [];
+  const client = {
+    async query(sql, params) {
+      calls.push({ sql, params });
+      if (sql.includes('FROM missions')) return { rows: [mission] };
+      if (sql.includes('FROM users')) {
+        return { rows: [{ id: 'user-1', email: null, support_code: 'CP-ABCD-1234-EF56' }] };
+      }
+      if (sql.includes("s.status IN ('pending', 'approved')")) return { rows: [] };
+      if (sql.includes('WHERE evidence_sha256')) return { rows: [] };
+      if (sql.includes('INSERT INTO mission_evidence_submissions')) {
+        return {
+          rows: [{
+            id: params[0],
+            public_protocol: params[1],
+            status: 'pending',
+            submitted_at: new Date('2026-09-01T15:00:00.000Z'),
+            reviewed_at: null,
+            rejection_reason: null,
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  db.getClient = async () => client;
+  t.after(() => {
+    db.getClient = originalGetClient;
+  });
+
+  const token = createMissionProofToken({ userId: 'user-1', missionId: mission.id });
+  const req = {
+    body: {
+      access_token: token,
+      mission_slug: 'manus-account-proof',
+      attestation: 'true',
+    },
+    file: {
+      mimetype: 'image/png',
+      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]),
+      size: 12,
+      originalname: 'captura.png',
+    },
+    ip: '127.0.0.1',
+  };
+  const res = responseRecorder();
+  await submitEvidence(req, res);
+
+  assert.equal(res.statusCode, 201);
+  assert.equal(res.body.success, true);
+  assert.equal(calls.find((call) => call.sql.includes('FROM users')).params[0], 'user-1');
+  assert.equal(Object.hasOwn(req.body, 'email'), false);
+  assert.equal(Object.hasOwn(req.body, 'support_code'), false);
+});
+
 test('sessao por token confirma somente o codigo de suporte e o estado da missao', async (t) => {
   const originalQuery = db.query;
   const mission = {
