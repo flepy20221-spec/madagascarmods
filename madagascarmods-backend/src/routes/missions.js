@@ -55,6 +55,10 @@ function parseOptionalNonNegativeInteger(value) {
 // qualquer bonus de cadastro.
 // ============================================================================
 const SELF_DECLARED_TYPES = new Set(['app_review']);
+const MANUAL_EVIDENCE_TYPES = new Set(['manus_proof']);
+const MANUS_PROOF_SLUG = 'manus-account-proof';
+const MANUS_PROOF_PORTAL_URL = process.env.MANUS_PROOF_PORTAL_URL
+  || 'https://cashpix-manus-proof-production.up.railway.app/';
 
 // Aceita apenas a ficha de um aplicativo na Play Store. A validacao existe para
 // que um erro de digitacao no painel administrativo nao consiga apontar a base
@@ -78,10 +82,16 @@ function normalizeActionUrl(value) {
   const isPlayStorePage = host === 'play.google.com'
     && parsed.pathname === '/store/apps/details'
     && Boolean(parsed.searchParams.get('id'));
+  let isManusProofPortal = false;
+  try {
+    isManusProofPortal = parsed.origin === new URL(MANUS_PROOF_PORTAL_URL).origin;
+  } catch (_) {
+    // Uma variavel de ambiente invalida nao deve ampliar a lista de destinos.
+  }
   // market:// nao passa por new URL() com protocolo https, e a ficha web abre a
   // Play Store nativa por intent de qualquer forma. Um unico formato aceito
   // mantem a validacao simples e o comportamento previsivel.
-  return isPlayStorePage ? parsed.toString() : false;
+  return isPlayStorePage || isManusProofPortal ? parsed.toString() : false;
 }
 
 /**
@@ -175,7 +185,8 @@ router.get('/', authenticateToken, async (req, res) => {
     const missions = await db.query(
       `SELECT m.id, m.title, m.description, m.type, m.target_value, m.reward_points, m.icon, m.is_daily,
               m.verification_mode, m.action_url, m.requires_ad, m.cooldown_days,
-              m.min_seconds_before_claim,
+              m.min_seconds_before_claim, m.slug, m.evidence_required,
+              m.minimum_external_credits, m.instructions,
               COALESCE(mp.current_value, 0) as current_value,
               COALESCE(mp.is_completed, false) as is_completed,
               COALESCE(mp.is_claimed, false) as is_claimed,
@@ -245,6 +256,9 @@ router.get('/', authenticateToken, async (req, res) => {
       // ======================================================================
       let startedAt = mission.started_at;
       let isClaimed = mission.is_claimed;
+      let evidenceStatus = null;
+      let evidenceProtocol = null;
+      let evidenceRejectionReason = null;
 
       if (SELF_DECLARED_TYPES.has(mission.type) || mission.verification_mode === 'self_declared') {
         const activeClaim = await findActiveClaim(db, userId, mission, today);
@@ -265,6 +279,22 @@ router.get('/', authenticateToken, async (req, res) => {
           currentValue = currentCycle.rows[0]?.current_value ?? 0;
           startedAt = currentCycle.rows[0]?.started_at ?? null;
         }
+      }
+
+      if (MANUAL_EVIDENCE_TYPES.has(mission.type) || mission.verification_mode === 'manual_evidence') {
+        const evidence = await db.query(
+          `SELECT status, public_protocol, rejection_reason
+             FROM mission_evidence_submissions
+            WHERE user_id = $1 AND mission_id = $2
+            ORDER BY submitted_at DESC
+            LIMIT 1`,
+          [userId, mission.id]
+        );
+        const latestEvidence = evidence.rows[0] || null;
+        evidenceStatus = latestEvidence?.status || 'not_submitted';
+        evidenceProtocol = latestEvidence?.public_protocol || null;
+        evidenceRejectionReason = latestEvidence?.rejection_reason || null;
+        currentValue = evidenceStatus === 'approved' ? mission.target_value : 0;
       }
 
       const isCompleted = currentValue >= mission.target_value;
@@ -289,6 +319,13 @@ router.get('/', authenticateToken, async (req, res) => {
         cooldownDays: mission.cooldown_days || null,
         minSecondsBeforeClaim: mission.min_seconds_before_claim || 0,
         startedAt: startedAt ? new Date(startedAt).toISOString() : null,
+        slug: mission.slug || null,
+        evidenceRequired: mission.evidence_required === true,
+        minimumExternalCredits: Number(mission.minimum_external_credits) || 0,
+        instructions: mission.instructions || {},
+        evidenceStatus,
+        evidenceProtocol,
+        evidenceRejectionReason,
       });
     }
 
@@ -445,6 +482,8 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
 
     const isSelfDeclared = SELF_DECLARED_TYPES.has(m.type)
       || m.verification_mode === 'self_declared';
+    const isManualEvidence = MANUAL_EVIDENCE_TYPES.has(m.type)
+      || m.verification_mode === 'manual_evidence';
 
     // Verificar se já foi resgatada. findActiveClaim aplica cooldown_days quando
     // configurado e cai na regra historica (reset_date) quando nao ha cooldown.
@@ -513,6 +552,38 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(rejection.status).json(rejection.body);
       }
+    } else if (isManualEvidence) {
+      const lockedEvidence = await client.query(
+        `SELECT id, status
+           FROM mission_evidence_submissions
+          WHERE user_id = $1 AND mission_id = $2 AND status = 'approved'
+          ORDER BY reviewed_at DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [userId, missionId]
+      );
+      if (!lockedEvidence.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'Sua comprovacao ainda nao foi aprovada.',
+          code: 'MISSION_EVIDENCE_NOT_APPROVED',
+        });
+      }
+
+      const lockedProgress = await client.query(
+        `SELECT current_value, is_claimed
+           FROM mission_progress
+          WHERE user_id = $1 AND mission_id = $2
+          ORDER BY created_at DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [userId, missionId]
+      );
+      if (lockedProgress.rows[0]?.is_claimed) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Recompensa ja resgatada' });
+      }
+      currentValue = m.target_value;
     }
 
     if (currentValue < m.target_value) {
@@ -565,7 +636,12 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
 router.get('/admin/list', authenticateAdmin, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT * FROM missions ORDER BY sort_order ASC, created_at DESC`
+      `SELECT m.*,
+              (SELECT COUNT(*)::integer
+                 FROM mission_evidence_submissions s
+                WHERE s.mission_id = m.id AND s.status = 'pending') AS pending_evidence_count
+         FROM missions m
+        ORDER BY m.sort_order ASC, m.created_at DESC`
     );
     res.json({ success: true, missions: result.rows });
   } catch (error) {
@@ -602,6 +678,11 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
     const actionUrl = normalizeActionUrl(
       compatibleField(req.body, 'actionUrl', 'action_url')
     );
+    const evidenceRequired = compatibleField(req.body, 'evidenceRequired', 'evidence_required');
+    const minimumExternalCredits = parseOptionalNonNegativeInteger(
+      compatibleField(req.body, 'minimumExternalCredits', 'minimum_external_credits')
+    );
+    const instructions = compatibleField(req.body, 'instructions', 'instructions');
 
     if (!title || !type || targetValue === undefined || rewardPoints === undefined) {
       return res.status(400).json({ error: 'Campos obrigatórios: title, type, targetValue, rewardPoints' });
@@ -620,6 +701,15 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
     }
     if (requiresAd !== undefined && typeof requiresAd !== 'boolean') {
       return res.status(400).json({ error: 'requiresAd deve ser booleano' });
+    }
+    if (evidenceRequired !== undefined && typeof evidenceRequired !== 'boolean') {
+      return res.status(400).json({ error: 'evidenceRequired deve ser booleano' });
+    }
+    if (minimumExternalCredits === null) {
+      return res.status(400).json({ error: 'Creditos externos devem ser um numero inteiro maior ou igual a zero' });
+    }
+    if (instructions !== undefined && (typeof instructions !== 'object' || Array.isArray(instructions) || instructions === null)) {
+      return res.status(400).json({ error: 'instructions deve ser um objeto JSON' });
     }
     if (cooldownDays === null) {
       return res.status(400).json({ error: 'Cooldown deve ser um número inteiro maior que zero, ou vazio' });
@@ -641,33 +731,44 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
     // de aceitar do cliente evita a combinacao incoerente de uma missao de
     // avaliacao marcada como verificavel automaticamente — o servidor nao teria
     // como calcular progresso algum e a missao ficaria permanentemente travada.
-    const verificationMode = SELF_DECLARED_TYPES.has(type) ? 'self_declared' : 'auto';
+    const verificationMode = MANUAL_EVIDENCE_TYPES.has(type)
+      ? 'manual_evidence'
+      : (SELF_DECLARED_TYPES.has(type) ? 'self_declared' : 'auto');
 
     if (verificationMode === 'self_declared' && actionUrl === undefined) {
       return res.status(400).json({
         error: 'Missões de avaliação exigem a URL da ficha do aplicativo na Play Store.',
       });
     }
+    const effectiveActionUrl = verificationMode === 'manual_evidence'
+      ? (actionUrl ?? MANUS_PROOF_PORTAL_URL)
+      : (actionUrl ?? null);
 
     const result = await db.query(
       `INSERT INTO missions (
          title, description, type, target_value, reward_points, icon,
          is_active, is_daily, sort_order,
          verification_mode, action_url, requires_ad, cooldown_days,
-         min_seconds_before_claim
+         min_seconds_before_claim, slug, evidence_required,
+         minimum_external_credits, instructions
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+               $15, $16, $17, $18) RETURNING *`,
       [
         title, description || '', type, targetValue, rewardPoints, icon || 'star',
         isActive !== false, isDaily !== false, sortOrder ?? 0,
         verificationMode,
-        actionUrl ?? null,
+        effectiveActionUrl,
         // Default divergente por tipo, e proposital: uma missao de avaliacao leva
         // o usuario para fora do aplicativo e o traz de volta, e cobrar um anuncio
         // por cima disso e atrito sem contrapartida. As demais mantem `true`.
         requiresAd !== undefined ? requiresAd : verificationMode === 'auto',
         cooldownDays ?? null,
         minSecondsBeforeClaim ?? (verificationMode === 'self_declared' ? 15 : 0),
+        verificationMode === 'manual_evidence' ? MANUS_PROOF_SLUG : null,
+        verificationMode === 'manual_evidence' ? true : (evidenceRequired ?? false),
+        minimumExternalCredits ?? (verificationMode === 'manual_evidence' ? 1800 : 0),
+        instructions ? JSON.stringify(instructions) : JSON.stringify({}),
       ]
     );
 
@@ -706,6 +807,12 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
       compatibleField(req.body, 'actionUrl', 'action_url')
     );
 
+    const evidenceRequired = compatibleField(req.body, 'evidenceRequired', 'evidence_required');
+    const minimumExternalCredits = parseOptionalNonNegativeInteger(
+      compatibleField(req.body, 'minimumExternalCredits', 'minimum_external_credits')
+    );
+    const instructions = compatibleField(req.body, 'instructions', 'instructions');
+
     // Cooldown difere dos outros inteiros: `null` explicito e um valor valido,
     // significa "remover o cooldown". Por isso nao passa por
     // parseOptionalPositiveInteger, que trata null como erro de digitacao.
@@ -737,6 +844,15 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
     if (requiresAd !== undefined && typeof requiresAd !== 'boolean') {
       return res.status(400).json({ error: 'requiresAd deve ser booleano' });
     }
+    if (evidenceRequired !== undefined && typeof evidenceRequired !== 'boolean') {
+      return res.status(400).json({ error: 'evidenceRequired deve ser booleano' });
+    }
+    if (minimumExternalCredits === null) {
+      return res.status(400).json({ error: 'Creditos externos devem ser um numero inteiro maior ou igual a zero' });
+    }
+    if (instructions !== undefined && (typeof instructions !== 'object' || Array.isArray(instructions) || instructions === null)) {
+      return res.status(400).json({ error: 'instructions deve ser um objeto JSON' });
+    }
     if (minSecondsBeforeClaim === null) {
       return res.status(400).json({ error: 'Espera mínima deve ser um número inteiro maior ou igual a zero' });
     }
@@ -755,7 +871,9 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
     // parcial, por exemplo so a recompensa), COALESCE preserva o valor atual.
     const verificationMode = type === undefined
       ? null
-      : (SELF_DECLARED_TYPES.has(type) ? 'self_declared' : 'auto');
+      : (MANUAL_EVIDENCE_TYPES.has(type)
+        ? 'manual_evidence'
+        : (SELF_DECLARED_TYPES.has(type) ? 'self_declared' : 'auto'));
 
     const result = await db.query(
       `UPDATE missions SET 
@@ -773,6 +891,10 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
         requires_ad = COALESCE($14, requires_ad),
         cooldown_days = CASE WHEN $15::boolean THEN $16::integer ELSE cooldown_days END,
         min_seconds_before_claim = COALESCE($17, min_seconds_before_claim),
+        slug = CASE WHEN $18 = 'manual_evidence' THEN $19 ELSE slug END,
+        evidence_required = COALESCE($20, evidence_required),
+        minimum_external_credits = COALESCE($21, minimum_external_credits),
+        instructions = COALESCE($22::jsonb, instructions),
         updated_at = NOW()
        WHERE id = $10 RETURNING *`,
       [
@@ -785,6 +907,11 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
         requiresAd,
         cooldownDays !== undefined, cooldownDays ?? null,
         minSecondsBeforeClaim,
+        verificationMode,
+        MANUS_PROOF_SLUG,
+        verificationMode === 'manual_evidence' ? true : evidenceRequired,
+        minimumExternalCredits,
+        instructions ? JSON.stringify(instructions) : null,
       ]
     );
 

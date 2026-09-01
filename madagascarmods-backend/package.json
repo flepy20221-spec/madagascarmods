@@ -7,7 +7,7 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "migrate": "node src/migrate.js",
-    "test": "node --test test/pointsRandom.test.js tests/concurrency.test.js tests/device_account_route.test.js tests/device_identity.test.js tests/hmac_compat.test.js tests/mission_admin_contract.test.js tests/pix_withdrawal_persistence.test.js tests/reward_polling_antifraud.test.js tests/ssv_reward_credit.test.js tests/ssv_verification.test.js tests/admin_users_totals.test.js tests/ip_limit_floor.test.js tests/ip_burst_replay.test.js tests/device_rate_limit.test.js tests/general_rate_limit_key.test.js",
+    "test": "node --test test/pointsRandom.test.js tests/concurrency.test.js tests/device_account_route.test.js tests/device_identity.test.js tests/hmac_compat.test.js tests/mission_admin_contract.test.js tests/mission_evidence_contract.test.js tests/pix_withdrawal_persistence.test.js tests/reward_polling_antifraud.test.js tests/ssv_reward_credit.test.js tests/ssv_verification.test.js tests/admin_users_totals.test.js tests/ip_limit_floor.test.js tests/ip_burst_replay.test.js tests/device_rate_limit.test.js tests/general_rate_limit_key.test.js",
     "test:ssv": "node --test tests/ssv_reward_credit.test.js tests/ssv_verification.test.js",
     "test:ip": "node --test tests/ip_limit_cgnat.test.js",
     "test:limits": "node --test tests/ip_limit_floor.test.js tests/ip_burst_replay.test.js",
@@ -23,10 +23,11 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.4",
+    "firebase-admin": "^12.0.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
     "pg": "^8.11.3",
-    "firebase-admin": "^12.0.0",
     "uuid": "^11.1.1"
   },
   "devDependencies": {

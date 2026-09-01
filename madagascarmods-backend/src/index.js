@@ -26,6 +26,7 @@ const checkinRoutes = require('./routes/checkin');
 const referralRoutes = require('./routes/referral');
 const pushRoutes = require('./routes/push');
 const missionsRoutes = require('./routes/missions');
+const missionEvidenceRoutes = require('./routes/missionEvidence');
 const myIpRoutes = require('./routes/myip');
 
 const app = express();
@@ -350,6 +351,7 @@ app.use('/api/ssv', ssvRoutes);
 app.use('/api/checkin', checkinRoutes);
 app.use('/api/referral', referralRoutes);
 app.use('/api/push', pushRoutes);
+app.use('/api/mission-evidence', missionEvidenceRoutes);
 
 // Limpeza diaria de tokens push mortos (03:30 Brasilia). Sem mexer no app:
 // tokens que o FCM reporta como invalidos (desinstalacao, reinstalacao,

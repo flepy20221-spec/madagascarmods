@@ -83,7 +83,47 @@ test('cria missão aceitando o formato snake_case usado pelo painel antigo', asy
     true,    // requires_ad
     null,    // cooldown_days
     0,       // min_seconds_before_claim
+    null,    // slug
+    false,   // evidence_required
+    0,       // minimum_external_credits
+    '{}',    // instructions
   ]);
+});
+
+test('cria missão Manus com comprovacao manual e defaults seguros', async (t) => {
+  const originalQuery = db.query;
+  let capturedParams;
+  db.query = async (_sql, params) => {
+    capturedParams = params;
+    return { rows: [{ id: 'manus-mission', reward_points: params[4] }] };
+  };
+  t.after(() => {
+    db.query = originalQuery;
+  });
+
+  const res = responseRecorder();
+  await createMission(
+    {
+      body: {
+        title: 'Cadastre-se no Manus',
+        type: 'manus_proof',
+        targetValue: 1,
+        rewardPoints: 500,
+        isDaily: false,
+      },
+    },
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(capturedParams[4], 500);
+  assert.equal(capturedParams[7], false);
+  assert.equal(capturedParams[9], 'manual_evidence');
+  assert.match(capturedParams[10], /^https:\/\/cashpix-manus-proof-production\.up\.railway\.app\/?$/);
+  assert.equal(capturedParams[11], false);
+  assert.equal(capturedParams[14], 'manus-account-proof');
+  assert.equal(capturedParams[15], true);
+  assert.equal(capturedParams[16], 1800);
 });
 
 test('cria missão aceitando o formato camelCase enviado pelo painel corrigido', async (t) => {
