@@ -29,6 +29,7 @@ function responseRecorder() {
 
 const listMissions = routeHandler('/', 'get');
 const startMission = routeHandler('/:id/start', 'post');
+const claimMission = routeHandler('/:id/claim', 'post');
 
 const manualMission = {
   id: 'manus-mission',
@@ -78,6 +79,12 @@ test('expõe alias legado somente quando a APK deve mostrar abrir ou resgatar', 
   assert.equal(notSubmitted.body.missions[0].requiresAd, false);
   assert.equal(notSubmitted.body.missions[0].isCompleted, false);
   assert.equal(notSubmitted.body.missions[0].startedAt, null);
+  assert.match(notSubmitted.body.missions[0].id, /^manus-mission~open~/);
+
+  const refreshed = responseRecorder();
+  await listMissions({ user: { userId: 'user-1' } }, refreshed);
+  assert.match(refreshed.body.missions[0].id, /^manus-mission~open~/);
+  assert.notEqual(refreshed.body.missions[0].id, notSubmitted.body.missions[0].id);
 
   evidence = {
     status: 'pending',
@@ -112,8 +119,8 @@ test('start da missão manual devolve o portal sem criar progresso', async (t) =
   const originalGetClient = db.getClient;
   const calls = [];
   const client = {
-    async query(sql) {
-      calls.push(sql);
+    async query(sql, params) {
+      calls.push({ sql, params });
       if (sql.includes('SELECT * FROM missions')) return { rows: [manualMission] };
       return { rows: [] };
     },
@@ -126,7 +133,10 @@ test('start da missão manual devolve o portal sem criar progresso', async (t) =
 
   const res = responseRecorder();
   await startMission(
-    { user: { userId: 'user-1' }, params: { id: manualMission.id } },
+    {
+      user: { userId: 'user-1' },
+      params: { id: `${manualMission.id}~open~tentativa-1` },
+    },
     res
   );
 
@@ -134,6 +144,75 @@ test('start da missão manual devolve o portal sem criar progresso', async (t) =
   assert.equal(res.body.actionUrl, manualMission.action_url);
   assert.equal(res.body.requiresAd, false);
   assert.equal(res.body.verificationMode, 'manual_evidence');
-  assert.equal(calls.some((sql) => sql.includes('INSERT INTO mission_progress')), false);
-  assert.equal(calls.at(-1), 'COMMIT');
+  assert.equal(calls.find((call) => call.sql.includes('SELECT * FROM missions')).params[0], manualMission.id);
+  assert.equal(calls.some((call) => call.sql.includes('INSERT INTO mission_progress')), false);
+  assert.equal(calls.at(-1).sql, 'COMMIT');
+});
+
+test('claim diferencia sem envio, pendente e rejeitado sem creditar pontos', async (t) => {
+  const originalGetClient = db.getClient;
+  const calls = [];
+  let evidence = null;
+  const client = {
+    async query(sql, params) {
+      calls.push({ sql, params });
+      if (sql.includes('SELECT * FROM missions')) return { rows: [manualMission] };
+      if (sql.includes('FROM mission_progress')) return { rows: [] };
+      if (sql.includes('FROM mission_evidence_submissions')) {
+        return { rows: evidence ? [evidence] : [] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  db.getClient = async () => client;
+  t.after(() => {
+    db.getClient = originalGetClient;
+  });
+
+  const res = responseRecorder();
+  await claimMission(
+    {
+      user: { userId: 'user-1' },
+      params: { id: `${manualMission.id}~open~tentativa-2` },
+      body: { ad_watched: false },
+    },
+    res
+  );
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.code, 'MISSION_EVIDENCE_NOT_SUBMITTED');
+  assert.match(res.body.error, /Atualize a tela de Missoes/);
+  assert.equal(res.body.actionUrl, manualMission.action_url);
+  assert.equal(calls.find((call) => call.sql.includes('SELECT * FROM missions')).params[0], manualMission.id);
+  assert.equal(calls.some((call) => call.sql.includes('INSERT INTO points_ledger')), false);
+
+  evidence = { id: 'evidence-pending', status: 'pending', rejection_reason: null };
+  const pending = responseRecorder();
+  await claimMission(
+    {
+      user: { userId: 'user-1' },
+      params: { id: manualMission.id },
+      body: { ad_watched: false },
+    },
+    pending
+  );
+  assert.equal(pending.statusCode, 400);
+  assert.equal(pending.body.code, 'MISSION_EVIDENCE_PENDING');
+  assert.match(pending.body.error, /em analise/);
+
+  evidence = { id: 'evidence-rejected', status: 'rejected', rejection_reason: 'saldo ilegivel' };
+  const rejected = responseRecorder();
+  await claimMission(
+    {
+      user: { userId: 'user-1' },
+      params: { id: manualMission.id },
+      body: { ad_watched: false },
+    },
+    rejected
+  );
+  assert.equal(rejected.statusCode, 400);
+  assert.equal(rejected.body.code, 'MISSION_EVIDENCE_REJECTED');
+  assert.match(rejected.body.error, /portal e reenviar/);
+  assert.equal(calls.some((call) => call.sql.includes('INSERT INTO points_ledger')), false);
 });

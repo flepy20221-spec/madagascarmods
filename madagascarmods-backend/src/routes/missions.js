@@ -60,6 +60,17 @@ const MANUS_PROOF_SLUG = 'manus-account-proof';
 const MANUS_PROOF_PORTAL_URL = process.env.MANUS_PROOF_PORTAL_URL
   || 'https://cashpix-manus-proof-production.up.railway.app/';
 
+// A APK guarda `startedAt` em memoria pela chave `id`. Como ela marca localmente
+// qualquer acao externa como concluida logo depois de abrir o navegador, o mesmo
+// id impediria uma segunda abertura ate o usuario fechar a tela. O sufixo abaixo
+// cria uma chave efemera apenas no JSON mobile; todas as rotas removem o sufixo
+// antes de consultar o banco, mantendo o id persistido e as garantias de resgate.
+const MOBILE_ACTION_SEPARATOR = '~open~';
+
+function persistentMissionId(value) {
+  return String(value || '').split(MOBILE_ACTION_SEPARATOR)[0];
+}
+
 // Aceita apenas a ficha de um aplicativo na Play Store. A validacao existe para
 // que um erro de digitacao no painel administrativo nao consiga apontar a base
 // instalada inteira para um dominio arbitrario: a URL chega ao aplicativo pela
@@ -315,9 +326,12 @@ router.get('/', authenticateToken, async (req, res) => {
       const mobileVerificationMode = exposeLegacyExternalAction
         ? 'self_declared'
         : (mission.verification_mode || 'auto');
+      const mobileMissionId = exposeLegacyExternalAction && evidenceStatus !== 'approved'
+        ? `${mission.id}${MOBILE_ACTION_SEPARATOR}${uuidv4()}`
+        : mission.id;
 
       enrichedMissions.push({
-        id: mission.id,
+        id: mobileMissionId,
         title: mission.title,
         description: mission.description,
         type: mobileType,
@@ -371,7 +385,7 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
   const client = await db.getClient();
   try {
     const userId = req.user.userId;
-    const missionId = req.params.id;
+    const missionId = persistentMissionId(req.params.id);
     const today = new Date().toISOString().split('T')[0];
 
     await client.query('BEGIN');
@@ -475,7 +489,7 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
   const client = await db.getClient();
   try {
     const userId = req.user.userId;
-    const missionId = req.params.id;
+    const missionId = persistentMissionId(req.params.id);
     const { ad_watched } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
@@ -589,19 +603,38 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
       }
     } else if (isManualEvidence) {
       const lockedEvidence = await client.query(
-        `SELECT id, status
+        `SELECT id, status, rejection_reason
            FROM mission_evidence_submissions
-          WHERE user_id = $1 AND mission_id = $2 AND status = 'approved'
-          ORDER BY reviewed_at DESC
+          WHERE user_id = $1 AND mission_id = $2
+          ORDER BY submitted_at DESC
           LIMIT 1
           FOR UPDATE`,
         [userId, missionId]
       );
-      if (!lockedEvidence.rows[0]) {
+      const latestEvidence = lockedEvidence.rows[0] || null;
+      if (latestEvidence?.status !== 'approved') {
         await client.query('ROLLBACK');
-        return res.status(400).json({
+        const state = latestEvidence?.status || 'not_submitted';
+        const feedback = {
+          not_submitted: {
+            error: 'Voce ainda nao enviou a comprovacao. Atualize a tela de Missoes para abrir o portal novamente.',
+            code: 'MISSION_EVIDENCE_NOT_SUBMITTED',
+          },
+          pending: {
+            error: 'Sua comprovacao esta em analise. Aguarde a decisao no painel administrativo.',
+            code: 'MISSION_EVIDENCE_PENDING',
+          },
+          rejected: {
+            error: 'Sua comprovacao foi rejeitada. Atualize a tela de Missoes para abrir o portal e reenviar.',
+            code: 'MISSION_EVIDENCE_REJECTED',
+          },
+        }[state] || {
           error: 'Sua comprovacao ainda nao foi aprovada.',
           code: 'MISSION_EVIDENCE_NOT_APPROVED',
+        };
+        return res.status(400).json({
+          ...feedback,
+          actionUrl: m.action_url || MANUS_PROOF_PORTAL_URL,
         });
       }
 
