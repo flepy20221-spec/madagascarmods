@@ -381,6 +381,12 @@ startDailyJob();
 const { scheduleJob: scheduleAbandonedJob } = require('./services/abandonedAccounts');
 scheduleAbandonedJob();
 
+// Revalida uma unica vez os destinos FaucetPay que ficaram pendentes antes da
+// aprovacao automatica. A rotina apenas consulta /checkaddress: nao cria ou
+// processa pagamentos e deixa indisponibilidades externas para nova tentativa.
+const { runOnStartup: revalidatePendingPayoutsOnStartup } = require('./services/payoutDestinationAutoApproval');
+revalidatePendingPayoutsOnStartup();
+
 app.use('/api/missions', missionsRoutes);
 app.use('/api/', myIpRoutes);
 

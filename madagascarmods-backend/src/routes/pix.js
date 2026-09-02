@@ -4,8 +4,8 @@ const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
 const { antifraudMiddleware } = require('../middleware/antiFraud');
 const { payoutSetupLimiter } = require('../middleware/rateLimits');
-const { encrypt, hashValue } = require('../utils/crypto');
-const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
+const { validatePixPayload } = require('../utils/payoutHelpers');
+const { hashValue } = require('../utils/crypto');
 
 const router = express.Router();
 
@@ -91,127 +91,115 @@ router.get('/status', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/pix/submit - Submit PIX account for approval
+// POST /api/pix/submit - Validate and auto-approve PIX account
 // payoutSetupLimiter: 10 tentativas/hora por usuario. Sem esse limite, o endpoint podia
 // ser usado para testar CPFs em massa contra as validacoes do servidor. (auditoria VULN-10)
 router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddleware, async (req, res) => {
+  const validation = validatePixPayload(req.body || {});
+  if (!validation.ok) {
+    return res.status(validation.status).json({ error: validation.error, code: validation.code });
+  }
+
+  const {
+    cpf: cleanCpf,
+    fullName,
+    pixKeyType,
+    pixKeyValue,
+    pixKeyMasked,
+  } = validation.data;
+  const cpfHash = hashValue(cleanCpf);
+  const userId = req.user.userId;
+  let client;
   try {
-    const { cpf, full_name, pix_key_type, pix_key_value } = req.body;
-    const userId = req.user.userId;
+    client = await db.getClient();
+    await client.query('BEGIN');
+    await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`pix:${pixKeyValue}`]);
 
-    // Validations
-    if (!cpf || !full_name || !pix_key_type || !pix_key_value) {
-      return res.status(400).json({ error: 'Todos os campos são obrigatórios: CPF, nome completo, tipo de chave e valor da chave' });
-    }
-
-    const cleanCpf = cpf.replace(/\D/g, '');
-    if (!validateCpf(cleanCpf)) {
-      return res.status(400).json({ error: 'CPF inválido', code: 'INVALID_CPF' });
-    }
-
-    if (full_name.trim().length < 5) {
-      return res.status(400).json({ error: 'Nome completo deve ter pelo menos 5 caracteres' });
-    }
-
-    if (!['cpf', 'email'].includes(pix_key_type)) {
-      return res.status(400).json({ error: 'Tipo de chave PIX deve ser "cpf" ou "email"' });
-    }
-
-    if (pix_key_type === 'email' && !pix_key_value.includes('@')) {
-      return res.status(400).json({ error: 'E-mail da chave PIX inválido' });
-    }
-
-    if (pix_key_type === 'cpf') {
-      const cleanPixKey = pix_key_value.replace(/\D/g, '');
-      if (!validateCpf(cleanPixKey)) {
-        return res.status(400).json({ error: 'CPF da chave PIX inválido' });
-      }
-    }
-
-    // Check if user already has a pending PIX request
-    const existing = await db.query(
-      `SELECT id, status FROM pix_accounts 
-       WHERE user_id = $1 AND status = 'PENDING' AND is_active = true`,
-      [userId]
+    const unchanged = await client.query(
+      `SELECT id, status, cpf, full_name, pix_key_type, pix_key_masked
+       FROM pix_accounts
+       WHERE user_id = $1 AND cpf_hash = $2 AND LOWER(pix_key_value) = LOWER($3)
+         AND pix_key_type = $4 AND full_name = $5 AND status = 'APPROVED' AND is_active = true
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId, cpfHash, pixKeyValue, pixKeyType, fullName]
     );
-
-    if (existing.rows.length > 0) {
-      return res.status(409).json({
-        error: 'Você já tem uma solicitação PIX pendente',
-        code: 'PENDING_EXISTS'
+    if (unchanged.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.json({
+        success: true,
+        message: 'Esta chave PIX já está aprovada.',
+        pixAccount: {
+          id: unchanged.rows[0].id,
+          status: unchanged.rows[0].status,
+          cpfMasked: maskCpf(unchanged.rows[0].cpf),
+          fullName: unchanged.rows[0].full_name,
+          pixKeyType: unchanged.rows[0].pix_key_type,
+          pixKeyMasked: unchanged.rows[0].pix_key_masked
+        }
       });
     }
 
-    // Check CPF uniqueness (1 account per CPF)
-    const cpfHash = hashValue(cleanCpf);
-    const cpfCheck = await db.query(
+    const cpfCheck = await client.query(
       `SELECT id, user_id FROM pix_accounts 
        WHERE cpf_hash = $1 AND user_id != $2 AND is_active = true AND status IN ('PENDING', 'APPROVED')`,
       [cpfHash, userId]
     );
 
     if (cpfCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
       return res.status(409).json({
         error: 'Este CPF já está vinculado a outra conta.',
         code: 'CPF_ALREADY_USED'
       });
     }
 
-    // Deactivate previous PIX accounts for this user
-    await db.query(
+    const keyCheck = await client.query(
+      `SELECT id FROM pix_accounts
+       WHERE LOWER(pix_key_value) = LOWER($1) AND user_id != $2
+         AND is_active = true AND status IN ('PENDING', 'APPROVED')`,
+      [pixKeyValue, userId]
+    );
+    if (keyCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Esta chave PIX já está vinculada a outra conta.',
+        code: 'PIX_KEY_ALREADY_USED'
+      });
+    }
+
+    await client.query(
       'UPDATE pix_accounts SET is_active = false, updated_at = NOW() WHERE user_id = $1 AND is_active = true',
       [userId]
     );
-
-    // Identificacao do usuario na notificacao ao admin. Nao ha JOIN mais barato aqui:
-    // o painel exibe o e-mail interno device-*@cashpix.local, e e por ele que o admin
-    // localiza a conta na fila de aprovacao.
-    const userRow = await db.query('SELECT email FROM users WHERE id = $1', [userId]);
-    const userEmail = userRow.rows[0]?.email || userId.substring(0, 8);
-
-    // Create new PIX account
     const pixId = uuidv4();
-    const pixKeyMasked = maskPixKey(pix_key_type, pix_key_value.trim());
-
-    await db.query(
-      `INSERT INTO pix_accounts (id, user_id, cpf, cpf_hash, full_name, pix_key_type, pix_key_value, pix_key_masked, status, is_active, submitted_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', true, NOW())`,
-      [pixId, userId, cleanCpf, cpfHash, full_name.trim(), pix_key_type, pix_key_value.trim().toLowerCase(), pixKeyMasked]
+    await client.query(
+      `INSERT INTO pix_accounts
+         (id, user_id, cpf, cpf_hash, full_name, pix_key_type, pix_key_value, pix_key_masked, status, is_active, submitted_at, reviewed_at, reviewed_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'APPROVED', true, NOW(), NOW(), NULL)`,
+      [pixId, userId, cleanCpf, cpfHash, fullName, pixKeyType, pixKeyValue, pixKeyMasked]
     );
-
-    // Audit log
-    await db.query(
+    await client.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value)
-       VALUES ($1, 'user', 'PIX_ACCOUNT_SUBMITTED', 'pix_account', $2, $3)`,
-      [userId, pixId, JSON.stringify({ cpf_masked: maskCpf(cleanCpf), pix_key_type, pix_key_masked: pixKeyMasked })]
+       VALUES ($1, 'system', 'PIX_ACCOUNT_AUTO_APPROVED', 'pix_account', $2, $3)`,
+      [userId, pixId, JSON.stringify({ cpf_masked: maskCpf(cleanCpf), pix_key_type: pixKeyType, pix_key_masked: pixKeyMasked, validation: 'local' })]
     );
+    await client.query('COMMIT');
 
-    // ------------------------------------------------------------------------------
-    // Aviso ao admin. Somente dados MASCARADOS saem daqui: CPF e chave PIX completos
-    // jamais devem trafegar para Discord ou Telegram. O nome tambem e reduzido ao
-    // primeiro nome, suficiente para conferencia visual na fila de aprovacao.
-    // ------------------------------------------------------------------------------
-    notifyAdmin('PIX_KEY_SUBMITTED', {
-      'Usuario': userEmail,
-      'Nome': full_name.trim().split(/\s+/)[0],
-      'CPF': maskCpf(cleanCpf),
-      'Tipo de chave': pix_key_type.toUpperCase(),
-      'Chave': pixKeyMasked,
-    }, { link: panelLink('/contas-pix'), footer: 'Aguardando aprovacao manual' });
-
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      message: 'Conta PIX enviada para aprovação',
+      message: 'Chave PIX aprovada automaticamente.',
       pixAccount: {
         id: pixId,
-        status: 'PENDING',
+        status: 'APPROVED',
         cpfMasked: maskCpf(cleanCpf),
-        fullName: full_name.trim(),
-        pixKeyType: pix_key_type,
+        fullName,
+        pixKeyType,
         pixKeyMasked: pixKeyMasked
       }
     });
   } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('Submit PIX error:', error);
     if (error.code === '23505') {
       // Unique constraint violation (CPF already used)
@@ -221,6 +209,8 @@ router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddlewar
       });
     }
     res.status(500).json({ error: 'Falha ao cadastrar conta PIX' });
+  } finally {
+    client?.release();
   }
 });
 

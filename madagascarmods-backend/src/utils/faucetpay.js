@@ -53,6 +53,9 @@ function httpPost(url, formData) {
     });
 
     req.on('error', reject);
+    req.setTimeout(15000, () => {
+      req.destroy(new Error('Timeout na comunicacao com a FaucetPay'));
+    });
     req.write(postData);
     req.end();
   });
@@ -189,6 +192,66 @@ async function getBalance() {
   };
 }
 
+/** Interpreta o resultado logico retornado por POST /checkaddress. */
+function interpretCheckAddressResult(result) {
+  const status = Number(result?.status);
+  const message = String(result?.message || 'Resposta inesperada da FaucetPay');
+  if (status === 200 && result?.payout_user_hash) {
+    return {
+      verified: true,
+      temporary: false,
+      code: 'FAUCETPAY_ACCOUNT_VERIFIED',
+      payoutUserHash: String(result.payout_user_hash),
+      message,
+    };
+  }
+  if (status === 456) {
+    return {
+      verified: false,
+      temporary: false,
+      code: 'FAUCETPAY_ACCOUNT_NOT_PAYABLE',
+      message,
+    };
+  }
+  return {
+    verified: false,
+    temporary: true,
+    code: `FAUCETPAY_CHECK_${Number.isFinite(status) ? status : 'UNKNOWN'}`,
+    message,
+  };
+}
+
+/**
+ * Confirma se um e-mail pertence a uma conta FaucetPay pagavel em LTC.
+ * A operacao apenas consulta o cadastro: nao cria conta e nao movimenta saldo.
+ */
+async function checkAddress({ address, currency = 'LTC' }) {
+  if (!FAUCETPAY_API_KEY) {
+    return {
+      verified: false,
+      temporary: true,
+      code: 'FAUCETPAY_KEY_MISSING',
+      message: 'FAUCETPAY_API_KEY nao configurada',
+    };
+  }
+
+  try {
+    const result = await httpPost(`${FAUCETPAY_API_URL}/checkaddress`, {
+      api_key: FAUCETPAY_API_KEY,
+      address: String(address || '').trim().toLowerCase(),
+      currency: String(currency || 'LTC').toUpperCase(),
+    });
+    return interpretCheckAddressResult(result);
+  } catch (error) {
+    return {
+      verified: false,
+      temporary: true,
+      code: 'FAUCETPAY_CHECK_UNAVAILABLE',
+      message: error?.message || 'Falha temporaria ao consultar a FaucetPay',
+    };
+  }
+}
+
 /**
  * Envia pagamento via FaucetPay.
  * 
@@ -256,6 +319,8 @@ module.exports = {
   getLtcBrlRate,
   convertBrlToLtc,
   getBalance,
+  checkAddress,
   sendPayment,
   FAUCETPAY_API_KEY,
+  _test: { interpretCheckAddressResult },
 };
