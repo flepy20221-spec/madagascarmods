@@ -97,7 +97,8 @@ router.get('/status', authenticateToken, async (req, res) => {
 router.post('/submit', payoutSetupLimiter, authenticateToken, antifraudMiddleware, async (req, res) => {
   const validation = validatePixPayload(req.body || {});
   if (!validation.ok) {
-    return res.status(validation.status).json({ error: validation.error, code: validation.code });
+    const status = Number.isInteger(validation.status) ? validation.status : 400;
+    return res.status(status).json({ error: validation.error, code: validation.code });
   }
 
   const {

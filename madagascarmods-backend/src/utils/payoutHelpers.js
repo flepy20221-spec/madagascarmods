@@ -17,6 +17,8 @@
  * duplicatas invisiveis.
  */
 
+const { encrypt, hashValue, maskEmail } = require('./crypto');
+
 /** Normaliza CPF para 11 digitos. */
 function cleanCpf(cpf) {
   return String(cpf || '').replace(/\D/g, '');
@@ -87,9 +89,33 @@ function normalizeEmail(value) {
 }
 
 /**
+ * Valida e prepara um e-mail FaucetPay no mesmo formato historicamente gravado.
+ * O retorno inclui status HTTP para que o roteador nunca tente usar `undefined`.
+ */
+function validatePayoutDestination(email) {
+  const normalized = normalizeEmail(email);
+  if (!isValidEmail(normalized)) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'E-mail FaucetPay invalido',
+      code: 'INVALID_FAUCETPAY_EMAIL'
+    };
+  }
+
+  return {
+    ok: true,
+    normalized,
+    encrypted: encrypt(normalized),
+    hash: hashValue(normalized),
+    masked: maskEmail(normalized)
+  };
+}
+
+/**
  * Valida um conjunto completo de dados PIX e devolve a forma normalizada.
  *
- * Retorna `{ ok: false, error, code }` em caso de dado invalido, ou
+ * Retorna `{ ok: false, status, error, code }` em caso de dado invalido, ou
  * `{ ok: true, data: { cpf, fullName, pixKeyType, pixKeyValue, pixKeyMasked } }`.
  *
  * Centralizar o retorno desta forma evita que o router do admin repita
@@ -99,6 +125,7 @@ function validatePixPayload({ cpf, full_name, pix_key_type, pix_key_value }) {
   if (!cpf || !full_name || !pix_key_type || !pix_key_value) {
     return {
       ok: false,
+      status: 400,
       error: 'CPF, nome completo, tipo de chave e valor da chave sao obrigatorios',
       code: 'MISSING_FIELDS'
     };
@@ -106,13 +133,14 @@ function validatePixPayload({ cpf, full_name, pix_key_type, pix_key_value }) {
 
   const normalizedCpf = cleanCpf(cpf);
   if (!validateCpf(normalizedCpf)) {
-    return { ok: false, error: 'CPF invalido', code: 'INVALID_CPF' };
+    return { ok: false, status: 400, error: 'CPF invalido', code: 'INVALID_CPF' };
   }
 
   const fullName = String(full_name).trim().replace(/\s+/g, ' ');
   if (fullName.length < 5 || fullName.length > 255) {
     return {
       ok: false,
+      status: 400,
       error: 'Nome completo deve ter entre 5 e 255 caracteres',
       code: 'INVALID_NAME'
     };
@@ -121,6 +149,7 @@ function validatePixPayload({ cpf, full_name, pix_key_type, pix_key_value }) {
   if (!['cpf', 'email'].includes(pix_key_type)) {
     return {
       ok: false,
+      status: 400,
       error: 'Tipo de chave PIX deve ser "cpf" ou "email"',
       code: 'INVALID_KEY_TYPE'
     };
@@ -132,6 +161,7 @@ function validatePixPayload({ cpf, full_name, pix_key_type, pix_key_value }) {
     if (!validateCpf(pixKeyValue)) {
       return {
         ok: false,
+        status: 400,
         error: 'CPF informado como chave PIX e invalido',
         code: 'INVALID_PIX_KEY_CPF'
       };
@@ -141,6 +171,7 @@ function validatePixPayload({ cpf, full_name, pix_key_type, pix_key_value }) {
     if (!isValidEmail(pixKeyValue)) {
       return {
         ok: false,
+        status: 400,
         error: 'E-mail informado como chave PIX e invalido',
         code: 'INVALID_PIX_KEY_EMAIL'
       };
@@ -167,5 +198,6 @@ module.exports = {
   validateCpf,
   isValidEmail,
   normalizeEmail,
+  validatePayoutDestination,
   validatePixPayload
 };

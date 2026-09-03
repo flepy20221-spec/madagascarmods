@@ -8,7 +8,7 @@ const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..');
 const read = (relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8');
 const { _test: faucetPayTest } = require('../src/utils/faucetpay');
-const { validatePixPayload } = require('../src/utils/payoutHelpers');
+const { validatePayoutDestination, validatePixPayload } = require('../src/utils/payoutHelpers');
 
 test('FaucetPay classifica conta confirmada, inexistente e indisponibilidade sem pagar', () => {
   const verified = faucetPayTest.interpretCheckAddressResult({
@@ -41,19 +41,38 @@ test('PIX mantém validações locais estritas antes da aprovação', () => {
   assert.equal(valid.ok, true);
   assert.equal(valid.data.pixKeyValue, 'ana.pix@exemplo.com');
 
-  assert.equal(validatePixPayload({
+  const invalidCpf = validatePixPayload({
     cpf: '11111111111',
     full_name: 'Ana Maria Souza',
     pix_key_type: 'cpf',
     pix_key_value: '11111111111',
-  }).code, 'INVALID_CPF');
+  });
+  assert.equal(invalidCpf.code, 'INVALID_CPF');
+  assert.equal(invalidCpf.status, 400);
 
-  assert.equal(validatePixPayload({
+  const invalidEmail = validatePixPayload({
     cpf: '52998224725',
     full_name: 'Ana Maria Souza',
     pix_key_type: 'email',
     pix_key_value: 'email-invalido',
-  }).code, 'INVALID_PIX_KEY_EMAIL');
+  });
+  assert.equal(invalidEmail.code, 'INVALID_PIX_KEY_EMAIL');
+  assert.equal(invalidEmail.status, 400);
+});
+
+test('FaucetPay valida, normaliza e prepara o destino sem função ausente', () => {
+  const invalid = validatePayoutDestination('email-invalido');
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.code, 'INVALID_FAUCETPAY_EMAIL');
+
+  const valid = validatePayoutDestination('  ANA.PIX@EXEMPLO.COM  ');
+  assert.equal(valid.ok, true);
+  assert.equal(valid.normalized, 'ana.pix@exemplo.com');
+  assert.match(valid.hash, /^[a-f0-9]{64}$/);
+  assert.equal(valid.masked, 'an***x@exemplo.com');
+  assert.equal(typeof valid.encrypted, 'string');
+  assert.ok(valid.encrypted.length > 0);
 });
 
 test('cadastros são aprovados em transação e auditados como sistema', () => {
@@ -61,6 +80,7 @@ test('cadastros são aprovados em transação e auditados como sistema', () => {
   const pixRoute = read('src/routes/pix.js');
 
   assert.match(payoutRoute, /checkAddress\(\{ address: validation\.normalized, currency: 'LTC' \}\)/);
+  assert.match(payoutRoute, /Number\.isInteger\(validation\.status\) \? validation\.status : 400/);
   assert.match(payoutRoute, /'PAYOUT_DESTINATION_AUTO_APPROVED'/);
   assert.match(payoutRoute, /'APPROVED'/);
   assert.match(payoutRoute, /client\.query\('BEGIN'\)/);
@@ -68,6 +88,7 @@ test('cadastros são aprovados em transação e auditados como sistema', () => {
   assert.doesNotMatch(payoutRoute, /sendPayment|sendPixPayment|asaas/i);
 
   assert.match(pixRoute, /'PIX_ACCOUNT_AUTO_APPROVED'/);
+  assert.match(pixRoute, /Number\.isInteger\(validation\.status\) \? validation\.status : 400/);
   assert.match(pixRoute, /'APPROVED'/);
   assert.match(pixRoute, /pg_advisory_xact_lock/);
   assert.match(pixRoute, /Esta chave PIX já está aprovada/);
