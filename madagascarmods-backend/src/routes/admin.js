@@ -2123,6 +2123,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
               u.last_fraud_at, u.device_migration_allowed,
               u.merged_into_user_id, u.merged_at,
               merged.support_code AS merged_into_support_code,
+              u.referral_count,
               u.created_at, u.updated_at, u.last_login_at,
               COALESCE(SUM(pl.amount), 0) as balance
        FROM users u
@@ -2205,6 +2206,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
           totalSpent: parseInt(statsResult.rows[0].total_spent),
           totalRewards: parseInt(statsResult.rows[0].total_rewards),
           totalTransactions: parseInt(statsResult.rows[0].total_transactions),
+          totalReferred: parseInt(user.referral_count || 0),
           todayRewards: parseInt(todayResult.rows[0].count),
           todayEarned: parseInt(todayResult.rows[0].total)
         },
