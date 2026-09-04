@@ -10,6 +10,7 @@ const { decrypt } = require('../utils/crypto');
 const faucetpay = require('../utils/faucetpay');
 const asaas = require('../utils/asaas');
 const { UserMergeError, mergeUserAccounts } = require('../services/userMerge');
+const { canDeleteAccount, deletionBlockedReason, MAX_DELETABLE_BALANCE_POINTS } = require('../services/accountDeletionPolicy');
 // IP real do cliente atras do proxy. Padroniza o registro em audit_log: antes cada
 // ponto usava req.headers['x-forwarded-for'] diretamente, gravando a lista inteira
 // ("ip1, ip2, ip3") quando havia mais de um salto, o que inutiliza o campo para
@@ -1191,13 +1192,24 @@ router.delete('/users/:id', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Informe um motivo com no minimo 5 caracteres' });
     }
     const target = await db.query(
-      `SELECT id, email, support_code, is_banned FROM users WHERE id = $1`,
+      `SELECT u.id, u.email, u.support_code, u.is_banned,
+              COALESCE((SELECT SUM(pl.amount) FROM points_ledger pl WHERE pl.user_id = u.id), 0)::bigint AS balance
+         FROM users u
+        WHERE u.id = $1`,
       [userId],
     );
     if (target.rows.length === 0) {
       return res.status(404).json({ error: 'Conta nao encontrada' });
     }
     const user = target.rows[0];
+    if (!canDeleteAccount(user.balance)) {
+      return res.status(409).json({
+        error: deletionBlockedReason(user.balance),
+        code: 'ACCOUNT_BALANCE_PROTECTED',
+        balance: Number(user.balance),
+        maxDeletableBalancePoints: MAX_DELETABLE_BALANCE_POINTS,
+      });
+    }
     const result = await db.query(`SELECT * FROM delete_user_safely($1)`, [userId]);
     const { previous_balance, deleted_ledger_rows, deleted_withdrawals } = result.rows[0];
 

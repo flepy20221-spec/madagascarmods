@@ -6,6 +6,7 @@
  *   - Conta e EXCLUIDA automaticamente quando completa 20 dias sem
  *     login (last_login_at) e sem cadastro recente (created_at), e sem
  *     saque pago/processando no periodo.
+ *   - Contas com saldo acima de 1.000 pontos nunca entram na exclusao.
  *
  * Execucao: job diario as 04:00 (America/Sao_Paulo), maximo de 50
  * exclusoes por dia, com registro em audit_log (ACCOUNT_DELETED_AUTO)
@@ -15,6 +16,7 @@
  * remove os dados operacionais em ordem correta respeitando as FKs.
  */
 const db = require('../models/db');
+const { MAX_DELETABLE_BALANCE_POINTS } = require('./accountDeletionPolicy');
 
 const EXCLUSION_DAYS = 20;
 const MAX_PER_RUN = 50;
@@ -24,8 +26,8 @@ const EXCLUDE_IF_HAS_RECENT_WITHDRAWAL = true;
  * Identifica contas elegiveis a exclusao automatica.
  *
  * Elegivel: sem login ha >= EXCLUSION_DAYS dias (ou nunca logou e criada
- * ha >= EXCLUSION_DAYS), sem saque PAID/PROCESSING, nao e alvo de merge,
- * nao banida (banidas tem processo proprio).
+ * ha >= EXCLUSION_DAYS), sem saque PAID/PROCESSING, saldo <= 1.000 pontos,
+ * nao e alvo de merge e nao banida (banidas tem processo proprio).
  */
 async function findExcludable() {
   const result = await db.query(
@@ -42,9 +44,10 @@ async function findExcludable() {
         AND (u.last_login_at IS NULL
              OR u.last_login_at < NOW() - make_interval(days => $1))
         AND u.created_at < NOW() - make_interval(days => $1)
+        AND COALESCE((SELECT SUM(pl.amount) FROM points_ledger pl WHERE pl.user_id = u.id), 0) <= $3
       ORDER BY COALESCE(u.last_login_at, u.created_at) ASC NULLS FIRST
       LIMIT $2`,
-    [EXCLUSION_DAYS, MAX_PER_RUN],
+    [EXCLUSION_DAYS, MAX_PER_RUN, MAX_DELETABLE_BALANCE_POINTS],
   );
   return result.rows;
 }
