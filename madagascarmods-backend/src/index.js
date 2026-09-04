@@ -124,6 +124,7 @@ app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 const {
   userOrTokenKey,
   deviceIdentifierFromBody,
+  adminApiLimiter,
 } = require('./middleware/rateLimits');
 
 const GENERAL_LIMIT_PER_IDENTITY = 300;
@@ -196,6 +197,11 @@ const generalLimiter = rateLimit({
 // O webhook de validacao de saques da Asaas tambem vem da infraestrutura do Asaas
 // e nao deve ser limitado por IP (uma unica origem concentra todas as validacoes).
 app.use('/api/', (req, res, next) => {
+  // O painel tem polling próprio e usa autenticação administrativa; isolá-lo
+  // impede que a atividade do admin consuma a cota do aplicativo móvel.
+  // Login e setup têm limitador de força bruta próprio e não passam duas vezes por aqui.
+  if (req.path === '/admin/login' || req.path === '/admin/setup') return next();
+  if (req.path.startsWith('/admin/')) return adminApiLimiter(req, res, next);
   if (req.path.startsWith('/ssv/')) return next();
   if (req.path.startsWith('/asaas/')) return next();
   // O portal envia imagens multipart e possui limitadores proprios por token nas

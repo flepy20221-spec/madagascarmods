@@ -1260,6 +1260,7 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
     // excluidas por nao rodar o job).
     const result = await db.query(
       `SELECT u.id, u.email, u.support_code, u.created_at, u.last_login_at,
+              u.is_banned,
               (SELECT MAX(w.created_at) FROM withdrawals w WHERE w.user_id = u.id
                  AND w.status IN ('PAID','PROCESSING')) AS last_withdrawal_at,
               (SELECT COALESCE(SUM(pl.amount), 0)::float FROM points_ledger pl
@@ -1278,17 +1279,118 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
       const last = r.last_login_at || r.created_at;
       return new Date() - new Date(last) >= exclusionDays * 24 * 3600 * 1000;
     });
+    const eligibleExclusion = pendingExclusion.filter((r) =>
+      !r.is_banned && r.last_withdrawal_at === null
+      && Number(r.balance || 0) < MAX_DELETABLE_BALANCE_POINTS,
+    );
     res.json({
       success: true,
       observationDays,
       exclusionDays,
       count: rows.length,
       pendingExclusion: pendingExclusion.length,
+      eligibleExclusion: eligibleExclusion.length,
       users: rows,
     });
   } catch (error) {
     console.error('Abandoned users error:', error);
     res.status(500).json({ error: 'Erro ao listar contas em observacao' });
+  }
+});
+
+// POST /api/admin/users/abandoned/delete-eligible - Limpeza manual em lote.
+// Seleciona a mesma regra de abandono do job, mas exige mais de 20 dias e saldo
+// estritamente inferior a 1.000 pontos, conforme a autorização operacional.
+router.post('/users/abandoned/delete-eligible', authenticateAdmin, requireRole('support'), async (req, res) => {
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  const exclusionDays = 20;
+  const batchLimit = 200;
+
+  if (reason.length < 5) {
+    return res.status(400).json({
+      error: 'Informe um motivo com no minimo 5 caracteres',
+      code: 'REASON_REQUIRED',
+    });
+  }
+
+  try {
+    const candidatesResult = await db.query(
+      `SELECT u.id, u.email, u.support_code,
+              COALESCE((SELECT SUM(pl.amount) FROM points_ledger pl WHERE pl.user_id = u.id), 0)::bigint AS balance
+         FROM users u
+        WHERE u.merged_into_user_id IS NULL
+          AND u.is_banned = false
+          AND NOT EXISTS (
+            SELECT 1 FROM withdrawals w
+             WHERE w.user_id = u.id AND w.status IN ('PAID', 'PROCESSING')
+          )
+          AND (u.last_login_at IS NULL
+               OR u.last_login_at < NOW() - make_interval(days => $1))
+          AND u.created_at < NOW() - make_interval(days => $1)
+          AND COALESCE((SELECT SUM(pl.amount) FROM points_ledger pl WHERE pl.user_id = u.id), 0) < $2
+        ORDER BY COALESCE(u.last_login_at, u.created_at) ASC NULLS FIRST
+        LIMIT $3`,
+      [exclusionDays, MAX_DELETABLE_BALANCE_POINTS, batchLimit],
+    );
+
+    const summary = { selected: candidatesResult.rows.length, deleted: [], errors: [] };
+    for (const candidate of candidatesResult.rows) {
+      try {
+        const deleted = await db.query(`SELECT * FROM delete_user_safely($1)`, [candidate.id]);
+        const details = deleted.rows[0] || {};
+
+        await db.query(
+          `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+           VALUES ($1, 'admin', 'ACCOUNT_DELETED', 'user', $2, $3, $4)`,
+          [
+            req.admin.id,
+            candidate.id,
+            JSON.stringify({
+              email: candidate.email,
+              support_code: candidate.support_code,
+              reason,
+              source: 'admin_abandoned_batch',
+              exclusion_days: exclusionDays,
+              previous_balance_points: details.previous_balance ?? candidate.balance,
+              deleted_withdrawals: details.deleted_withdrawals ?? 0,
+              deleted_ledger_rows: details.deleted_ledger_rows ?? 0,
+              deleted_at: new Date().toISOString(),
+            }),
+            clientIp(req),
+          ],
+        );
+
+        summary.deleted.push({
+          email: candidate.email,
+          support_code: candidate.support_code,
+          previous_balance_points: Number(details.previous_balance ?? candidate.balance),
+        });
+      } catch (error) {
+        console.error(`[admin-abandoned] Falha ao excluir ${candidate.email}:`, error.message || error);
+        summary.errors.push({
+          email: candidate.email,
+          support_code: candidate.support_code,
+          error: String(error.message || error),
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      criteria: {
+        exclusionDays,
+        maxBalanceExclusive: MAX_DELETABLE_BALANCE_POINTS,
+        excludedStatuses: ['PAID', 'PROCESSING'],
+        excludedBanned: true,
+        excludedMerged: true,
+      },
+      ...summary,
+      deletedCount: summary.deleted.length,
+      errorCount: summary.errors.length,
+    });
+  } catch (error) {
+    console.error('Batch abandoned deletion error:', error);
+    return res.status(500).json({ error: 'Falha ao excluir contas elegiveis' });
   }
 });
 

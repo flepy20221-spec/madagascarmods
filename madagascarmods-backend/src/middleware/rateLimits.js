@@ -120,6 +120,24 @@ const adminLoginLimiter = rateLimit({
 });
 
 /**
+ * Limite dedicado às rotas do painel administrativo.
+ * O painel mantém indicadores e listas em polling; não deve consumir o bucket
+ * geral da API, que também atende o aplicativo móvel. A autenticação admin continua
+ * sendo obrigatória em cada rota, e ações destrutivas mantêm suas validações próprias.
+ */
+const adminApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: (req) => (userOrTokenKey(req).startsWith('ip:') ? 1200 : 600),
+  keyGenerator: userOrTokenKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Muitas requisições administrativas. Aguarde alguns minutos e tente novamente.',
+    code: 'ADMIN_RATE_LIMIT'
+  }
+});
+
+/**
  * Limite do cadastro de dados de pagamento (PIX/FaucetPay).
  * Evita uso do endpoint para enumerar ou testar CPFs em massa.
  */
@@ -335,6 +353,7 @@ module.exports = {
   rewardStatusLimiter,
   withdrawalLimiter,
   adminLoginLimiter,
+  adminApiLimiter,
   payoutSetupLimiter,
   authLimiter,
   configLimiter,
