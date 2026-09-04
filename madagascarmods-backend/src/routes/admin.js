@@ -1275,21 +1275,47 @@ router.get('/users/abandoned', authenticateAdmin, async (req, res) => {
       [observationDays],
     );
     const rows = result && result.rows ? result.rows : [];
-    const pendingExclusion = rows.filter((r) => {
-      const last = r.last_login_at || r.created_at;
-      return new Date() - new Date(last) >= exclusionDays * 24 * 3600 * 1000;
-    });
-    const eligibleExclusion = pendingExclusion.filter((r) =>
-      !r.is_banned && r.last_withdrawal_at === null
-      && Number(r.balance || 0) < MAX_DELETABLE_BALANCE_POINTS,
+    // Os contadores precisam abranger a base inteira, não apenas os 200 registros
+    // exibidos na tela. Sem esta consulta separada, contas antigas podiam ficar fora
+    // da primeira página e o operador receberia a impressão errada de que não havia
+    // nada elegível para limpeza.
+    const countsResult = await db.query(
+      `WITH abandoned AS (
+         SELECT u.id, u.is_banned, u.last_login_at, u.created_at,
+                COALESCE((SELECT SUM(pl.amount) FROM points_ledger pl WHERE pl.user_id = u.id), 0) AS balance,
+                EXISTS (
+                  SELECT 1 FROM withdrawals w
+                   WHERE w.user_id = u.id AND w.status IN ('PAID', 'PROCESSING')
+                ) AS has_protected_withdrawal
+           FROM users u
+          WHERE u.merged_into_user_id IS NULL
+            AND (u.last_login_at IS NULL
+                 OR u.last_login_at < NOW() - make_interval(days => $1))
+            AND u.created_at < NOW() - make_interval(days => $1)
+       )
+       SELECT
+         COUNT(*) FILTER (
+           WHERE (last_login_at IS NULL OR last_login_at < NOW() - make_interval(days => $2))
+             AND created_at < NOW() - make_interval(days => $2)
+         )::bigint AS pending_exclusion,
+         COUNT(*) FILTER (
+           WHERE (last_login_at IS NULL OR last_login_at < NOW() - make_interval(days => $2))
+             AND created_at < NOW() - make_interval(days => $2)
+             AND is_banned = false
+             AND has_protected_withdrawal = false
+             AND balance < $3
+         )::bigint AS eligible_exclusion
+       FROM abandoned`,
+      [observationDays, exclusionDays, MAX_DELETABLE_BALANCE_POINTS],
     );
+    const counts = countsResult.rows[0] || {};
     res.json({
       success: true,
       observationDays,
       exclusionDays,
       count: rows.length,
-      pendingExclusion: pendingExclusion.length,
-      eligibleExclusion: eligibleExclusion.length,
+      pendingExclusion: Number(counts.pending_exclusion || 0),
+      eligibleExclusion: Number(counts.eligible_exclusion || 0),
       users: rows,
     });
   } catch (error) {
