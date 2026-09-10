@@ -373,7 +373,7 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
               approved_at = NOW(),
               updated_at = NOW()
         WHERE id = $2 AND status = 'PENDING'
-        RETURNING id, user_id, status, amount, points_debited, crypto_address, crypto_currency`,
+        RETURNING id, user_id, status, amount, points_debited, crypto_address, crypto_currency, payment_method`,
       [req.admin.id, id]
     );
 
