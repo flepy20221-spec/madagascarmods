@@ -2388,6 +2388,12 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
     const currentLevel = user.level_override === null || user.level_override === undefined
       ? calculatedLevel
       : Number(user.level_override);
+    const levelMissionsResult = await db.query(
+      `SELECT id, title, target_value, reward_points, is_active, slug
+         FROM missions
+        WHERE type = 'reach_level'
+        ORDER BY target_value ASC`,
+    );
 
     // Reset diario a meia-noite (horario de Brasilia) — igual ao limite do app.
     const { countDailyAds, todayBr } = require('../utils/adDailyLimit');
@@ -2450,7 +2456,8 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
         deviceAliases: aliasesResult.rows,
         payoutDestinations: payoutResult.rows,
         pixAccounts: pixResult.rows,
-        withdrawals: withdrawalsResult.rows
+        withdrawals: withdrawalsResult.rows,
+        levelMissions: levelMissionsResult.rows,
       }
     });
   } catch (error) {
