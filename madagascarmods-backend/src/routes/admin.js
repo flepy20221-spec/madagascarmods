@@ -16,8 +16,15 @@ const { canDeleteAccount, deletionBlockedReason, MAX_DELETABLE_BALANCE_POINTS } 
 // ("ip1, ip2, ip3") quando havia mais de um salto, o que inutiliza o campo para
 // investigacao e para qualquer filtro por IP no painel.
 const { clientIp } = require('../middleware/antiFraud');
+const { todayBr } = require('../utils/adDailyLimit');
 
 const router = express.Router();
+
+function brDateOffset(days) {
+  const base = new Date(`${todayBr()}T12:00:00-03:00`);
+  base.setDate(base.getDate() + days);
+  return base.toISOString().slice(0, 10);
+}
 
 /**
  * Extrai os dados da chave PIX do snapshot gravado em w.crypto_address.
@@ -1038,16 +1045,11 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
     // aritmetica de DATE (sem tz) do Postgres, que opera na tz da
     // sessao; forcar a sessao para America/Sao_Paulo antes.
     // -------------------------------------------------------------
-    const today = new Date();
-    const fmtDate = (d) => d.toISOString().slice(0, 10);
+    const today = todayBr();
     let fromDate = req.query.from;
     let toDate = req.query.to;
-    if (!fromDate) {
-      const start = new Date(today);
-      start.setDate(start.getDate() - 29);
-      fromDate = fmtDate(start);
-    }
-    if (!toDate) toDate = fmtDate(today);
+    if (!fromDate) fromDate = brDateOffset(-29);
+    if (!toDate) toDate = today;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
       return res.status(400).json({ error: 'Datas devem estar no formato YYYY-MM-DD' });
     }
@@ -1055,7 +1057,8 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
     const methodList = String(req.query.method || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
     const params = [fromDate, toDate];
-    let where = `WHERE w.created_at::date >= $1::date AND w.created_at::date <= $2::date`;
+    let where = `WHERE w.created_at >= ($1::date AT TIME ZONE 'America/Sao_Paulo')
+          AND w.created_at < (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`;
     if (statusList.length > 0) {
       params.push(statusList);
       where += ` AND w.status = ANY($${params.length}::text[])`;
@@ -1065,9 +1068,8 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
       where += ` AND w.payment_method = ANY($${params.length}::text[])`;
     }
 
-    await db.query(`SET LOCAL TimeZone = 'America/Sao_Paulo'`);
 
-    const [totals, byMethod, byStatus, byDay] = await Promise.all([
+    const [totals, byMethod, byStatus, byDay, detail] = await Promise.all([
       db.query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::float AS amount
                 FROM withdrawals w ${where}`,
         params),
@@ -1081,10 +1083,22 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
                 FROM withdrawals w ${where}
                 GROUP BY w.status ORDER BY count DESC`,
         params),
-      db.query(`SELECT w.created_at::date AS day, COUNT(*)::int AS count,
+      db.query(`SELECT (w.created_at AT TIME ZONE 'America/Sao_Paulo')::date AS day, COUNT(*)::int AS count,
                        COALESCE(SUM(w.amount), 0)::float AS amount
                 FROM withdrawals w ${where}
-                GROUP BY w.created_at::date ORDER BY day DESC`,
+                GROUP BY (w.created_at AT TIME ZONE 'America/Sao_Paulo')::date ORDER BY day DESC`,
+        params),
+      db.query(`SELECT w.id,
+                       w.created_at AT TIME ZONE 'America/Sao_Paulo' AS created_at_br,
+                       w.processed_at AT TIME ZONE 'America/Sao_Paulo' AS processed_at_br,
+                       w.amount, w.points_debited, w.payment_method, w.status, w.tx_hash,
+                       u.id AS user_id, u.email AS user_email, u.support_code,
+                       CASE WHEN w.status = 'PAID' THEN true ELSE false END AS is_paid
+                FROM withdrawals w
+                JOIN users u ON u.id = w.user_id
+                ${where}
+                ORDER BY w.created_at DESC
+                LIMIT 1000`,
         params),
     ]);
 
@@ -1099,6 +1113,7 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
         byMethod: byMethod.rows,
         byStatus: byStatus.rows,
         byDay: byDay.rows,
+        detail: detail.rows,
       },
     });
   } catch (error) {
@@ -1111,21 +1126,17 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
 // Aceita os mesmos parametros (from, to, status, method) e retorna texto/csv.
 router.get('/withdrawals/report/csv', authenticateAdmin, async (req, res) => {
   try {
-    const today = new Date();
-    const fmtDate = (d) => d.toISOString().slice(0, 10);
+    const today = todayBr();
     let fromDate = req.query.from;
     let toDate = req.query.to;
-    if (!fromDate) {
-      const start = new Date(today);
-      start.setDate(start.getDate() - 29);
-      fromDate = fmtDate(start);
-    }
-    if (!toDate) toDate = fmtDate(today);
+    if (!fromDate) fromDate = brDateOffset(-29);
+    if (!toDate) toDate = today;
     const statusList = String(req.query.status || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
     const methodList = String(req.query.method || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
     const params = [fromDate, toDate];
-    let where = `WHERE w.created_at::date >= $1::date AND w.created_at::date <= $2::date`;
+    let where = `WHERE w.created_at >= ($1::date AT TIME ZONE 'America/Sao_Paulo')
+          AND w.created_at < (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`;
     if (statusList.length > 0) {
       params.push(statusList);
       where += ` AND w.status = ANY($${params.length}::text[])`;
@@ -1135,7 +1146,6 @@ router.get('/withdrawals/report/csv', authenticateAdmin, async (req, res) => {
       where += ` AND w.payment_method = ANY($${params.length}::text[])`;
     }
 
-    await db.query(`SET LOCAL TimeZone = 'America/Sao_Paulo'`);
 
     const detail = await db.query(
       `SELECT w.created_at AT TIME ZONE 'America/Sao_Paulo' AS created_at_br,
@@ -1862,6 +1872,46 @@ router.post('/users/:id/points', authenticateAdmin, requireRole('finance'), asyn
   }
 });
 
+// POST /api/admin/users/:id/level - Define nível administrativo (contas de teste)
+router.post('/users/:id/level', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { level, reason } = req.body || {};
+    const parsedLevel = Number(level);
+    if (!Number.isInteger(parsedLevel) || parsedLevel < 0 || parsedLevel > 1000000) {
+      return res.status(400).json({ error: 'Informe um nível inteiro entre 0 e 1000000' });
+    }
+    if (!reason || String(reason).trim().length < 5) {
+      return res.status(400).json({ error: 'Informe o motivo do ajuste de nível' });
+    }
+
+    const result = await db.query(
+      `UPDATE users SET level_override = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, support_code, level_override`,
+      [parsedLevel, id],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    await db.query(
+      `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
+       VALUES ($1, 'admin', 'USER_LEVEL_OVERRIDE', 'user', $2, $3, $4)`,
+      [req.admin.id, id, JSON.stringify({ level: parsedLevel, reason: String(reason).trim() }), clientIp(req)],
+    );
+
+    res.json({
+      success: true,
+      message: `Nível da conta ${result.rows[0].support_code} definido como ${parsedLevel}`,
+      level: parsedLevel,
+    });
+  } catch (error) {
+    console.error('Set user level error:', error);
+    res.status(500).json({ error: 'Falha ao ajustar nível do usuário' });
+  }
+});
+
 // POST /api/admin/users/:id/ban - Ban/unban user
 router.post('/users/:id/ban', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
@@ -2249,7 +2299,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
               u.ip_address, u.app_version, u.is_active, u.is_banned,
               u.ban_reason, u.banned_at, u.banned_by, u.fraud_score,
               u.last_fraud_at, u.device_migration_allowed,
-              u.merged_into_user_id, u.merged_at,
+              u.merged_into_user_id, u.merged_at, u.level_override,
               merged.support_code AS merged_into_support_code,
               u.referral_count,
               u.created_at, u.updated_at, u.last_login_at,
@@ -2286,6 +2336,15 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
        FROM points_ledger WHERE user_id = $1`,
       [id]
     );
+    const levelAdsResult = await db.query(
+      `SELECT COUNT(*)::integer AS total_ads FROM reward_events WHERE user_id = $1`,
+      [id],
+    );
+    const totalAds = Number(levelAdsResult.rows[0]?.total_ads || 0);
+    const calculatedLevel = Math.floor(totalAds / 50);
+    const currentLevel = user.level_override === null || user.level_override === undefined
+      ? calculatedLevel
+      : Number(user.level_override);
 
     // Reset diario a meia-noite (horario de Brasilia) — igual ao limite do app.
     const { countDailyAds, todayBr } = require('../utils/adDailyLimit');
@@ -2336,7 +2395,14 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
           totalTransactions: parseInt(statsResult.rows[0].total_transactions),
           totalReferred: parseInt(user.referral_count || 0),
           todayRewards: parseInt(todayResult.rows[0].count),
-          todayEarned: parseInt(todayResult.rows[0].total)
+          todayEarned: parseInt(todayResult.rows[0].total),
+          totalAds,
+          level: currentLevel,
+          levelProgress: user.level_override === null || user.level_override === undefined
+            ? totalAds % 50
+            : 0,
+          levelTarget: 50,
+          levelOverride: user.level_override,
         },
         deviceAliases: aliasesResult.rows,
         payoutDestinations: payoutResult.rows,
