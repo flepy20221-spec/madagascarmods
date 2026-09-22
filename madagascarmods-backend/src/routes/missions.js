@@ -196,18 +196,13 @@ function evaluateSelfDeclaredClaim(mission, progressRow) {
  * missao com cooldown de 30 dias resgatada dia 20 volta no dia 19 do mes
  * seguinte, e nao no dia 1.
  */
-async function ensureNextLevelMission(queryable, currentLevel) {
-  const nextLevel = Math.max(
-    LEVEL_MISSION_STEP,
-    (Math.floor(Number(currentLevel) / LEVEL_MISSION_STEP) + 1) * LEVEL_MISSION_STEP,
-  );
-
+async function ensureLevelMission(queryable, targetLevel, rewardPoints = DEFAULT_LEVEL_MISSION_REWARD) {
   const existing = await queryable.query(
     `SELECT id FROM missions
       WHERE type = 'reach_level' AND target_value = $1
       ORDER BY is_active DESC, created_at ASC
       LIMIT 1`,
-    [nextLevel],
+    [targetLevel],
   );
   if (existing.rows.length > 0) return;
 
@@ -221,12 +216,20 @@ async function ensureNextLevelMission(queryable, currentLevel) {
              COALESCE((SELECT MAX(sort_order) + 1 FROM missions), 0),
              'auto', true, 0)`,
     [
-      `Alcançar nível ${nextLevel}`,
-      `Chegue ao nível ${nextLevel} assistindo anúncios`,
-      nextLevel,
-      DEFAULT_LEVEL_MISSION_REWARD,
+      `Alcançar nível ${targetLevel}`,
+      `Chegue ao nível ${targetLevel} assistindo anúncios`,
+      targetLevel,
+      rewardPoints,
     ],
   );
+}
+
+async function ensureNextLevelMission(queryable, currentLevel) {
+  const nextLevel = Math.max(
+    LEVEL_MISSION_STEP,
+    (Math.floor(Number(currentLevel) / LEVEL_MISSION_STEP) + 1) * LEVEL_MISSION_STEP,
+  );
+  await ensureLevelMission(queryable, nextLevel);
 }
 
 function keepOnlyRecentLevelMissions(missions, currentLevel) {
@@ -823,6 +826,14 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
  */
 router.get('/admin/list', authenticateAdmin, async (req, res) => {
   try {
+    // Mantém as primeiras faixas visíveis no painel mesmo antes da migração
+    // 021 terminar em uma instalação que já esteja em produção. O administrador
+    // pode editar a recompensa de cada uma; novas faixas continuam sendo
+    // criadas pelo fluxo de progressão ou pelo formulário do painel.
+    for (const level of [10, 20, 30]) {
+      await ensureLevelMission(db, level);
+    }
+
     const result = await db.query(
       `SELECT m.*,
               (SELECT COUNT(*)::integer
@@ -881,6 +892,9 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
     }
     if (targetValue === null || rewardPoints === null) {
       return res.status(400).json({ error: 'Meta e recompensa devem ser números inteiros maiores que zero' });
+    }
+    if (type === 'reach_level' && targetValue % LEVEL_MISSION_STEP !== 0) {
+      return res.status(400).json({ error: 'Missões de nível devem usar múltiplos de 10: 10, 20, 30...' });
     }
     if (sortOrder === null) {
       return res.status(400).json({ error: 'Ordem deve ser um número inteiro maior ou igual a zero' });
@@ -1048,6 +1062,9 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
 
     if (targetValue === null || rewardPoints === null) {
       return res.status(400).json({ error: 'Meta e recompensa devem ser números inteiros maiores que zero' });
+    }
+    if (type === 'reach_level' && targetValue % LEVEL_MISSION_STEP !== 0) {
+      return res.status(400).json({ error: 'Missões de nível devem usar múltiplos de 10: 10, 20, 30...' });
     }
     if (sortOrder === null) {
       return res.status(400).json({ error: 'Ordem deve ser um número inteiro maior ou igual a zero' });
