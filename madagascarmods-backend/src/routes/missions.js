@@ -250,7 +250,25 @@ async function ensureLevelMission(queryable, targetLevel, rewardPoints = DEFAULT
       LIMIT 1`,
     [targetLevel],
   );
-  if (existing.rows.length > 0) return;
+  if (existing.rows.length > 0) {
+    // Uma faixa criada anteriormente, mas desativada no painel, não pode
+    // desaparecer para uma conta que acabou de avançar/recebeu override de teste.
+    // Reativa apenas a missão concreta; o histórico de resgates continua intacto.
+    if (targetLevel >= LEVEL_30_PLUS_MIN) {
+      await queryable.query(
+        `UPDATE missions
+            SET is_active = true, reward_points = $1, updated_at = NOW()
+          WHERE id = $2`,
+        [effectiveReward, existing.rows[0].id],
+      );
+    } else {
+      await queryable.query(
+        `UPDATE missions SET is_active = true, updated_at = NOW() WHERE id = $1`,
+        [existing.rows[0].id],
+      );
+    }
+    return;
+  }
 
   await queryable.query(
     `INSERT INTO missions (
