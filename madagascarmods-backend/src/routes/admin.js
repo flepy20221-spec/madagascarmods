@@ -2404,7 +2404,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
       WHERE user_id = $1
         AND ad_type = 'rewarded' AND ssv_verified = true
         AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-        AND created_at <  ($2::date + INTERVAL '1 day')::timestamptz AT TIME ZONE 'America/Sao_Paulo'`,
+        AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`,
       [id, todayBr()]
     );
     todayResult.rows[0] = { ...todayResult.rows[0], count: todayCount };

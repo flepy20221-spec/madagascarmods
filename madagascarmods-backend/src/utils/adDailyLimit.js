@@ -38,7 +38,7 @@ const DAILY_COUNT_SQL = `
      AND ad_type = 'rewarded'
      AND ssv_verified = true
      AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-     AND created_at <  ($2::date + INTERVAL '1 day')::timestamptz AT TIME ZONE 'America/Sao_Paulo'
+     AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')
 `;
 
 /**
