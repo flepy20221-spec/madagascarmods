@@ -2727,7 +2727,7 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 90);
-    const [summary, byNetwork, byDay, topUsers, recentObservations] = await Promise.all([
+    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS total_ads,
                 COUNT(DISTINCT user_id)::int AS users,
@@ -2786,6 +2786,18 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
           ORDER BY last_event_at DESC
           LIMIT 50`,
       ),
+      db.query(
+        `SELECT ad_format, COALESCE(NULLIF(error_code, ''), 'unknown') AS error_code,
+                COALESCE(NULLIF(error_message, ''), 'Sem mensagem') AS error_message,
+                COUNT(*)::int AS failures,
+                MAX(created_at) AS last_failure_at
+           FROM ad_observations
+          WHERE event_type = 'failed'
+            AND created_at >= NOW() - INTERVAL '15 minutes'
+          GROUP BY 1, 2, 3
+          ORDER BY failures DESC, last_failure_at DESC
+          LIMIT 50`,
+      ),
     ]);
 
     res.json({
@@ -2796,6 +2808,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
       byDay: byDay.rows,
       topUsers: topUsers.rows,
       recentObservations: recentObservations.rows,
+      failureReasons: failureReasons.rows,
     });
   } catch (error) {
     console.error('Ad analytics error:', error);
