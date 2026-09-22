@@ -2720,6 +2720,78 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 // ---------------------------------------------------------------------------
 // ROTA TEMPORARIA — diagnostico de ads por usuario (Ingrid, CP-BC0C-36F6-CBF8).
 // Remover apos o diagnostico.
+// GET /api/admin/ad-analytics?days=7
+// Visão simples e somente leitura dos rewarded registrados pelo backend.
+// Não substitui os relatórios oficiais de receita do AdMob/Unity/AppBrain;
+// mostra o que o CashPix realmente recebeu e creditou.
+router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 90);
+    const [summary, byNetwork, byDay, topUsers] = await Promise.all([
+      db.query(
+        `SELECT COUNT(*)::int AS total_ads,
+                COUNT(DISTINCT user_id)::int AS users,
+                COUNT(*) FILTER (WHERE ssv_verified = true)::int AS verified_ads,
+                COALESCE(SUM(points_awarded), 0)::int AS points
+           FROM reward_events
+          WHERE created_at >= NOW() - make_interval(days => $1)`,
+        [days],
+      ),
+      db.query(
+        `SELECT COALESCE(NULLIF(ad_network, ''), 'unknown') AS network,
+                COALESCE(NULLIF(ad_type, ''), 'unknown') AS format,
+                COUNT(*)::int AS ads,
+                COUNT(DISTINCT user_id)::int AS users,
+                COUNT(*) FILTER (WHERE ssv_verified = true)::int AS verified,
+                COALESCE(SUM(points_awarded), 0)::int AS points
+           FROM reward_events
+          WHERE created_at >= NOW() - make_interval(days => $1)
+          GROUP BY 1, 2
+          ORDER BY ads DESC, network ASC`,
+        [days],
+      ),
+      db.query(
+        `SELECT (created_at AT TIME ZONE 'America/Sao_Paulo')::date AS day,
+                COUNT(*)::int AS ads,
+                COUNT(DISTINCT user_id)::int AS users,
+                COUNT(*) FILTER (WHERE ssv_verified = true)::int AS verified,
+                COALESCE(SUM(points_awarded), 0)::int AS points
+           FROM reward_events
+          WHERE created_at >= NOW() - make_interval(days => $1)
+          GROUP BY 1
+          ORDER BY day DESC`,
+        [days],
+      ),
+      db.query(
+        `SELECT u.support_code, u.email,
+                COUNT(*)::int AS ads,
+                COUNT(*) FILTER (WHERE re.ssv_verified = true)::int AS verified,
+                COALESCE(SUM(re.points_awarded), 0)::int AS points,
+                MAX(re.created_at) AS last_ad_at
+           FROM reward_events re
+           JOIN users u ON u.id = re.user_id
+          WHERE re.created_at >= NOW() - make_interval(days => $1)
+          GROUP BY u.id, u.support_code, u.email
+          ORDER BY ads DESC, last_ad_at DESC
+          LIMIT 20`,
+        [days],
+      ),
+    ]);
+
+    res.json({
+      success: true,
+      days,
+      summary: summary.rows[0] || {},
+      byNetwork: byNetwork.rows,
+      byDay: byDay.rows,
+      topUsers: topUsers.rows,
+    });
+  } catch (error) {
+    console.error('Ad analytics error:', error);
+    res.status(500).json({ error: 'Erro ao buscar análise de anúncios' });
+  }
+});
+
 // GET /api/admin/users/:id/ads-diagnostics?hours=168
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
