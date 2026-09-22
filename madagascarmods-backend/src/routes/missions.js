@@ -402,7 +402,12 @@ router.get('/', authenticateToken, async (req, res) => {
          AND (m.is_daily = false OR mp.reset_date = $2)
        WHERE m.is_active = true
          AND m.type <> $3
-       ORDER BY m.sort_order ASC`,
+       ORDER BY CASE
+                  WHEN m.type = 'reach_level' THEN 1
+                  WHEN m.type IN ('app_download', 'instagram_follow', 'app_review') THEN 2
+                  ELSE 0
+                END ASC,
+                m.sort_order ASC`,
       [userId, today, LEVEL_30_PLUS_CONFIG_TYPE]
     );
 
