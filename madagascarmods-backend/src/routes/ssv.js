@@ -340,17 +340,6 @@ router.get('/callback', async (req, res) => {
     // ---------------------------------------------------------------------------
     const { getDailyLimit, countDailyAds } = require('../utils/adDailyLimit');
     const dailyLimit = await getDailyLimit();
-    const dailyCount = await countDailyAds(userId);
-
-    if (dailyCount >= dailyLimit) {
-      console.warn('[SSV] Daily limit reached for user', { userId, dailyCount, dailyLimit });
-      return res.status(200).json({
-        success: false,
-        error: 'Daily reward limit reached',
-        dailyCount,
-        dailyLimit
-      });
-    }
 
     // Sortear pontos
     const configResult = await db.query(
@@ -367,6 +356,27 @@ router.get('/callback', async (req, res) => {
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
+
+      // Serializa callbacks simultâneos do mesmo usuário no mesmo dia antes
+      // de contar e inserir o evento. Assim o anúncio 201 não passa por uma
+      // corrida entre duas requisições SSV concorrentes.
+      const brDay = new Date(Date.now() - 3 * 3600 * 1000)
+        .toISOString().slice(0, 10);
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+        [userId, brDay],
+      );
+      const dailyCount = await countDailyAds(userId, client);
+      if (dailyCount >= dailyLimit) {
+        await client.query('ROLLBACK');
+        console.warn('[SSV] Daily limit reached for user', { userId, dailyCount, dailyLimit });
+        return res.status(200).json({
+          success: false,
+          error: 'Daily reward limit reached',
+          dailyCount,
+          dailyLimit,
+        });
+      }
 
       // Registrar evento de reward com SSV verificado
       const eventId = uuidv4();

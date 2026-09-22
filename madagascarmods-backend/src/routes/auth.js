@@ -317,6 +317,8 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       installation_state,
       device_model,
       app_version,
+      recovery_support_code,
+      recovery_email,
     } = req.body;
 
     const deviceAccountKey = normalizeDeviceAccountKey(device_account_key);
@@ -494,6 +496,26 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       if (user) migrationMethod = 'legacy_device_id';
     }
 
+    // Recuperação assistida: o suporte libera a troca de aparelho e o usuário
+    // confirma simultaneamente o código de suporte e o e-mail da conta. O código
+    // sozinho nunca concede acesso; a flag é consumida após a migração.
+    if (!user && recovery_support_code && recovery_email) {
+      const recoveryUser = await client.query(
+        `SELECT id, email, is_active, is_banned, device_account_key,
+                device_migration_allowed
+           FROM users
+          WHERE upper(support_code) = upper($1)
+            AND lower(email) = lower($2)
+            AND device_migration_allowed = true
+            AND merged_into_user_id IS NULL
+          LIMIT 1
+          FOR UPDATE`,
+        [String(recovery_support_code).trim(), String(recovery_email).trim()],
+      );
+      user = recoveryUser.rows[0] || null;
+      if (user) migrationMethod = 'support_recovery';
+    }
+
     // Chave diferente da atual da conta, porem com posse comprovada (refresh token salvo,
     // device_id legado do mesmo aparelho ou alias anterior). Este e exatamente o caso da
     // rotacao da chave de assinatura: a chave nova passa a ser a principal e a antiga
@@ -507,6 +529,7 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
         || migrationMethod === 'refresh_token'
         || migrationMethod === 'legacy_device_id'
         || migrationMethod === 'device_alias'
+        || migrationMethod === 'support_recovery'
         // O alias de ANDROID_ID entra na lista pelo mesmo fundamento dos demais:
         // so quem esta executando o aplicativo naquele aparelho consegue produzir
         // o hash. E precisamente este caso — chave principal trocada, aparelho
@@ -538,6 +561,12 @@ router.post('/device', authLimiter, loginBotDetection, antifraudMiddleware, asyn
       );
       user.device_account_key = deviceAccountKey;
       accountMigrated = true;
+      if (migrationMethod === 'support_recovery') {
+        await client.query(
+          `UPDATE users SET device_migration_allowed = false, updated_at = NOW() WHERE id = $1`,
+          [user.id],
+        );
+      }
     }
 
     // ==========================================================================

@@ -2,11 +2,16 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
-const { authenticateToken, authenticateAdmin } = require('../middleware/auth');
+const { authenticateToken, authenticateAdmin, requireRole } = require('../middleware/auth');
 const {
   appendProofToken,
   createMissionProofToken,
 } = require('../utils/missionProofToken');
+const {
+  consumeVerifiedReward,
+  shouldRequireVerifiedReward,
+  RewardConsumptionError,
+} = require('../utils/rewardConsumption');
 
 function compatibleField(body, camelCase, snakeCase) {
   if (Object.prototype.hasOwnProperty.call(body, camelCase)) {
@@ -825,7 +830,7 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const missionId = persistentMissionId(req.params.id);
-    const { ad_watched } = req.body;
+    const { ad_watched, reward_session_id } = req.body;
     const today = new Date().toISOString().split('T')[0];
 
     await client.query('BEGIN');
@@ -870,6 +875,14 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
       return res.status(403).json({
         error: 'É necessário assistir um anúncio para coletar a recompensa',
         require_ad: true,
+      });
+    }
+
+    if (requiresAd && await shouldRequireVerifiedReward(client)) {
+      await consumeVerifiedReward(client, {
+        userId,
+        rewardSessionId: reward_session_id,
+        purpose: `mission:${missionId}`,
       });
     }
 
@@ -1035,6 +1048,9 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error instanceof RewardConsumptionError) {
+      return res.status(409).json({ error: error.message, code: error.code });
+    }
     console.error('Mission claim error:', error);
     res.status(500).json({ error: 'Erro ao resgatar recompensa' });
   } finally {
@@ -1110,7 +1126,7 @@ router.get('/admin/list', authenticateAdmin, async (req, res) => {
  * POST /api/admin/missions
  * Criar nova missão (admin)
  */
-router.post('/admin/create', authenticateAdmin, async (req, res) => {
+router.post('/admin/create', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
     const { title, description, type, icon } = req.body;
     const targetValue = parseOptionalPositiveInteger(
@@ -1270,7 +1286,7 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
  * PUT /api/admin/missions/:id
  * Atualizar missão (admin)
  */
-router.put('/admin/:id', authenticateAdmin, async (req, res) => {
+router.put('/admin/:id', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
     const { id } = req.params;
     const { title, description, type, icon } = req.body;
@@ -1449,7 +1465,7 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
  * DELETE /api/admin/missions/:id
  * Deletar missão (admin)
  */
-router.delete('/admin/:id', authenticateAdmin, async (req, res) => {
+router.delete('/admin/:id', authenticateAdmin, requireRole('support', 'finance'), async (req, res) => {
   try {
     const { id } = req.params;
     await db.query(`DELETE FROM mission_progress WHERE mission_id = $1`, [id]);

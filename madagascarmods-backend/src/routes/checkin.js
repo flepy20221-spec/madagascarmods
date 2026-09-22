@@ -3,6 +3,11 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const {
+  consumeVerifiedReward,
+  shouldRequireVerifiedReward,
+  RewardConsumptionError,
+} = require('../utils/rewardConsumption');
 
 /**
  * GET /api/checkin/status
@@ -101,7 +106,7 @@ router.post('/claim', authenticateToken, async (req, res) => {
   const client = await db.getClient();
   try {
     const userId = req.user.userId;
-    const { ad_watched } = req.body;
+    const { ad_watched, reward_session_id } = req.body;
 
     // Exigir que o usuário tenha assistido um anúncio antes de fazer check-in
     if (!ad_watched) {
@@ -122,15 +127,24 @@ router.post('/claim', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Você já fez check-in hoje!' });
     }
 
+    if (await shouldRequireVerifiedReward(client)) {
+      await consumeVerifiedReward(client, {
+        userId,
+        rewardSessionId: reward_session_id,
+        purpose: 'checkin',
+      });
+    }
+
     // Buscar configs
     const configResult = await client.query(
-      `SELECT key, value FROM system_config WHERE key IN ('checkin_base_points', 'checkin_streak_multiplier', 'checkin_max_streak_bonus')`
+      `SELECT key, value FROM system_config WHERE key IN ('checkin_base_points', 'checkin_streak_multiplier', 'checkin_max_streak_bonus', 'checkin_weekly_bonus_points')`
     );
     const config = {};
     configResult.rows.forEach(r => { config[r.key] = parseInt(r.value); });
     const basePoints = config.checkin_base_points || 10;
     const streakMultiplier = config.checkin_streak_multiplier || 5;
     const maxBonus = config.checkin_max_streak_bonus || 100;
+    const weeklyBonusPoints = Math.max(config.checkin_weekly_bonus_points || 100, 0);
 
     // Calcular streak
     const lastCheckin = await client.query(
@@ -151,8 +165,10 @@ router.post('/claim', authenticateToken, async (req, res) => {
       }
     }
 
-    // Calcular pontos (base + streak bonus, limitado ao max)
+    // Calcular pontos (base + streak bonus, limitado ao max).
     const points = Math.min(basePoints + ((newStreak - 1) * streakMultiplier), maxBonus);
+    const weeklyBonus = newStreak % 7 === 0 ? weeklyBonusPoints : 0;
+    const totalPoints = points + weeklyBonus;
 
     // Inserir check-in
     await client.query(
@@ -165,7 +181,8 @@ router.post('/claim', authenticateToken, async (req, res) => {
     await client.query(
       `INSERT INTO points_ledger (id, user_id, amount, transaction_type, description)
        VALUES ($1, $2, $3, 'CHECKIN', $4)`,
-      [uuidv4(), userId, points, `Check-in dia ${newStreak} (+${points} pts)`]
+      [uuidv4(), userId, totalPoints,
+        `Check-in dia ${newStreak} (+${points} pts${weeklyBonus > 0 ? ` + ${weeklyBonus} bônus semanal` : ''})`]
     );
 
     await client.query('COMMIT');
@@ -174,12 +191,16 @@ router.post('/claim', authenticateToken, async (req, res) => {
       success: true,
       checkin: {
         streakDay: newStreak,
-        pointsAwarded: points,
+        pointsAwarded: totalPoints,
+        streakBonus: weeklyBonus,
         nextReward: Math.min(basePoints + (newStreak * streakMultiplier), maxBonus)
       }
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error instanceof RewardConsumptionError) {
+      return res.status(409).json({ error: error.message, code: error.code });
+    }
     console.error('Checkin claim error:', error);
     res.status(500).json({ error: 'Erro ao realizar check-in' });
   } finally {

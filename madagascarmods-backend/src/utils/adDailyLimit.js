@@ -44,23 +44,29 @@ const DAILY_COUNT_SQL = `
 /**
  * Conta os ads rewarded verificados do usuario no dia atual (Brasilia).
  */
-async function countDailyAds(userId) {
-  const result = await db.query(DAILY_COUNT_SQL, [userId, todayBr()]);
+async function countDailyAds(userId, queryable = db) {
+  const result = await queryable.query(DAILY_COUNT_SQL, [userId, todayBr()]);
   return parseInt(result.rows[0].count, 10);
 }
 
 /**
- * Consulta o limite diario configurado em system_config
- * ('dailyAdLimitRewarded') ou retorna o default 100.
+ * Consulta o limite diário configurado em system_config.
+ *
+ * Durante versões anteriores foram usadas duas chaves diferentes. A leitura
+ * aceita ambas para que o limite aplicado pelo SSV seja sempre o mesmo limite
+ * exibido pela API pública. O valor de produção aprovado é 200.
  */
 async function getDailyLimit() {
-  const DAILY_LIMIT_DEFAULT = 100;
+  const DAILY_LIMIT_DEFAULT = 200;
   try {
     const limitConfig = await db.query(
-      "SELECT value FROM system_config WHERE key = 'dailyAdLimitRewarded'"
+      `SELECT key, value
+         FROM system_config
+        WHERE key IN ('dailyAdLimitRewarded', 'daily_ad_limit_rewarded')
+        ORDER BY CASE WHEN key = 'daily_ad_limit_rewarded' THEN 0 ELSE 1 END`
     );
-    if (limitConfig.rows.length > 0) {
-      const parsed = Number(JSON.parse(limitConfig.rows[0].value));
+    for (const row of limitConfig.rows) {
+      const parsed = Number(JSON.parse(row.value));
       if (Number.isFinite(parsed) && parsed > 0) return parsed;
     }
   } catch (_) { /* usa o default */ }

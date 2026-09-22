@@ -3,6 +3,11 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../models/db');
 const { authenticateToken } = require('../middleware/auth');
+const {
+  consumeVerifiedReward,
+  shouldRequireVerifiedReward,
+  RewardConsumptionError,
+} = require('../utils/rewardConsumption');
 const crypto = require('crypto');
 const { clientIp } = require('../middleware/antiFraud');
 
@@ -140,7 +145,7 @@ router.post('/apply', authenticateToken, async (req, res) => {
   const client = await db.getClient();
   try {
     const userId = req.user.userId;
-    const { code, ad_watched } = req.body;
+    const { code, ad_watched, reward_session_id } = req.body;
     const userIP = clientIp(req);
 
     // Exigir que o usuário tenha assistido um anúncio antes de aplicar código
@@ -294,7 +299,14 @@ router.post('/apply', authenticateToken, async (req, res) => {
     // =========================================================================
     // TUDO OK - Aplicar referral
     // =========================================================================
-    
+    if (await shouldRequireVerifiedReward(client)) {
+      await consumeVerifiedReward(client, {
+        userId,
+        rewardSessionId: reward_session_id,
+        purpose: 'referral_apply',
+      });
+    }
+
     // Buscar configs
     const configResult = await client.query(
       `SELECT key, value FROM system_config WHERE key IN ('referral_signup_bonus_referrer', 'referral_signup_bonus_referred', 'referral_min_ads_for_bonus')`
@@ -349,6 +361,9 @@ router.post('/apply', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error instanceof RewardConsumptionError) {
+      return res.status(409).json({ error: error.message, code: error.code });
+    }
     console.error('Referral apply error:', error);
     res.status(500).json({ error: 'Erro ao aplicar código de referral' });
   } finally {
