@@ -2727,7 +2727,7 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 90);
-    const [summary, byNetwork, byDay, topUsers] = await Promise.all([
+    const [summary, byNetwork, byDay, topUsers, recentObservations] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS total_ads,
                 COUNT(DISTINCT user_id)::int AS users,
@@ -2776,6 +2776,16 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
           LIMIT 20`,
         [days],
       ),
+      db.query(
+        `SELECT event_type, ad_format, COALESCE(NULLIF(adapter, ''), 'unknown') AS adapter,
+                COUNT(*)::int AS events,
+                MAX(created_at) AS last_event_at
+           FROM ad_observations
+          WHERE created_at >= NOW() - INTERVAL '15 minutes'
+          GROUP BY 1, 2, 3
+          ORDER BY last_event_at DESC
+          LIMIT 50`,
+      ),
     ]);
 
     res.json({
@@ -2785,6 +2795,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
       byNetwork: byNetwork.rows,
       byDay: byDay.rows,
       topUsers: topUsers.rows,
+      recentObservations: recentObservations.rows,
     });
   } catch (error) {
     console.error('Ad analytics error:', error);

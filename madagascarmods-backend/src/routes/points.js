@@ -9,12 +9,49 @@ const {
   getRewardDistribution,
   POINT_VALUES
 } = require('../utils/pointsRandom');
+const { getDailyLimit, todayBr } = require('../utils/adDailyLimit');
 // Nota: drawRewardPoints e validateSsvToken NAO sao mais usados aqui.
 // O sorteio de pontos de anuncios rewarded e a validacao criptografica do Google passaram a
 // viver exclusivamente em src/routes/ssv.js, que e o unico caminho autorizado a creditar
 // esse tipo de recompensa (ver auditoria VULN-01).
 
 const router = express.Router();
+
+// Telemetria técnica da mediação. Nunca libera pontos e falhas do cliente não
+// alteram saldo; serve apenas para diagnóstico de rede/formato no painel.
+router.post('/ad-observation', authenticateToken, async (req, res) => {
+  try {
+    const allowedEvents = new Set(['loaded', 'shown', 'failed', 'paid']);
+    const allowedFormats = new Set(['rewarded', 'interstitial', 'banner', 'native', 'app_open']);
+    const eventType = String(req.body?.event_type || '').trim().toLowerCase();
+    const adFormat = String(req.body?.ad_format || '').trim().toLowerCase();
+    if (!allowedEvents.has(eventType) || !allowedFormats.has(adFormat)) {
+      return res.status(400).json({ error: 'Evento de anúncio inválido' });
+    }
+
+    const safe = (value, max) => typeof value === 'string' ? value.trim().slice(0, max) : null;
+    const valueMicros = Number.isSafeInteger(Number(req.body?.value_micros))
+      ? Number(req.body.value_micros)
+      : null;
+    await db.query(
+      `INSERT INTO ad_observations
+         (id, user_id, event_type, ad_format, adapter, ad_unit_id,
+          app_version, error_code, error_message, value_micros, currency)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [
+        uuidv4(), req.user.userId, eventType, adFormat,
+        safe(req.body?.adapter, 180), safe(req.body?.ad_unit_id, 180),
+        safe(req.body?.app_version, 32), safe(req.body?.error_code, 64),
+        safe(req.body?.error_message, 500), valueMicros, safe(req.body?.currency, 8),
+      ],
+    );
+    res.status(201).json({ success: true });
+  } catch (error) {
+    // Telemetria nunca deve interromper a experiência do usuário.
+    console.error('[Ads] Observation error:', error.message);
+    res.status(204).end();
+  }
+});
 
 // ============================================================================================
 // GET /api/points/reward-status/:sessionId
@@ -40,6 +77,7 @@ router.get(
       }
 
       const userId = req.user.userId;
+      const dailyLimit = await getDailyLimit();
       const [eventResult, balanceResult, dailyResult] = await Promise.all([
         db.query(
           `SELECT id, points_awarded, created_at
@@ -80,7 +118,7 @@ router.get(
           message: 'Aguardando confirmacao do anuncio.',
           newBalance: balance,
           pointValues: POINT_VALUES,
-          dailyLimit: 100,
+          dailyLimit,
           dailyCount
         });
       }
@@ -95,7 +133,7 @@ router.get(
         eventId: event.id,
         rewardSessionId: sessionId,
         pointValues: POINT_VALUES,
-        dailyLimit: 100,
+        dailyLimit,
         dailyCount
       });
     } catch (error) {
@@ -160,6 +198,7 @@ router.post(
     }
 
     const userId = req.user.userId;
+    const dailyLimit = await getDailyLimit();
     const ip = clientIp(req);
 
     if (!['rewarded', 'interstitial', 'banner'].includes(ad_type)) {
@@ -224,7 +263,7 @@ router.post(
           message: 'Aguardando confirmacao do anuncio. O saldo sera atualizado em instantes.',
           newBalance: balance,
           pointValues: POINT_VALUES,
-          dailyLimit: 100,
+          dailyLimit,
           dailyCount: parseInt(dailyCount.rows[0].count, 10)
         });
       }
@@ -237,7 +276,7 @@ router.post(
         newBalance: balance,
         eventId: confirmed.id,
         pointValues: POINT_VALUES,
-        dailyLimit: 100,
+        dailyLimit,
         dailyCount: parseInt(dailyCount.rows[0].count, 10)
       });
     }
@@ -276,7 +315,7 @@ router.post(
       pointsAwarded: 0,
       newBalance: currentBalance,
       pointValues: POINT_VALUES,
-      dailyLimit: 100,
+      dailyLimit,
       dailyCount: parseInt(dailyCount.rows[0].count, 10)
     });
   } catch (error) {
