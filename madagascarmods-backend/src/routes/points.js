@@ -360,12 +360,26 @@ router.get('/stats', authenticateToken, async (req, res) => {
       [req.user.userId, require('../utils/adDailyLimit').todayBr()]
     );
 
-    // Sistema de níveis visual (puramente cosmético)
-    // Nível 1 = 50 anúncios, Nível 2 = 100, Nível 3 = 150, etc.
-    const totalAdsWatched = parseInt(stats.rows[0].total_rewards) || 0;
+    // Nível baseado em eventos de anúncio; o override existe apenas para contas
+    // de teste administradas pelo painel e não altera o saldo.
+    const totalAdsResult = await db.query(
+      `SELECT COUNT(*) AS total FROM reward_events WHERE user_id = $1`,
+      [req.user.userId],
+    );
+    const levelResult = await db.query(
+      `SELECT level_override FROM users WHERE id = $1`,
+      [req.user.userId],
+    );
+    const totalAdsWatched = parseInt(totalAdsResult.rows[0].total) || 0;
     const adsPerLevel = 50;
-    const currentLevel = Math.floor(totalAdsWatched / adsPerLevel);
-    const adsInCurrentLevel = totalAdsWatched % adsPerLevel;
+    const calculatedLevel = Math.floor(totalAdsWatched / adsPerLevel);
+    const levelOverride = levelResult.rows[0]?.level_override;
+    const currentLevel = levelOverride === null || levelOverride === undefined
+      ? calculatedLevel
+      : Number(levelOverride);
+    const adsInCurrentLevel = levelOverride === null || levelOverride === undefined
+      ? totalAdsWatched % adsPerLevel
+      : 0;
     const adsForNextLevel = adsPerLevel;
 
     res.json({
