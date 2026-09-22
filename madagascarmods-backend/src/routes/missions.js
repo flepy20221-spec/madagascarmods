@@ -400,7 +400,7 @@ router.get('/', authenticateToken, async (req, res) => {
        FROM missions m
        LEFT JOIN mission_progress mp ON mp.mission_id = m.id AND mp.user_id = $1 
          AND (m.is_daily = false OR mp.reset_date = $2)
-       WHERE m.is_active = true
+       WHERE (m.is_active = true OR m.type = 'reach_level')
          AND m.type <> $3
        ORDER BY CASE
                   WHEN m.type = 'reach_level' THEN 1
