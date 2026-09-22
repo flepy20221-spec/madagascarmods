@@ -8,7 +8,7 @@ const router = express.Router();
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const user = await db.query(
-      `SELECT u.id, u.support_code, u.email, u.device_id, u.app_version, u.is_active, u.created_at, u.last_login_at,
+      `SELECT u.id, u.support_code, u.email, u.device_id, u.app_version, u.is_active, u.level_override, u.created_at, u.last_login_at,
        COALESCE(SUM(pl.amount), 0) as balance
        FROM users u
        LEFT JOIN points_ledger pl ON pl.user_id = u.id
@@ -30,8 +30,13 @@ router.get('/me', authenticateToken, async (req, res) => {
     );
     const totalAds = parseInt(rewardCount.rows[0].total) || 0;
     const adsPerLevel = 50;
-    const level = Math.floor(totalAds / adsPerLevel);
-    const levelProgress = totalAds % adsPerLevel;
+    const calculatedLevel = Math.floor(totalAds / adsPerLevel);
+    const level = userData.level_override === null || userData.level_override === undefined
+      ? calculatedLevel
+      : Number(userData.level_override);
+    const levelProgress = userData.level_override === null || userData.level_override === undefined
+      ? totalAds % adsPerLevel
+      : 0;
 
     // Get payout destination status
     const payout = await db.query(
@@ -55,6 +60,7 @@ router.get('/me', authenticateToken, async (req, res) => {
         level: level,
         levelProgress: levelProgress,
         levelTarget: adsPerLevel,
+        levelOverride: userData.level_override,
         totalAdsWatched: totalAds
       },
       payoutDestination: payout.rows.length > 0 ? {
