@@ -1895,6 +1895,49 @@ router.post('/users/:id/level', authenticateAdmin, requireRole('support', 'finan
       return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
+    // Garante imediatamente as faixas concretas (10, 20, ... até a próxima)
+    // para que o próximo GET /api/missions do app já encontre as missões.
+    const levelConfig = await db.query(
+      `SELECT reward_points FROM missions
+        WHERE type = 'level_30_plus_config' AND slug = 'level-30-plus-config'
+        ORDER BY updated_at DESC LIMIT 1`,
+    );
+    const level30Reward = Number(levelConfig.rows[0]?.reward_points || 2000);
+    for (let target = 10; target <= parsedLevel + 10; target += 10) {
+      const concrete = await db.query(
+        `SELECT id FROM missions
+          WHERE type = 'reach_level' AND target_value = $1
+          ORDER BY is_active DESC, created_at ASC LIMIT 1`,
+        [target],
+      );
+      if (concrete.rows.length > 0) {
+        await db.query(
+          `UPDATE missions SET is_active = true,
+                  reward_points = CASE WHEN $1 >= 30 THEN $2 ELSE reward_points END,
+                  updated_at = NOW()
+            WHERE id = $3`,
+          [target, level30Reward, concrete.rows[0].id],
+        );
+      } else {
+        await db.query(
+          `INSERT INTO missions
+             (title, description, type, target_value, reward_points, icon,
+              is_active, is_daily, sort_order, verification_mode, requires_ad,
+              min_seconds_before_claim, slug)
+           VALUES ($1, $2, 'reach_level', $3, $4, 'emoji_events', true, false,
+                   COALESCE((SELECT MAX(sort_order) + 1 FROM missions), 0),
+                   'auto', true, 0, $5)`,
+          [
+            `Alcançar nível ${target}`,
+            `Chegue ao nível ${target} assistindo anúncios`,
+            target,
+            target >= 30 ? level30Reward : 100,
+            target >= 30 ? `level-30-plus-${target}` : null,
+          ],
+        );
+      }
+    }
+
     await db.query(
       `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
        VALUES ($1, 'admin', 'USER_LEVEL_OVERRIDE', 'user', $2, $3, $4)`,
