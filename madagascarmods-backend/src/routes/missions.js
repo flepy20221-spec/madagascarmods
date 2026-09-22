@@ -659,13 +659,22 @@ router.get('/', authenticateToken, async (req, res) => {
       }
     }
 
+    const filteredMissions = keepOnlyRecentLevelMissions(enrichedMissions, currentLevel);
+    const filteredIds = new Set(filteredMissions.map((mission) => mission.id));
+    // Nunca esconder as metas concretas de nível do cliente móvel: algumas
+    // instalações antigas tinham progresso/linhas duplicadas e o filtro de
+    // histórico acabava removendo todas as metas da resposta.
+    const finalMissions = [
+      ...filteredMissions,
+      ...enrichedMissions.filter(
+        (mission) => mission.type === 'reach_level' && !filteredIds.has(mission.id),
+      ),
+    ];
+
     res.json({
       success: true,
       currentLevel,
-      // No máximo duas metas de level já alcançadas e a próxima pendente.
-      // Missões antigas já resgatadas deixam de poluir a tela, mas permanecem
-      // no banco para auditoria e histórico.
-      missions: keepOnlyRecentLevelMissions(enrichedMissions, currentLevel),
+      missions: finalMissions,
     });
   } catch (error) {
     console.error('Missions list error:', error);
