@@ -296,6 +296,48 @@ async function ensureLevelMissionsThrough(queryable, highestLevel) {
   }
 }
 
+async function ensureConcreteLevelMissions(queryable, currentLevel) {
+  const nextLevel = Math.max(
+    LEVEL_MISSION_STEP,
+    (Math.floor(Number(currentLevel) / LEVEL_MISSION_STEP) + 1) * LEVEL_MISSION_STEP,
+  );
+  const level30Reward = await getLevel30PlusReward(queryable);
+
+  // INSERT ... SELECT com NOT EXISTS deixa esta rotina idempotente e não depende
+  // de uma constraint única que não existe em instalações antigas do banco.
+  for (let target = LEVEL_MISSION_STEP; target <= nextLevel; target += LEVEL_MISSION_STEP) {
+    await queryable.query(
+      `INSERT INTO missions (
+         title, description, type, target_value, reward_points, icon,
+         is_active, is_daily, sort_order, verification_mode, requires_ad,
+         min_seconds_before_claim, slug
+       )
+       SELECT $1, $2, 'reach_level', $3, $4, 'emoji_events',
+              true, false, COALESCE((SELECT MAX(sort_order) + 1 FROM missions), 0),
+              'auto', true, 0, $5
+        WHERE NOT EXISTS (
+          SELECT 1 FROM missions
+           WHERE type = 'reach_level' AND target_value = $3
+        )`,
+      [
+        `Alcançar nível ${target}`,
+        `Chegue ao nível ${target} assistindo anúncios`,
+        target,
+        target >= LEVEL_30_PLUS_MIN ? level30Reward : DEFAULT_LEVEL_MISSION_REWARD,
+        target >= LEVEL_30_PLUS_MIN ? `level-30-plus-${target}` : null,
+      ],
+    );
+    await queryable.query(
+      `UPDATE missions
+          SET is_active = true,
+              reward_points = CASE WHEN target_value >= $1 THEN $2 ELSE reward_points END,
+              updated_at = NOW()
+        WHERE type = 'reach_level' AND target_value = $3`,
+      [LEVEL_30_PLUS_MIN, level30Reward, target],
+    );
+  }
+}
+
 async function ensureNextLevelMission(queryable, currentLevel) {
   const nextLevel = Math.max(
     LEVEL_MISSION_STEP,
@@ -383,6 +425,7 @@ router.get('/', authenticateToken, async (req, res) => {
       ? calculatedLevel
       : Number(levelOverride);
     await ensureLevel30PlusConfig(db);
+    await ensureConcreteLevelMissions(db, currentLevel);
     await ensureNextLevelMission(db, currentLevel);
     const level30PlusReward = await getLevel30PlusReward(db);
 
