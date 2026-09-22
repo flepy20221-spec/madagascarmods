@@ -611,6 +611,54 @@ router.get('/', authenticateToken, async (req, res) => {
       });
     }
 
+    // Fallback explícito para instalações que possuem as missões concretas no
+    // banco, mas ainda não as devolveram no SELECT geral por causa de dados
+    // legados. As linhas usam os IDs reais, então o resgate continua normal.
+    if (!enrichedMissions.some((mission) => mission.type === 'reach_level')) {
+      const explicitLevelRows = await db.query(
+        `SELECT m.id, m.title, m.description, m.target_value, m.reward_points,
+                m.icon, m.is_daily, m.verification_mode, m.requires_ad,
+                m.cooldown_days, m.min_seconds_before_claim, m.slug,
+                COALESCE(mp.is_claimed, false) AS is_claimed
+           FROM missions m
+           LEFT JOIN mission_progress mp
+             ON mp.mission_id = m.id AND mp.user_id = $1
+          WHERE m.type = 'reach_level' AND m.is_active = true
+          ORDER BY m.target_value ASC`,
+        [userId],
+      );
+      for (const mission of explicitLevelRows.rows) {
+        enrichedMissions.push({
+          id: mission.id,
+          title: mission.title,
+          description: mission.description,
+          type: 'reach_level',
+          targetValue: Number(mission.target_value),
+          rewardPoints: Number(mission.target_value) >= LEVEL_30_PLUS_MIN
+            ? level30PlusReward
+            : Number(mission.reward_points),
+          icon: mission.icon,
+          isDaily: mission.is_daily,
+          currentValue: currentLevel,
+          isCompleted: currentLevel >= Number(mission.target_value),
+          isClaimed: Boolean(mission.is_claimed),
+          verificationMode: mission.verification_mode || 'auto',
+          actionUrl: null,
+          requiresAd: mission.requires_ad !== false,
+          cooldownDays: mission.cooldown_days || null,
+          minSecondsBeforeClaim: mission.min_seconds_before_claim || 0,
+          startedAt: null,
+          slug: mission.slug || null,
+          evidenceRequired: false,
+          minimumExternalCredits: 0,
+          instructions: {},
+          evidenceStatus: null,
+          evidenceProtocol: null,
+          evidenceRejectionReason: null,
+        });
+      }
+    }
+
     res.json({
       success: true,
       currentLevel,
