@@ -1016,6 +1016,22 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
 
 // ============ ADMIN ROUTES ============
 
+// Diagnóstico seguro das missões de nível concretas; não é exposto ao app.
+router.get('/admin/level-missions', authenticateAdmin, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, type, title, target_value, reward_points, is_active, slug
+         FROM missions
+        WHERE type = 'reach_level'
+        ORDER BY target_value ASC`,
+    );
+    res.json({ success: true, missions: result.rows });
+  } catch (error) {
+    console.error('Admin level missions diagnostic error:', error);
+    res.status(500).json({ error: 'Erro ao consultar missões de nível' });
+  }
+});
+
 /**
  * GET /api/admin/missions
  * Lista todas as missões (admin)
