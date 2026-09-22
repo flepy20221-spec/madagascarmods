@@ -660,15 +660,34 @@ router.get('/', authenticateToken, async (req, res) => {
     }
 
     const filteredMissions = keepOnlyRecentLevelMissions(enrichedMissions, currentLevel);
-    const filteredIds = new Set(filteredMissions.map((mission) => mission.id));
-    // Nunca esconder as metas concretas de nível do cliente móvel: algumas
-    // instalações antigas tinham progresso/linhas duplicadas e o filtro de
-    // histórico acabava removendo todas as metas da resposta.
+    const nonLevelMissions = filteredMissions.filter((mission) => mission.type !== 'reach_level');
+    // Escolhe no máximo duas metas já alcançadas e a próxima, deduplicando
+    // linhas antigas que possam existir no banco para o mesmo target_value.
+    const uniqueLevels = new Map();
+    for (const mission of enrichedMissions) {
+      if (mission.type !== 'reach_level') continue;
+      const target = Number(mission.targetValue);
+      if (!uniqueLevels.has(target)) uniqueLevels.set(target, mission);
+    }
+    const levelRows = [...uniqueLevels.values()];
+    const recentReached = levelRows
+      .filter((mission) => Number(mission.targetValue) <= Number(currentLevel))
+      .sort((a, b) => Number(b.targetValue) - Number(a.targetValue))
+      .slice(0, 2);
+    const nextLevel = levelRows
+      .filter((mission) => Number(mission.targetValue) > Number(currentLevel))
+      .sort((a, b) => Number(a.targetValue) - Number(b.targetValue))[0];
+    const externalMissions = nonLevelMissions.filter((mission) =>
+      ['app_download', 'instagram_follow', 'app_review'].includes(mission.type),
+    );
+    const regularMissions = nonLevelMissions.filter((mission) =>
+      !['app_download', 'instagram_follow', 'app_review'].includes(mission.type),
+    );
     const finalMissions = [
-      ...filteredMissions,
-      ...enrichedMissions.filter(
-        (mission) => mission.type === 'reach_level' && !filteredIds.has(mission.id),
-      ),
+      ...regularMissions,
+      ...recentReached,
+      ...(nextLevel ? [nextLevel] : []),
+      ...externalMissions,
     ];
 
     res.json({
