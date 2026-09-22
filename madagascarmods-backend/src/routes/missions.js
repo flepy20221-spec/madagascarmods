@@ -58,8 +58,18 @@ function parseOptionalNonNegativeInteger(value) {
 // limita o prejuizo a uma concessao por conta — que e a mesma exposicao de
 // qualquer bonus de cadastro.
 // ============================================================================
-const SELF_DECLARED_TYPES = new Set(['app_review']);
+// A API não consegue confirmar instalação, follow ou avaliação por privacidade das
+// plataformas externas. Para esses fluxos, registra a abertura do destino e exige
+// uma espera mínima antes do resgate. Cada missão continua resgatável uma única vez
+// quando `is_daily=false` e `cooldown_days` é nulo.
+const SELF_DECLARED_TYPES = new Set([
+  'app_review',
+  'app_download',
+  'instagram_follow',
+]);
 const MANUAL_EVIDENCE_TYPES = new Set(['manus_proof']);
+const LEVEL_MISSION_STEP = 10;
+const DEFAULT_LEVEL_MISSION_REWARD = 100;
 const MANUS_PROOF_SLUG = 'manus-account-proof';
 const MANUS_PROOF_PORTAL_URL = process.env.MANUS_PROOF_PORTAL_URL
   || 'https://cashpix-manus-proof-production.up.railway.app/';
@@ -81,7 +91,7 @@ function persistentMissionId(value) {
 // que um erro de digitacao no painel administrativo nao consiga apontar a base
 // instalada inteira para um dominio arbitrario: a URL chega ao aplicativo pela
 // API e e aberta no navegador do aparelho.
-function normalizeActionUrl(value) {
+function normalizeActionUrl(value, type) {
   if (value === undefined) return undefined;
   if (value === null || (typeof value === 'string' && value.trim() === '')) return null;
   if (typeof value !== 'string') return false;
@@ -99,15 +109,19 @@ function normalizeActionUrl(value) {
   const isPlayStorePage = host === 'play.google.com'
     && parsed.pathname === '/store/apps/details'
     && Boolean(parsed.searchParams.get('id'));
+  const isInstagramPage = (host === 'instagram.com' || host === 'www.instagram.com')
+    && /^\/[A-Za-z0-9._-]+\/?$/.test(parsed.pathname);
   let isManusProofPortal = false;
   try {
     isManusProofPortal = parsed.origin === new URL(MANUS_PROOF_PORTAL_URL).origin;
   } catch (_) {
     // Uma variavel de ambiente invalida nao deve ampliar a lista de destinos.
   }
-  // market:// nao passa por new URL() com protocolo https, e a ficha web abre a
-  // Play Store nativa por intent de qualquer forma. Um unico formato aceito
-  // mantem a validacao simples e o comportamento previsivel.
+
+  if (type === 'instagram_follow') return isInstagramPage ? parsed.toString() : false;
+  if (type === 'app_download' || type === 'app_review') {
+    return isPlayStorePage ? parsed.toString() : false;
+  }
   return isPlayStorePage || isManusProofPortal ? parsed.toString() : false;
 }
 
@@ -182,6 +196,59 @@ function evaluateSelfDeclaredClaim(mission, progressRow) {
  * missao com cooldown de 30 dias resgatada dia 20 volta no dia 19 do mes
  * seguinte, e nao no dia 1.
  */
+async function ensureNextLevelMission(queryable, currentLevel) {
+  const nextLevel = Math.max(
+    LEVEL_MISSION_STEP,
+    (Math.floor(Number(currentLevel) / LEVEL_MISSION_STEP) + 1) * LEVEL_MISSION_STEP,
+  );
+
+  const existing = await queryable.query(
+    `SELECT id FROM missions
+      WHERE type = 'reach_level' AND target_value = $1
+      ORDER BY is_active DESC, created_at ASC
+      LIMIT 1`,
+    [nextLevel],
+  );
+  if (existing.rows.length > 0) return;
+
+  await queryable.query(
+    `INSERT INTO missions (
+       title, description, type, target_value, reward_points, icon,
+       is_active, is_daily, sort_order, verification_mode, requires_ad,
+       min_seconds_before_claim
+     )
+     VALUES ($1, $2, 'reach_level', $3, $4, 'emoji_events', true, false,
+             COALESCE((SELECT MAX(sort_order) + 1 FROM missions), 0),
+             'auto', true, 0)`,
+    [
+      `Alcançar nível ${nextLevel}`,
+      `Chegue ao nível ${nextLevel} assistindo anúncios`,
+      nextLevel,
+      DEFAULT_LEVEL_MISSION_REWARD,
+    ],
+  );
+}
+
+function keepOnlyRecentLevelMissions(missions, currentLevel) {
+  const levelMissions = missions
+    .filter((mission) => mission.type === 'reach_level')
+    .sort((a, b) => Number(b.target_value) - Number(a.target_value));
+  if (levelMissions.length <= 3) return missions;
+
+  const completedOrReached = levelMissions
+    .filter((mission) => Number(mission.target_value) <= Number(currentLevel))
+    .slice(0, 2);
+  const next = levelMissions
+    .filter((mission) => Number(mission.target_value) > Number(currentLevel))
+    .sort((a, b) => Number(a.target_value) - Number(b.target_value))[0];
+
+  const keepIds = new Set(completedOrReached.map((mission) => mission.id));
+  if (next) keepIds.add(next.id);
+  return missions.filter(
+    (mission) => mission.type !== 'reach_level' || keepIds.has(mission.id),
+  );
+}
+
 async function findActiveClaim(queryable, userId, mission, today) {
   if (mission.cooldown_days) {
     const result = await queryable.query(
@@ -219,6 +286,17 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const today = new Date().toISOString().split('T')[0];
+
+    // O nível é ilimitado no servidor. A cada múltiplo de 10, cria-se sob
+    // demanda apenas a próxima missão; o administrador pode depois editar sua
+    // recompensa no painel. Assim o usuário no nível 20 recebe a missão 30,
+    // depois 40, 50 e assim por diante, sem limite artificial.
+    const totalAdsResult = await db.query(
+      `SELECT COUNT(*)::integer AS total FROM reward_events WHERE user_id = $1`,
+      [userId],
+    );
+    const currentLevel = Math.floor(Number(totalAdsResult.rows[0]?.total || 0) / 50);
+    await ensureNextLevelMission(db, currentLevel);
 
     // Buscar missões ativas
     const missions = await db.query(
@@ -396,7 +474,11 @@ router.get('/', authenticateToken, async (req, res) => {
 
     res.json({
       success: true,
-      missions: enrichedMissions
+      currentLevel,
+      // No máximo duas metas de level já alcançadas e a próxima pendente.
+      // Missões antigas já resgatadas deixam de poluir a tela, mas permanecem
+      // no banco para auditoria e histórico.
+      missions: keepOnlyRecentLevelMissions(enrichedMissions, currentLevel),
     });
   } catch (error) {
     console.error('Missions list error:', error);
@@ -782,7 +864,8 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
       compatibleField(req.body, 'minSecondsBeforeClaim', 'min_seconds_before_claim')
     );
     const actionUrl = normalizeActionUrl(
-      compatibleField(req.body, 'actionUrl', 'action_url')
+      compatibleField(req.body, 'actionUrl', 'action_url'),
+      type,
     );
     const evidenceRequired = compatibleField(req.body, 'evidenceRequired', 'evidence_required');
     const minimumExternalCredits = parseOptionalNonNegativeInteger(
@@ -829,10 +912,17 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
     if (minSecondsBeforeClaim !== undefined && minSecondsBeforeClaim > 3600) {
       return res.status(400).json({ error: 'Espera mínima não pode passar de 3600 segundos' });
     }
+    if (SELF_DECLARED_TYPES.has(type)
+      && (type === 'app_download' || type === 'instagram_follow')
+      && minSecondsBeforeClaim !== undefined
+      && minSecondsBeforeClaim < 30) {
+      return res.status(400).json({ error: 'Missões de download e Instagram exigem espera mínima de 30 segundos' });
+    }
     if (actionUrl === false) {
       return res.status(400).json({
-        error: 'A URL da ação deve ser um link de ficha de aplicativo na Play Store, '
-          + 'no formato https://play.google.com/store/apps/details?id=SEU.PACOTE',
+        error: type === 'instagram_follow'
+          ? 'A URL deve ser um perfil oficial https://www.instagram.com/usuario.'
+          : 'A URL deve ser uma ficha oficial da Play Store no formato https://play.google.com/store/apps/details?id=SEU.PACOTE.',
       });
     }
     if (invitationUrl === false) {
@@ -849,9 +939,11 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
       ? 'manual_evidence'
       : (SELF_DECLARED_TYPES.has(type) ? 'self_declared' : 'auto');
 
-    if (verificationMode === 'self_declared' && actionUrl === undefined) {
+    if (verificationMode === 'self_declared' && !actionUrl) {
       return res.status(400).json({
-        error: 'Missões de avaliação exigem a URL da ficha do aplicativo na Play Store.',
+        error: type === 'instagram_follow'
+          ? 'A missão do Instagram exige o link do perfil oficial.'
+          : 'A missão externa exige o link da ficha na Play Store.',
       });
     }
     const effectiveActionUrl = verificationMode === 'manual_evidence'
@@ -878,7 +970,11 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
         // por cima disso e atrito sem contrapartida. As demais mantem `true`.
         requiresAd !== undefined ? requiresAd : verificationMode === 'auto',
         cooldownDays ?? null,
-        minSecondsBeforeClaim ?? (verificationMode === 'self_declared' ? 15 : 0),
+        minSecondsBeforeClaim ?? (
+          type === 'app_download' || type === 'instagram_follow'
+            ? 30
+            : (verificationMode === 'self_declared' ? 15 : 0)
+        ),
         verificationMode === 'manual_evidence' ? MANUS_PROOF_SLUG : null,
         verificationMode === 'manual_evidence' ? true : (evidenceRequired ?? false),
         minimumExternalCredits ?? (verificationMode === 'manual_evidence' ? 1800 : 0),
@@ -921,7 +1017,8 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
       compatibleField(req.body, 'minSecondsBeforeClaim', 'min_seconds_before_claim')
     );
     const actionUrl = normalizeActionUrl(
-      compatibleField(req.body, 'actionUrl', 'action_url')
+      compatibleField(req.body, 'actionUrl', 'action_url'),
+      type,
     );
 
     const evidenceRequired = compatibleField(req.body, 'evidenceRequired', 'evidence_required');
@@ -979,10 +1076,24 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
     if (minSecondsBeforeClaim !== undefined && minSecondsBeforeClaim > 3600) {
       return res.status(400).json({ error: 'Espera mínima não pode passar de 3600 segundos' });
     }
+    if (SELF_DECLARED_TYPES.has(type)
+      && (type === 'app_download' || type === 'instagram_follow')
+      && minSecondsBeforeClaim !== undefined
+      && minSecondsBeforeClaim < 30) {
+      return res.status(400).json({ error: 'Missões de download e Instagram exigem espera mínima de 30 segundos' });
+    }
     if (actionUrl === false) {
       return res.status(400).json({
-        error: 'A URL da ação deve ser um link de ficha de aplicativo na Play Store, '
-          + 'no formato https://play.google.com/store/apps/details?id=SEU.PACOTE',
+        error: type === 'instagram_follow'
+          ? 'A URL deve ser um perfil oficial https://www.instagram.com/usuario.'
+          : 'A URL deve ser uma ficha oficial da Play Store no formato https://play.google.com/store/apps/details?id=SEU.PACOTE.',
+      });
+    }
+    if (type && SELF_DECLARED_TYPES.has(type) && actionUrl === null) {
+      return res.status(400).json({
+        error: type === 'instagram_follow'
+          ? 'Informe o link do perfil oficial do Instagram antes de ativar a missão.'
+          : 'Informe o link da Play Store antes de ativar a missão.',
       });
     }
     if (invitationUrl === false) {
