@@ -1058,7 +1058,7 @@ router.get('/withdrawals/report', authenticateAdmin, async (req, res) => {
 
     const params = [fromDate, toDate];
     let where = `WHERE w.created_at >= ($1::date AT TIME ZONE 'America/Sao_Paulo')
-          AND w.created_at < (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`;
+          AND w.created_at < (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`;
     if (statusList.length > 0) {
       params.push(statusList);
       where += ` AND w.status = ANY($${params.length}::text[])`;
@@ -1136,7 +1136,7 @@ router.get('/withdrawals/report/csv', authenticateAdmin, async (req, res) => {
 
     const params = [fromDate, toDate];
     let where = `WHERE w.created_at >= ($1::date AT TIME ZONE 'America/Sao_Paulo')
-          AND w.created_at < (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`;
+          AND w.created_at < (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`;
     if (statusList.length > 0) {
       params.push(statusList);
       where += ` AND w.status = ANY($${params.length}::text[])`;
@@ -2404,7 +2404,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
       WHERE user_id = $1
         AND ad_type = 'rewarded' AND ssv_verified = true
         AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-        AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`,
+        AND created_at <  (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`,
       [id, todayBr()]
     );
     todayResult.rows[0] = { ...todayResult.rows[0], count: todayCount };

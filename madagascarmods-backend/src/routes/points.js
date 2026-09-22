@@ -102,7 +102,7 @@ router.get(
               AND ad_type = 'rewarded'
               AND ssv_verified = true
               AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-              AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`,
+              AND created_at <  (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`,
           [userId, require('../utils/adDailyLimit').todayBr()]
         )
       ]);
@@ -247,7 +247,7 @@ router.post(
         `SELECT COUNT(*) as count FROM reward_events
           WHERE user_id = $1 AND ad_type = 'rewarded' AND ssv_verified = true
             AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-            AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`,
+            AND created_at <  (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`,
         [userId, require('../utils/adDailyLimit').todayBr()]
       );
 
@@ -304,7 +304,7 @@ router.post(
       `SELECT COUNT(*) as count FROM reward_events
         WHERE user_id = $1 AND ad_type = 'rewarded' AND ssv_verified = true
           AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-          AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`,
+          AND created_at <  (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`,
       [userId, require('../utils/adDailyLimit').todayBr()]
     );
     // Responde sucesso (o app nao precisa saber que nao creditou)
@@ -395,7 +395,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
        FROM reward_events 
        WHERE user_id = $1
          AND created_at >= ($2 || ' 00:00:00-03')::timestamptz
-         AND created_at <  (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`,
+         AND created_at <  (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`,
       [req.user.userId, require('../utils/adDailyLimit').todayBr()]
     );
 
