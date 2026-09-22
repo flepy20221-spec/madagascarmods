@@ -2447,9 +2447,7 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
           todayEarned: parseInt(todayResult.rows[0].total),
           totalAds,
           level: currentLevel,
-          levelProgress: user.level_override === null || user.level_override === undefined
-            ? totalAds % 50
-            : 0,
+          levelProgress: totalAds % 50,
           levelTarget: 50,
           levelOverride: user.level_override,
         },

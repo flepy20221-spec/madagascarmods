@@ -416,9 +416,10 @@ router.get('/stats', authenticateToken, async (req, res) => {
     const currentLevel = levelOverride === null || levelOverride === undefined
       ? calculatedLevel
       : Number(levelOverride);
-    const adsInCurrentLevel = levelOverride === null || levelOverride === undefined
-      ? totalAdsWatched % adsPerLevel
-      : 0;
+    // O override altera somente o nível visual. O progresso continua vindo
+    // dos anúncios reais já registrados, para não congelar o contador em 0/50
+    // nas contas de teste administradas pelo painel.
+    const adsInCurrentLevel = totalAdsWatched % adsPerLevel;
     const adsForNextLevel = adsPerLevel;
 
     res.json({

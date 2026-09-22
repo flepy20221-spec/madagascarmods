@@ -34,9 +34,8 @@ router.get('/me', authenticateToken, async (req, res) => {
     const level = userData.level_override === null || userData.level_override === undefined
       ? calculatedLevel
       : Number(userData.level_override);
-    const levelProgress = userData.level_override === null || userData.level_override === undefined
-      ? totalAds % adsPerLevel
-      : 0;
+    // O override não fabrica anúncios nem deve congelar o progresso visual.
+    const levelProgress = totalAds % adsPerLevel;
 
     // Get payout destination status
     const payout = await db.query(
