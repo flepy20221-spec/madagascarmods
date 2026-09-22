@@ -69,7 +69,11 @@ const SELF_DECLARED_TYPES = new Set([
 ]);
 const MANUAL_EVIDENCE_TYPES = new Set(['manus_proof']);
 const LEVEL_MISSION_STEP = 10;
+const LEVEL_30_PLUS_CONFIG_TYPE = 'level_30_plus_config';
+const LEVEL_30_PLUS_CONFIG_SLUG = 'level-30-plus-config';
+const LEVEL_30_PLUS_MIN = 30;
 const DEFAULT_LEVEL_MISSION_REWARD = 100;
+const DEFAULT_LEVEL_30_PLUS_REWARD = 2000;
 const MANUS_PROOF_SLUG = 'manus-account-proof';
 const MANUS_PROOF_PORTAL_URL = process.env.MANUS_PROOF_PORTAL_URL
   || 'https://cashpix-manus-proof-production.up.railway.app/';
@@ -196,7 +200,49 @@ function evaluateSelfDeclaredClaim(mission, progressRow) {
  * missao com cooldown de 30 dias resgatada dia 20 volta no dia 19 do mes
  * seguinte, e nao no dia 1.
  */
+async function ensureLevel30PlusConfig(queryable) {
+  const existing = await queryable.query(
+    `SELECT id FROM missions WHERE type = $1 AND slug = $2 LIMIT 1`,
+    [LEVEL_30_PLUS_CONFIG_TYPE, LEVEL_30_PLUS_CONFIG_SLUG],
+  );
+  if (existing.rows.length > 0) return;
+
+  await queryable.query(
+    `INSERT INTO missions (
+       title, description, type, target_value, reward_points, icon,
+       is_active, is_daily, sort_order, verification_mode, requires_ad,
+       min_seconds_before_claim, slug
+     )
+     VALUES ($1, $2, $3, $4, $5, 'emoji_events', true, false,
+             COALESCE((SELECT MAX(sort_order) + 1 FROM missions), 0),
+             'auto', true, 0, $6)`,
+    [
+      'Level 30+ — 2000 pontos fixos',
+      'Recompensa aplicada a cada missão de nível 30, 40, 50 e demais múltiplos de 10.',
+      LEVEL_30_PLUS_CONFIG_TYPE,
+      LEVEL_30_PLUS_MIN,
+      DEFAULT_LEVEL_30_PLUS_REWARD,
+      LEVEL_30_PLUS_CONFIG_SLUG,
+    ],
+  );
+}
+
+async function getLevel30PlusReward(queryable) {
+  const result = await queryable.query(
+    `SELECT reward_points
+       FROM missions
+      WHERE type = $1 AND slug = $2
+      ORDER BY updated_at DESC
+      LIMIT 1`,
+    [LEVEL_30_PLUS_CONFIG_TYPE, LEVEL_30_PLUS_CONFIG_SLUG],
+  );
+  return Number(result.rows[0]?.reward_points || DEFAULT_LEVEL_30_PLUS_REWARD);
+}
+
 async function ensureLevelMission(queryable, targetLevel, rewardPoints = DEFAULT_LEVEL_MISSION_REWARD) {
+  const effectiveReward = targetLevel >= LEVEL_30_PLUS_MIN
+    ? await getLevel30PlusReward(queryable)
+    : rewardPoints;
   const existing = await queryable.query(
     `SELECT id FROM missions
       WHERE type = 'reach_level' AND target_value = $1
@@ -210,18 +256,26 @@ async function ensureLevelMission(queryable, targetLevel, rewardPoints = DEFAULT
     `INSERT INTO missions (
        title, description, type, target_value, reward_points, icon,
        is_active, is_daily, sort_order, verification_mode, requires_ad,
-       min_seconds_before_claim
+       min_seconds_before_claim, slug
      )
      VALUES ($1, $2, 'reach_level', $3, $4, 'emoji_events', true, false,
              COALESCE((SELECT MAX(sort_order) + 1 FROM missions), 0),
-             'auto', true, 0)`,
+             'auto', true, 0, $5)`,
     [
       `Alcançar nível ${targetLevel}`,
       `Chegue ao nível ${targetLevel} assistindo anúncios`,
       targetLevel,
-      rewardPoints,
+      effectiveReward,
+      targetLevel >= LEVEL_30_PLUS_MIN ? `level-30-plus-${targetLevel}` : null,
     ],
   );
+}
+
+async function ensureLevelMissionsThrough(queryable, highestLevel) {
+  const limit = Math.max(LEVEL_MISSION_STEP, Number(highestLevel));
+  for (let level = LEVEL_MISSION_STEP; level <= limit; level += LEVEL_MISSION_STEP) {
+    await ensureLevelMission(queryable, level);
+  }
 }
 
 async function ensureNextLevelMission(queryable, currentLevel) {
@@ -229,7 +283,10 @@ async function ensureNextLevelMission(queryable, currentLevel) {
     LEVEL_MISSION_STEP,
     (Math.floor(Number(currentLevel) / LEVEL_MISSION_STEP) + 1) * LEVEL_MISSION_STEP,
   );
-  await ensureLevelMission(queryable, nextLevel);
+  // Cria também faixas anteriores que ainda não existiam. Isso é importante
+  // para contas antigas que já estão acima do nível 40: elas recebem 40 e 50,
+  // por exemplo, e o administrador consegue ajustar ambas no painel.
+  await ensureLevelMissionsThrough(queryable, nextLevel);
 }
 
 function keepOnlyRecentLevelMissions(missions, currentLevel) {
@@ -298,10 +355,21 @@ router.get('/', authenticateToken, async (req, res) => {
       `SELECT COUNT(*)::integer AS total FROM reward_events WHERE user_id = $1`,
       [userId],
     );
-    const currentLevel = Math.floor(Number(totalAdsResult.rows[0]?.total || 0) / 50);
+    const levelOverrideResult = await db.query(
+      `SELECT level_override FROM users WHERE id = $1`,
+      [userId],
+    );
+    const calculatedLevel = Math.floor(Number(totalAdsResult.rows[0]?.total || 0) / 50);
+    const levelOverride = levelOverrideResult.rows[0]?.level_override;
+    const currentLevel = levelOverride === null || levelOverride === undefined
+      ? calculatedLevel
+      : Number(levelOverride);
+    await ensureLevel30PlusConfig(db);
     await ensureNextLevelMission(db, currentLevel);
+    const level30PlusReward = await getLevel30PlusReward(db);
 
-    // Buscar missões ativas
+    // Buscar missões ativas. A linha de configuração "Level 30+" pertence
+    // somente ao painel; os usuários recebem as metas concretas 30, 40, 50...
     const missions = await db.query(
       `SELECT m.id, m.title, m.description, m.type, m.target_value, m.reward_points, m.icon, m.is_daily,
               m.verification_mode, m.action_url, m.requires_ad, m.cooldown_days,
@@ -315,14 +383,19 @@ router.get('/', authenticateToken, async (req, res) => {
        LEFT JOIN mission_progress mp ON mp.mission_id = m.id AND mp.user_id = $1 
          AND (m.is_daily = false OR mp.reset_date = $2)
        WHERE m.is_active = true
+         AND m.type <> $3
        ORDER BY m.sort_order ASC`,
-      [userId, today]
+      [userId, today, LEVEL_30_PLUS_CONFIG_TYPE]
     );
 
     // Calcular progresso automático para missões baseadas em dados existentes
     const enrichedMissions = [];
     for (const mission of missions.rows) {
       let currentValue = mission.current_value;
+      if (mission.type === 'reach_level'
+        && Number(mission.target_value) >= LEVEL_30_PLUS_MIN) {
+        mission.reward_points = level30PlusReward;
+      }
 
       // Auto-calcular progresso para missões do tipo watch_ads (baseado no dia)
       if (mission.type === 'watch_ads' && mission.is_daily) {
@@ -335,11 +408,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
       // Auto-calcular para reach_level
       if (mission.type === 'reach_level') {
-        const totalAds = await db.query(
-          `SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1`,
-          [userId]
-        );
-        currentValue = Math.floor(parseInt(totalAds.rows[0].total) / 50);
+        // Respeita o nível real ou o override de conta de teste calculado acima.
+        currentValue = currentLevel;
       }
 
       // Auto-calcular para referral
@@ -630,6 +700,15 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
     }
 
     const m = mission.rows[0];
+    if (m.type === 'reach_level' && Number(m.target_value) >= LEVEL_30_PLUS_MIN) {
+      // O painel controla uma única recompensa para todas as metas 30+.
+      m.reward_points = await getLevel30PlusReward(client);
+    }
+    const levelOverrideResult = await client.query(
+      `SELECT level_override FROM users WHERE id = $1`,
+      [userId],
+    );
+    const levelOverride = levelOverrideResult.rows[0]?.level_override;
 
     // ========================================================================
     // EXIGENCIA DE ANUNCIO
@@ -684,7 +763,10 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
         `SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1`,
         [userId]
       );
-      currentValue = Math.floor(parseInt(totalAds.rows[0].total) / 50);
+      const calculatedLevel = Math.floor(parseInt(totalAds.rows[0].total) / 50);
+      currentValue = levelOverride === null || levelOverride === undefined
+        ? calculatedLevel
+        : Number(levelOverride);
     } else if (m.type === 'referral') {
       const referrals = await client.query(
         `SELECT referral_count FROM users WHERE id = $1`,
@@ -826,13 +908,28 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
  */
 router.get('/admin/list', authenticateAdmin, async (req, res) => {
   try {
-    // Mantém as primeiras faixas visíveis no painel mesmo antes da migração
-    // 021 terminar em uma instalação que já esteja em produção. O administrador
-    // pode editar a recompensa de cada uma; novas faixas continuam sendo
-    // criadas pelo fluxo de progressão ou pelo formulário do painel.
-    for (const level of [10, 20, 30]) {
-      await ensureLevelMission(db, level);
-    }
+    await ensureLevel30PlusConfig(db);
+
+    // Cria todas as faixas até o próximo múltiplo de 10 do usuário de maior
+    // nível. Assim, se já existem usuários no nível 45, o painel mostra as
+    // metas concretas necessárias, enquanto o painel também exibe uma única
+    // configuração "Level 30+" para controlar a recompensa de todas elas.
+    const highestUserAds = await db.query(
+      `SELECT COALESCE(MAX(total_ads), 0)::integer AS total_ads
+         FROM (
+           SELECT user_id, COUNT(*)::integer AS total_ads
+             FROM reward_events
+            GROUP BY user_id
+         ) totals`,
+    );
+    const highestUserLevel = Math.floor(
+      Number(highestUserAds.rows[0]?.total_ads || 0) / 50,
+    );
+    const nextConfiguredLevel = Math.max(
+      30,
+      (Math.floor(highestUserLevel / LEVEL_MISSION_STEP) + 1) * LEVEL_MISSION_STEP,
+    );
+    await ensureLevelMissionsThrough(db, nextConfiguredLevel);
 
     const result = await db.query(
       `SELECT m.*,
@@ -840,7 +937,9 @@ router.get('/admin/list', authenticateAdmin, async (req, res) => {
                  FROM mission_evidence_submissions s
                 WHERE s.mission_id = m.id AND s.status = 'pending') AS pending_evidence_count
          FROM missions m
-        ORDER BY m.sort_order ASC, m.created_at DESC`
+        WHERE NOT (m.type = 'reach_level' AND m.target_value >= $1)
+        ORDER BY m.sort_order ASC, m.created_at DESC`,
+      [LEVEL_30_PLUS_MIN]
     );
     res.json({ success: true, missions: result.rows });
   } catch (error) {
@@ -895,6 +994,9 @@ router.post('/admin/create', authenticateAdmin, async (req, res) => {
     }
     if (type === 'reach_level' && targetValue % LEVEL_MISSION_STEP !== 0) {
       return res.status(400).json({ error: 'Missões de nível devem usar múltiplos de 10: 10, 20, 30...' });
+    }
+    if (type === LEVEL_30_PLUS_CONFIG_TYPE && targetValue !== LEVEL_30_PLUS_MIN) {
+      return res.status(400).json({ error: 'A configuração Level 30+ deve manter a meta 30.' });
     }
     if (sortOrder === null) {
       return res.status(400).json({ error: 'Ordem deve ser um número inteiro maior ou igual a zero' });
@@ -1065,6 +1167,9 @@ router.put('/admin/:id', authenticateAdmin, async (req, res) => {
     }
     if (type === 'reach_level' && targetValue % LEVEL_MISSION_STEP !== 0) {
       return res.status(400).json({ error: 'Missões de nível devem usar múltiplos de 10: 10, 20, 30...' });
+    }
+    if (type === LEVEL_30_PLUS_CONFIG_TYPE && targetValue !== LEVEL_30_PLUS_MIN) {
+      return res.status(400).json({ error: 'A configuração Level 30+ deve manter a meta 30.' });
     }
     if (sortOrder === null) {
       return res.status(400).json({ error: 'Ordem deve ser um número inteiro maior ou igual a zero' });
