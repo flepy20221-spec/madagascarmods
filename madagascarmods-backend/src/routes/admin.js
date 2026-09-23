@@ -2718,6 +2718,48 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 // ---------------------------------------------------------------------------
 // ROTA TEMPORARIA — diagnostico de ads por usuario (Ingrid, CP-BC0C-36F6-CBF8).
 // Remover apos o diagnostico.
+// Receita de anúncios informada pelo administrador. Registro analítico; não altera
+// saldo, ledger, SSV ou fila de saques.
+router.post('/ad-revenue', authenticateAdmin, async (req, res) => {
+  try {
+    const reportDate = String(req.body?.report_date || '').trim();
+    const source = String(req.body?.source || '').trim().toLowerCase();
+    const revenue = Number(req.body?.revenue_brl);
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim().slice(0, 500) : null;
+    if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(reportDate) || !['admob', 'unity', 'appbrain', 'other'].includes(source)) {
+      return res.status(400).json({ error: 'Data ou fonte de receita inválida' });
+    }
+    if (!Number.isFinite(revenue) || revenue < 0 || revenue > 100000000) {
+      return res.status(400).json({ error: 'Valor de receita inválido' });
+    }
+    const result = await db.query(
+      `INSERT INTO ad_revenue_entries (id, report_date, source, revenue_brl, notes, created_by)
+       VALUES ($1, $2::date, $3, $4, $5, $6)
+       ON CONFLICT (report_date, source) DO UPDATE SET
+         revenue_brl = EXCLUDED.revenue_brl,
+         notes = EXCLUDED.notes,
+         created_by = EXCLUDED.created_by,
+         updated_at = NOW()
+       RETURNING id, report_date, source, revenue_brl, notes, updated_at`,
+      [uuidv4(), reportDate, source, revenue.toFixed(2), notes, req.admin?.email || null],
+    );
+    res.status(201).json({ success: true, entry: result.rows[0] });
+  } catch (error) {
+    console.error('Ad revenue save error:', error);
+    res.status(500).json({ error: 'Erro ao salvar receita de anúncios' });
+  }
+});
+
+router.delete('/ad-revenue/:id', authenticateAdmin, async (req, res) => {
+  try {
+    await db.query('DELETE FROM ad_revenue_entries WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Ad revenue delete error:', error);
+    res.status(500).json({ error: 'Erro ao remover receita de anúncios' });
+  }
+});
+
 // GET /api/admin/ad-analytics?days=7
 // Visão simples e somente leitura dos rewarded registrados pelo backend.
 // Não substitui os relatórios oficiais de receita do AdMob/Unity/AppBrain;
@@ -2728,7 +2770,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
     const validBrDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
     const fromDate = validBrDate(req.query.from) ? String(req.query.from) : brDateOffset(-(days - 1));
     const toDate = validBrDate(req.query.to) ? String(req.query.to) : todayBr();
-    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution, pointsPerRealResult] = await Promise.all([
+    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution, pointsPerRealResult, revenueEntriesResult] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS total_ads,
                 COUNT(DISTINCT user_id)::int AS users,
@@ -2813,6 +2855,13 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
         [fromDate, toDate],
       ),
       db.query("SELECT value FROM system_config WHERE key = 'points_per_real' LIMIT 1"),
+      db.query(
+        `SELECT id, report_date, source, revenue_brl, notes, updated_at
+           FROM ad_revenue_entries
+          WHERE report_date BETWEEN $1::date AND $2::date
+          ORDER BY report_date DESC, source ASC`,
+        [fromDate, toDate],
+      ),
     ]);
 
     const pointsPerReal = Math.max(parseInt(pointsPerRealResult.rows[0]?.value, 10) || 2000, 1);
@@ -2826,6 +2875,11 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
       points: acc.points + Number(row.points || 0),
       estimated_payout_brl: Number((acc.estimated_payout_brl + Number(row.estimated_payout_brl || 0)).toFixed(2)),
     }), { ads: 0, users: 0, points: 0, estimated_payout_brl: 0 });
+    const revenueEntries = revenueEntriesResult.rows.map((row) => ({
+      ...row,
+      revenue_brl: Number(row.revenue_brl || 0),
+    }));
+    const reportedRevenueBrl = Number(revenueEntries.reduce((sum, row) => sum + row.revenue_brl, 0).toFixed(2));
 
     res.json({
       success: true,
@@ -2841,7 +2895,12 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
         to: toDate,
         timezone: 'America/Sao_Paulo',
         pointsPerReal,
-        totals: distributionTotals,
+        totals: {
+          ...distributionTotals,
+          reported_revenue_brl: reportedRevenueBrl,
+          estimated_margin_brl: Number((reportedRevenueBrl - distributionTotals.estimated_payout_brl).toFixed(2)),
+        },
+        revenueEntries,
         byDay: distributionRows,
       },
     });
