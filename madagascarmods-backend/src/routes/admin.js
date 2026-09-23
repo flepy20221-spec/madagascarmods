@@ -2891,6 +2891,18 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
       revenue_brl: Number(row.revenue_brl || 0),
     }));
     const reportedRevenueBrl = Number(revenueEntries.reduce((sum, row) => sum + row.revenue_brl, 0).toFixed(2));
+    const alerts = [];
+    const marginBrl = Number((reportedRevenueBrl - distributionTotals.estimated_payout_brl).toFixed(2));
+    if (reportedRevenueBrl > 0 && marginBrl < 0) {
+      alerts.push({ level: 'critical', code: 'NEGATIVE_MARGIN', message: `Margem negativa no período: R$ ${marginBrl.toFixed(2)}` });
+    }
+    if (Number(summary.rows[0]?.total_ads || 0) > 0 && Number(summary.rows[0]?.verified_ads || 0) < Number(summary.rows[0]?.total_ads || 0)) {
+      alerts.push({ level: 'warning', code: 'SSV_GAP', message: 'Há anúncios registrados sem confirmação SSV.' });
+    }
+    const noFillFailures = failureReasons.rows.reduce((sum, row) => sum + (row.error_code === '3' ? Number(row.failures || 0) : 0), 0);
+    if (noFillFailures >= 10) {
+      alerts.push({ level: 'warning', code: 'NO_FILL_SPIKE', message: `${noFillFailures} falhas No fill nos últimos 15 minutos.` });
+    }
 
     res.json({
       success: true,
@@ -2901,6 +2913,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
       topUsers: topUsers.rows,
       recentObservations: recentObservations.rows,
       failureReasons: failureReasons.rows,
+      alerts,
       pointsDistribution: {
         from: fromDate,
         to: toDate,
