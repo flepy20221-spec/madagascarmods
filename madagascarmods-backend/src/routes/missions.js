@@ -1023,14 +1023,23 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
     //
     // `started_at` e preservado com COALESCE: ele e o registro historico de
     // quando a acao externa comecou e nao deve ser sobrescrito pelo resgate.
-    await client.query(
+    const claimProgress = await client.query(
       `INSERT INTO mission_progress (user_id, mission_id, current_value, is_completed, is_claimed, completed_at, claimed_at, reset_date)
        VALUES ($1, $2, $3, true, true, NOW(), NOW(), $4)
-       ON CONFLICT (user_id, mission_id, reset_date) 
+       ON CONFLICT (user_id, mission_id, reset_date)
        DO UPDATE SET is_completed = true, is_claimed = true, current_value = $3, completed_at = NOW(), claimed_at = NOW(),
-                     started_at = COALESCE(mission_progress.started_at, EXCLUDED.started_at)`,
+                     started_at = COALESCE(mission_progress.started_at, EXCLUDED.started_at)
+       WHERE mission_progress.is_claimed = false
+       RETURNING id`,
       [userId, missionId, currentValue, today]
     );
+
+    // A claim sem rewarded adicional também precisa de uma trava persistente:
+    // duas chamadas simultâneas não podem gerar dois lançamentos no ledger.
+    if (claimProgress.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Recompensa já resgatada' });
+    }
 
     // Registrar no ledger (saldo é calculado pela soma do points_ledger)
     await client.query(
