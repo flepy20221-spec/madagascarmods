@@ -12,6 +12,7 @@ const {
   shouldRequireVerifiedReward,
   RewardConsumptionError,
 } = require('../utils/rewardConsumption');
+const { countDailyAds, todayBr } = require('../utils/adDailyLimit');
 
 function compatibleField(body, camelCase, snakeCase) {
   if (Object.prototype.hasOwnProperty.call(body, camelCase)) {
@@ -403,6 +404,63 @@ async function findActiveClaim(queryable, userId, mission, today) {
   return result.rows[0] || null;
 }
 
+// A missão que exige chegar ao teto rewarded diário pode ser liquidada pelo
+// servidor assim que a contagem SSV chega a 200. Isso permite que APKs antigos,
+// que sempre abrem outro anúncio para resgatar, recebam a missão sem depender do
+// anúncio 201. O upsert condicional torna o crédito idempotente entre instâncias.
+const DAILY_200_AD_MISSION_ID = '00cc8dcd-afe3-45e9-bbb4-7ffc19f79ede';
+
+async function autoClaimDaily200AdsMission(userId, resetDate, verifiedAdsToday) {
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    const missionResult = await client.query(
+      `SELECT id, title, target_value, reward_points
+         FROM missions
+        WHERE id = $1 AND type = 'watch_ads' AND is_daily = true
+          AND is_active = true AND requires_ad = false`,
+      [DAILY_200_AD_MISSION_ID],
+    );
+    const mission = missionResult.rows[0];
+    if (!mission || verifiedAdsToday < Number(mission.target_value)) {
+      await client.query('COMMIT');
+      return false;
+    }
+
+    const claimed = await client.query(
+      `INSERT INTO mission_progress
+         (user_id, mission_id, current_value, is_completed, is_claimed,
+          completed_at, claimed_at, reset_date)
+       VALUES ($1, $2, $3, true, true, NOW(), NOW(), $4)
+       ON CONFLICT (user_id, mission_id, reset_date)
+       DO UPDATE SET current_value = $3, is_completed = true, is_claimed = true,
+                     completed_at = NOW(), claimed_at = NOW()
+       WHERE mission_progress.is_claimed = false
+       RETURNING id`,
+      [userId, mission.id, Number(mission.target_value), resetDate],
+    );
+
+    if (claimed.rows.length === 0) {
+      await client.query('COMMIT');
+      return false;
+    }
+
+    await client.query(
+      `INSERT INTO points_ledger
+         (id, user_id, amount, transaction_type, reference_id, description)
+       VALUES ($1, $2, $3, 'MISSION', $4, $5)`,
+      [uuidv4(), userId, Number(mission.reward_points), claimed.rows[0].id, `Missão: ${mission.title}`],
+    );
+    await client.query('COMMIT');
+    return true;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * GET /api/missions
  * Lista missões ativas com progresso do usuário
@@ -410,7 +468,17 @@ async function findActiveClaim(queryable, userId, mission, today) {
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const today = new Date().toISOString().split('T')[0];
+    const today = todayBr();
+    const verifiedAdsToday = await countDailyAds(userId);
+    if (verifiedAdsToday >= 200) {
+      try {
+        await autoClaimDaily200AdsMission(userId, today, verifiedAdsToday);
+      } catch (error) {
+        // Falha no auto-resgate nao bloqueia a tela; uma nova carga pode repetir
+        // a operacao, protegida pelo upsert idempotente.
+        console.error('Auto-claim daily 200-ad mission error:', error);
+      }
+    }
 
     // O nível é ilimitado no servidor. A cada múltiplo de 10, cria-se sob
     // demanda apenas a próxima missão; o administrador pode depois editar sua
@@ -468,13 +536,10 @@ router.get('/', authenticateToken, async (req, res) => {
         mission.reward_points = level30PlusReward;
       }
 
-      // Auto-calcular progresso para missões do tipo watch_ads (baseado no dia)
+      // Progresso usa apenas rewarded verificados por SSV no dia de Brasília,
+      // igual ao limite que autoriza o resgate da missão.
       if (mission.type === 'watch_ads' && mission.is_daily) {
-        const adsToday = await db.query(
-          `SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1 AND DATE(created_at) = $2`,
-          [userId, today]
-        );
-        currentValue = parseInt(adsToday.rows[0].total);
+        currentValue = verifiedAdsToday;
       }
 
       // Auto-calcular para reach_level
@@ -831,7 +896,7 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const missionId = persistentMissionId(req.params.id);
     const { ad_watched, reward_session_id } = req.body;
-    const today = new Date().toISOString().split('T')[0];
+    const today = todayBr();
 
     await client.query('BEGIN');
 
@@ -908,11 +973,7 @@ router.post('/:id/claim', authenticateToken, async (req, res) => {
     let currentValue = 0;
 
     if (m.type === 'watch_ads' && m.is_daily) {
-      const adsToday = await client.query(
-        `SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1 AND DATE(created_at) = $2`,
-        [userId, today]
-      );
-      currentValue = parseInt(adsToday.rows[0].total);
+      currentValue = await countDailyAds(userId, client);
     } else if (m.type === 'reach_level') {
       const totalAds = await client.query(
         `SELECT COUNT(*) as total FROM reward_events WHERE user_id = $1`,
