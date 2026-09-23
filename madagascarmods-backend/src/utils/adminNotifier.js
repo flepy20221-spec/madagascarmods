@@ -103,6 +103,27 @@ const EVENTS = {
     tags: 'moneybag',
     category: 'withdrawals',
   },
+  FAUCETPAY_PAYMENT_SUCCESS: {
+    title: 'Pagamento enviado pela FaucetPay',
+    color: 0x00C853,
+    priority: 3,
+    tags: 'white_check_mark,moneybag',
+    category: 'withdrawals',
+  },
+  FAUCETPAY_PAYMENT_FAILED: {
+    title: 'Falha no pagamento FaucetPay',
+    color: 0xD50000,
+    priority: 4,
+    tags: 'warning,moneybag',
+    category: 'withdrawals',
+  },
+  FAUCETPAY_PAYMENT_UNCONFIRMED: {
+    title: 'Pagamento FaucetPay sem confirmação — verificação necessária',
+    color: 0xFF6D00,
+    priority: 5,
+    tags: 'warning,mag',
+    category: 'withdrawals',
+  },
   USER_AUTO_BANNED: {
     title: 'Auto-ban executado',
     color: 0xD50000,
@@ -214,6 +235,8 @@ function escapeHtml(value) {
  */
 function notifyAdmin(eventKey, fields = {}, opts = {}) {
   const event = EVENTS[eventKey];
+  const requestedChannels = Array.isArray(opts.channels) ? new Set(opts.channels) : null;
+  const channelEnabled = (name) => !requestedChannels || requestedChannels.has(name);
   if (!event) {
     console.error(`[AdminNotifier] Evento desconhecido: ${eventKey}`);
     return;
@@ -224,8 +247,12 @@ function notifyAdmin(eventKey, fields = {}, opts = {}) {
   const textBody = buildTextBody(fields);
 
   // ---------------------------------------------------------------- Discord
-  const discordUrl = process.env.ADMIN_DISCORD_WEBHOOK_URL || process.env.BAN_WEBHOOK_URL;
-  if (discordUrl && discordUrl.includes('discord.com')) {
+  const discordUrl = process.env.ADMIN_DISCORD_WEBHOOK_URL ||
+    (!opts.dedicatedDiscord && process.env.BAN_WEBHOOK_URL);
+  if (opts.dedicatedDiscord && channelEnabled('discord') && !process.env.ADMIN_DISCORD_WEBHOOK_URL) {
+    console.warn(`[AdminNotifier] ${eventKey} não enviado: ADMIN_DISCORD_WEBHOOK_URL ausente`);
+  }
+  if (channelEnabled('discord') && discordUrl && discordUrl.includes('discord.com')) {
     const embed = {
       title: event.title,
       color: event.color,
@@ -251,7 +278,7 @@ function notifyAdmin(eventKey, fields = {}, opts = {}) {
   // --------------------------------------------------------------- Telegram
   const tgToken = process.env.ADMIN_TELEGRAM_BOT_TOKEN;
   const tgChat = process.env.ADMIN_TELEGRAM_CHAT_ID;
-  if (tgToken && tgChat) {
+  if (channelEnabled('telegram') && tgToken && tgChat) {
     let text = `<b>${escapeHtml(event.title)}</b>\n\n`;
     text += Object.entries(fields)
       .filter(([, v]) => v !== null && v !== undefined && v !== '')
@@ -279,7 +306,7 @@ function notifyAdmin(eventKey, fields = {}, opts = {}) {
   // Canal recomendado para o celular Android: o app ntfy respeita a prioridade enviada,
   // portanto um pedido de saque (prioridade 5) toca som mesmo no modo silencioso.
   const ntfyTopic = process.env.ADMIN_NTFY_TOPIC;
-  if (ntfyTopic) {
+  if (channelEnabled('ntfy') && ntfyTopic) {
     const ntfyServer = (process.env.ADMIN_NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
     const headers = {
       'Content-Type': 'text/plain; charset=utf-8',
@@ -303,7 +330,7 @@ function notifyAdmin(eventKey, fields = {}, opts = {}) {
 
   // -------------------------------------------------------- Webhook genérico
   const genericUrl = process.env.ADMIN_GENERIC_WEBHOOK_URL;
-  if (genericUrl) {
+  if (channelEnabled('webhook') && genericUrl) {
     safePost(
       genericUrl,
       {

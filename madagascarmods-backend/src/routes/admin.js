@@ -17,6 +17,7 @@ const { canDeleteAccount, deletionBlockedReason, MAX_DELETABLE_BALANCE_POINTS } 
 // investigacao e para qualquer filtro por IP no painel.
 const { clientIp } = require('../middleware/antiFraud');
 const { todayBr } = require('../utils/adDailyLimit');
+const { notifyAdmin, panelLink } = require('../utils/adminNotifier');
 
 const router = express.Router();
 
@@ -45,6 +46,38 @@ function parsePixData(cryptoAddress) {
     pixKeyType: parsed.pix_key_type,
     holderName: parsed.full_name || null,
   };
+}
+
+/**
+ * Notifica somente o Discord configurado para pagamentos FaucetPay.
+ * O alerta evita incluir email/destino do usuario; o detalhe completo permanece no painel.
+ */
+function notifyFaucetPayOutcome(eventKey, withdrawalId, amountBRL, paymentResult = {}) {
+  const amount = Number(amountBRL);
+  const fields = {
+    'Saque': String(withdrawalId),
+    'Valor': Number.isFinite(amount) ? `R$ ${amount.toFixed(2).replace('.', ',')}` : 'não informado',
+  };
+
+  if (eventKey === 'FAUCETPAY_PAYMENT_SUCCESS') {
+    const ltcAmount = Number(paymentResult.ltcAmount);
+    if (Number.isFinite(ltcAmount)) fields['LTC enviado'] = `${ltcAmount} LTC`;
+    const txHash = paymentResult.tx_hash || paymentResult.payout_hash || paymentResult.payout_id;
+    if (txHash) fields['Transação'] = String(txHash).slice(0, 120);
+  } else if (eventKey === 'FAUCETPAY_PAYMENT_FAILED') {
+    if (paymentResult.errorCode !== undefined && paymentResult.errorCode !== null) {
+      fields['Código de retorno'] = String(paymentResult.errorCode).slice(0, 80);
+    }
+    fields['Resultado'] = 'A FaucetPay recusou explicitamente o envio.';
+  } else if (eventKey === 'FAUCETPAY_PAYMENT_UNCONFIRMED') {
+    fields['Atenção'] = 'Confira o extrato da FaucetPay antes de reenviar; o resultado é incerto.';
+  }
+
+  notifyAdmin(eventKey, fields, {
+    link: panelLink('/saques'),
+    channels: ['discord'],
+    dedicatedDiscord: true,
+  });
 }
 
 // Registra tentativas de acesso administrativo negadas, para investigacao posterior.
@@ -490,6 +523,17 @@ router.post('/withdrawals/:id/approve', authenticateAdmin, requireRole('finance'
       ]
     );
 
+    // O alerta externo só sai depois que o resultado financeiro e a auditoria foram gravados.
+    // O caminho PIX/Asaas permanece sem alterações.
+    if (!(isPix && pixData)) {
+      const faucetPayEvent = finalStatus === 'PAID'
+        ? 'FAUCETPAY_PAYMENT_SUCCESS'
+        : finalStatus === 'PAYMENT_UNCONFIRMED'
+          ? 'FAUCETPAY_PAYMENT_UNCONFIRMED'
+          : 'FAUCETPAY_PAYMENT_FAILED';
+      notifyFaucetPayOutcome(faucetPayEvent, id, amountBRL, paymentResult || {});
+    }
+
     if (finalStatus === 'PAID') {
       res.json({
         success: true,
@@ -617,6 +661,7 @@ router.post('/withdrawals/:id/reject', authenticateAdmin, requireRole('finance')
 // POST /api/admin/withdrawals/:id/process-faucetpay - Process FaucetPay payment (LTC)
 router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole('finance'), async (req, res) => {
   const client = await db.getClient();
+  let amountForNotification = null;
   
   try {
     const { id } = req.params;
@@ -673,6 +718,7 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
 
     // Call FaucetPay API to send LTC payment
     const amountBRL = parseFloat(w.amount);
+    amountForNotification = amountBRL;
     const paymentResult = await faucetpay.sendPayment({
       to: w.crypto_address,
       amountBRL: amountBRL,
@@ -717,6 +763,8 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
         ]
       );
 
+      notifyFaucetPayOutcome('FAUCETPAY_PAYMENT_SUCCESS', id, amountBRL, paymentResult);
+
       res.json({
         success: true,
         message: paymentResult.message,
@@ -747,6 +795,8 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
         ]
       );
 
+      notifyFaucetPayOutcome('FAUCETPAY_PAYMENT_FAILED', id, amountBRL, paymentResult);
+
       res.json({
         success: false,
         message: paymentResult.message || 'Falha no pagamento FaucetPay',
@@ -762,15 +812,23 @@ router.post('/withdrawals/:id/process-faucetpay', authenticateAdmin, requireRole
     // Agora o saque fica em PAYMENT_UNCONFIRMED e sai da fila automatica, exigindo que um
     // humano confira o extrato. Perder alguns minutos de conferencia e melhor que pagar duas vezes.
     try {
-      await db.query(
+      const unconfirmedResult = await db.query(
         `UPDATE withdrawals SET status = 'PAYMENT_UNCONFIRMED',
                 gateway_response = $2, updated_at = NOW()
-          WHERE id = $1 AND status = 'PROCESSING'`,
+          WHERE id = $1 AND status = 'PROCESSING'
+          RETURNING id`,
         [req.params.id, JSON.stringify({ error: error.message, requiresManualCheck: true })]
       );
+      if (unconfirmedResult.rows.length > 0) {
+        notifyFaucetPayOutcome(
+          'FAUCETPAY_PAYMENT_UNCONFIRMED',
+          req.params.id,
+          amountForNotification,
+        );
+      }
       await db.query(
         `INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, new_value, ip_address)
-         VALUES ($1, 'admin', 'FAUCETPAY_PAYMENT_UNCONFIRMED', 'withdrawal', $2, $3, $4)`,
+         VALUES ($1, 'admin', 'FAUCETPAY_PAYMENT_UNCONFIRMED', 'withdrawal', $2, $3, $4)`, 
         [req.admin.id, req.params.id,
          JSON.stringify({ error: error.message, requiresManualCheck: true }),
          clientIp(req)]
