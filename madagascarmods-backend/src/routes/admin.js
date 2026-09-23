@@ -2728,7 +2728,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
     const validBrDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
     const fromDate = validBrDate(req.query.from) ? String(req.query.from) : brDateOffset(-(days - 1));
     const toDate = validBrDate(req.query.to) ? String(req.query.to) : todayBr();
-    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution] = await Promise.all([
+    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution, pointsPerRealResult] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS total_ads,
                 COUNT(DISTINCT user_id)::int AS users,
