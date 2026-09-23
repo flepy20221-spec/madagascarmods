@@ -2725,7 +2725,10 @@ router.put('/system-config', authenticateAdmin, requireRole('finance'), async (r
 router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 90);
-    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons] = await Promise.all([
+    const validBrDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
+    const fromDate = validBrDate(req.query.from) ? String(req.query.from) : brDateOffset(-(days - 1));
+    const toDate = validBrDate(req.query.to) ? String(req.query.to) : todayBr();
+    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS total_ads,
                 COUNT(DISTINCT user_id)::int AS users,
@@ -2796,7 +2799,33 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
           ORDER BY failures DESC, last_failure_at DESC
           LIMIT 50`,
       ),
+      db.query(
+        `SELECT (created_at AT TIME ZONE 'America/Sao_Paulo')::date AS day,
+                COUNT(*)::int AS ads,
+                COUNT(DISTINCT user_id)::int AS users,
+                COALESCE(SUM(points_awarded), 0)::int AS points
+           FROM reward_events
+          WHERE ad_type = 'rewarded' AND ssv_verified = true
+            AND created_at >= ($1 || ' 00:00:00-03')::timestamptz
+            AND created_at < (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')
+          GROUP BY 1
+          ORDER BY day DESC`,
+        [fromDate, toDate],
+      ),
+      db.query("SELECT value FROM system_config WHERE key = 'points_per_real' LIMIT 1"),
     ]);
+
+    const pointsPerReal = Math.max(parseInt(pointsPerRealResult.rows[0]?.value, 10) || 2000, 1);
+    const distributionRows = pointsDistribution.rows.map((row) => ({
+      ...row,
+      estimated_payout_brl: Number((Number(row.points || 0) / pointsPerReal).toFixed(2)),
+    }));
+    const distributionTotals = distributionRows.reduce((acc, row) => ({
+      ads: acc.ads + Number(row.ads || 0),
+      users: acc.users + Number(row.users || 0),
+      points: acc.points + Number(row.points || 0),
+      estimated_payout_brl: Number((acc.estimated_payout_brl + Number(row.estimated_payout_brl || 0)).toFixed(2)),
+    }), { ads: 0, users: 0, points: 0, estimated_payout_brl: 0 });
 
     res.json({
       success: true,
@@ -2807,6 +2836,14 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
       topUsers: topUsers.rows,
       recentObservations: recentObservations.rows,
       failureReasons: failureReasons.rows,
+      pointsDistribution: {
+        from: fromDate,
+        to: toDate,
+        timezone: 'America/Sao_Paulo',
+        pointsPerReal,
+        totals: distributionTotals,
+        byDay: distributionRows,
+      },
     });
   } catch (error) {
     console.error('Ad analytics error:', error);
