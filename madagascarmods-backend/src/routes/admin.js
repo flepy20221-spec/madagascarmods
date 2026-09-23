@@ -992,8 +992,8 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
 
 // GET /api/admin/asaas/balance - Check Asaas balance
 // GET /api/admin/users/activity - Atividade dos usuarios do app (agregado).
-// - activeToday: usuarios distintos com last_login_at nas ultimas 24h (quem
-//   entrou no app hoje).
+// - activeToday: usuarios distintos com last_login_at desde 00:00 de Brasilia
+//   (dia calendario local, nao uma janela movel de 24 horas).
 // - onlineNow: usuarios distintos com last_login_at nos ultimos 15 minutos
 //   (proxy de "online agora", ja que o app nao expoe heartbeat persistente).
 // - lastHour: usuarios distintos que entraram na ultima hora.
@@ -1003,7 +1003,12 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
 router.get('/users/activity', authenticateAdmin, async (req, res) => {
   try {
     const [today, lastHour, quarterHour, last7d, total] = await Promise.all([
-      db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '24 hours'`),
+      db.query(
+        `SELECT COUNT(*)::int AS n FROM users
+          WHERE last_login_at >= ($1 || ' 00:00:00-03')::timestamptz
+            AND last_login_at < NOW()`,
+        [todayBr()],
+      ),
       db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '1 hour'`),
       db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '15 minutes'`),
       db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '7 days'`),
