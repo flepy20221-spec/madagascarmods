@@ -2770,7 +2770,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
     const validBrDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
     const fromDate = validBrDate(req.query.from) ? String(req.query.from) : brDateOffset(-(days - 1));
     const toDate = validBrDate(req.query.to) ? String(req.query.to) : todayBr();
-    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution, pointsPerRealResult, revenueEntriesResult] = await Promise.all([
+    const [summary, byNetwork, byDay, topUsers, recentObservations, failureReasons, pointsDistribution, pointsPerRealResult, revenueEntriesResult, withdrawalSummary] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS total_ads,
                 COUNT(DISTINCT user_id)::int AS users,
@@ -2862,6 +2862,17 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
           ORDER BY report_date DESC, source ASC`,
         [fromDate, toDate],
       ),
+      db.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'PAID')::int AS paid_count,
+           COUNT(*) FILTER (WHERE status IN ('PENDING', 'PROCESSING'))::int AS pending_count,
+           COALESCE(SUM(amount) FILTER (WHERE status = 'PAID'), 0)::numeric AS paid_brl,
+           COALESCE(SUM(points_debited) FILTER (WHERE status = 'PAID'), 0)::int AS paid_points
+           FROM withdrawals
+          WHERE COALESCE(processed_at, created_at) >= ($1 || ' 00:00:00-03')::timestamptz
+            AND COALESCE(processed_at, created_at) < (($2 || ' 00:00:00-03')::timestamptz + INTERVAL '1 day')`,
+        [fromDate, toDate],
+      ),
     ]);
 
     const pointsPerReal = Math.max(parseInt(pointsPerRealResult.rows[0]?.value, 10) || 2000, 1);
@@ -2901,6 +2912,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
           estimated_margin_brl: Number((reportedRevenueBrl - distributionTotals.estimated_payout_brl).toFixed(2)),
         },
         revenueEntries,
+        withdrawals: withdrawalSummary.rows[0] || {},
         byDay: distributionRows,
       },
     });
