@@ -2806,7 +2806,7 @@ router.get('/ad-analytics', authenticateAdmin, async (req, res) => {
         [days],
       ),
       db.query(
-        `SELECT u.support_code, u.email,
+        `SELECT u.id, u.support_code, u.email,
                 COUNT(*)::int AS ads,
                 COUNT(*) FILTER (WHERE re.ssv_verified = true)::int AS verified,
                 COALESCE(SUM(re.points_awarded), 0)::int AS points,
