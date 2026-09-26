@@ -1037,11 +1037,13 @@ router.get('/faucetpay/balance', authenticateAdmin, async (req, res) => {
 //   (proxy de "online agora", ja que o app nao expoe heartbeat persistente).
 // - lastHour: usuarios distintos que entraram na ultima hora.
 // - active7d: usuarios distintos com acesso nos ultimos 7 dias.
+// - scoringLastMinute: usuarios distintos com credito positivo de pontos nos ultimos 60s;
+//   e uma estimativa de atividade, nao uma confirmacao de sessao online.
 // A coluna users.last_login_at e atualizada em todos os caminhos de login do
 // app (auth.js), incluindo o primeiro acesso apos reinstalacao.
 router.get('/users/activity', authenticateAdmin, async (req, res) => {
   try {
-    const [today, lastHour, quarterHour, last7d, total] = await Promise.all([
+    const [today, lastHour, quarterHour, last7d, total, scoringLastMinute] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS n FROM users
           WHERE last_login_at >= ($1 || ' 00:00:00-03')::timestamptz
@@ -1052,6 +1054,17 @@ router.get('/users/activity', authenticateAdmin, async (req, res) => {
       db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '15 minutes'`),
       db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_login_at > NOW() - INTERVAL '7 days'`),
       db.query(`SELECT COUNT(*)::int AS n FROM users`),
+      db.query(
+        `SELECT COUNT(DISTINCT pl.user_id)::int AS n
+           FROM points_ledger pl
+           JOIN users u ON u.id = pl.user_id
+          WHERE pl.amount > 0
+            AND COALESCE(pl.transaction_type, '') <> 'ADMIN_ADJUSTMENT'
+            AND pl.created_at >= NOW() - INTERVAL '60 seconds'
+            AND u.is_active = true
+            AND u.is_banned = false
+            AND u.merged_into_user_id IS NULL`,
+      ),
     ]);
     res.json({
       success: true,
@@ -1061,6 +1074,7 @@ router.get('/users/activity', authenticateAdmin, async (req, res) => {
         onlineNow: quarterHour.rows[0].n,
         active7d: last7d.rows[0].n,
         totalUsers: total.rows[0].n,
+        scoringLastMinute: scoringLastMinute.rows[0].n,
       },
     });
   } catch (error) {
@@ -1125,8 +1139,34 @@ router.get('/users/registrations', authenticateAdmin, async (req, res) => {
       db.query(`SELECT COUNT(*)::int AS total FROM users u WHERE ${dateWhere}`, [date]),
       db.query(
         `SELECT u.id, u.support_code, u.support_label, u.email,
-                TO_CHAR(u.created_at AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD HH24:MI:SS') AS created_at_br
+                TO_CHAR(u.created_at AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD HH24:MI:SS') AS created_at_br,
+                points.balance::text AS points_balance,
+                pix.status AS pix_status,
+                faucetpay.status AS faucetpay_status
            FROM users u
+           CROSS JOIN LATERAL (
+             SELECT COALESCE(SUM(pl.amount), 0)::bigint AS balance
+               FROM points_ledger pl
+              WHERE pl.user_id = u.id
+           ) points
+           LEFT JOIN LATERAL (
+             SELECT pa.status
+               FROM pix_accounts pa
+              WHERE pa.user_id = u.id AND pa.is_active = true
+              ORDER BY (pa.status = 'APPROVED') DESC,
+                       pa.reviewed_at DESC NULLS LAST,
+                       pa.submitted_at DESC
+              LIMIT 1
+           ) pix ON TRUE
+           LEFT JOIN LATERAL (
+             SELECT pd.status
+               FROM payout_destinations pd
+              WHERE pd.user_id = u.id AND pd.is_active = true
+              ORDER BY (pd.status = 'APPROVED') DESC,
+                       pd.reviewed_at DESC NULLS LAST,
+                       pd.submitted_at DESC
+              LIMIT 1
+           ) faucetpay ON TRUE
           WHERE ${dateWhere}
           ORDER BY u.created_at ASC, u.id ASC
           LIMIT $2 OFFSET $3`,
@@ -3166,5 +3206,6 @@ router.get('/users/:id/ads-diagnostics', authenticateAdmin, async (req, res) => 
 module.exports = router;
 
 // deploy-refresh
+
 
 
