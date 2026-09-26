@@ -1116,14 +1116,16 @@ router.get('/users/registrations', authenticateAdmin, async (req, res) => {
       ? Math.min(requestedLimit, 100)
       : 50;
     const offset = (page - 1) * limit;
+    // Use a mesma conversao para dia local do resumo diario, evitando que
+    // limites de tipo/fuso da sessao desalinhem a lista do total exibido.
     const dateWhere = `u.merged_into_user_id IS NULL
-      AND u.created_at >= ($1::date AT TIME ZONE 'America/Sao_Paulo')
-      AND u.created_at < (($1::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`;
+      AND (u.created_at AT TIME ZONE 'America/Sao_Paulo')::date = $1::date`;
 
     const [countResult, usersResult] = await Promise.all([
       db.query(`SELECT COUNT(*)::int AS total FROM users u WHERE ${dateWhere}`, [date]),
       db.query(
-        `SELECT u.id, u.support_code, u.support_label, u.email, u.created_at
+        `SELECT u.id, u.support_code, u.support_label, u.email,
+                TO_CHAR(u.created_at AT TIME ZONE 'America/Sao_Paulo', 'YYYY-MM-DD HH24:MI:SS') AS created_at_br
            FROM users u
           WHERE ${dateWhere}
           ORDER BY u.created_at ASC, u.id ASC
@@ -3164,4 +3166,5 @@ router.get('/users/:id/ads-diagnostics', authenticateAdmin, async (req, res) => 
 module.exports = router;
 
 // deploy-refresh
+
 
