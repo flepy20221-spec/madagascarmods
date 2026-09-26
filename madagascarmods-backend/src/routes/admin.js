@@ -1069,6 +1069,89 @@ router.get('/users/activity', authenticateAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/users/registrations/summary - cadastros iniciais agrupados pelo dia de Brasilia.
+// `created_at` e gravado quando a conta e criada no primeiro acesso; contas ja
+// mescladas sao excluidas para nao contar duplicatas como usuarios novos.
+router.get('/users/registrations/summary', authenticateAdmin, async (req, res) => {
+  try {
+    const today = todayBr();
+    const historyResult = await db.query(
+      `SELECT TO_CHAR((created_at AT TIME ZONE 'America/Sao_Paulo')::date, 'YYYY-MM-DD') AS day,
+              COUNT(*)::int AS count
+         FROM users
+        WHERE merged_into_user_id IS NULL
+          AND created_at IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1 DESC`,
+    );
+    const days = historyResult.rows.map((row) => ({ day: row.day, count: row.count }));
+    const todayCount = days.find((item) => item.day === today)?.count ?? 0;
+
+    res.json({
+      success: true,
+      todayDate: today,
+      todayCount,
+      days,
+    });
+  } catch (error) {
+    console.error('New user registration summary error:', error);
+    res.status(500).json({ error: 'Erro ao consultar novos usuarios' });
+  }
+});
+
+// GET /api/admin/users/registrations?date=YYYY-MM-DD&page=1&limit=50
+// Lista paginada das contas criadas naquele dia local de Brasilia.
+router.get('/users/registrations', authenticateAdmin, async (req, res) => {
+  try {
+    const date = String(req.query.date || '').trim();
+    const parsedDate = /^\d{4}-\d{2}-\d{2}$/.test(date) ? new Date(`${date}T00:00:00.000Z`) : null;
+    if (!parsedDate || Number.isNaN(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== date) {
+      return res.status(400).json({ error: 'Informe uma data valida no formato AAAA-MM-DD' });
+    }
+
+    const requestedPage = Number.parseInt(req.query.page, 10);
+    const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? Math.min(requestedPage, 1000000) : 1;
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 50;
+    const offset = (page - 1) * limit;
+    const dateWhere = `u.merged_into_user_id IS NULL
+      AND u.created_at >= ($1::date AT TIME ZONE 'America/Sao_Paulo')
+      AND u.created_at < (($1::date + INTERVAL '1 day') AT TIME ZONE 'America/Sao_Paulo')`;
+
+    const [countResult, usersResult] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS total FROM users u WHERE ${dateWhere}`, [date]),
+      db.query(
+        `SELECT u.id, u.support_code, u.support_label, u.email, u.created_at
+           FROM users u
+          WHERE ${dateWhere}
+          ORDER BY u.created_at ASC, u.id ASC
+          LIMIT $2 OFFSET $3`,
+        [date, limit, offset],
+      ),
+    ]);
+
+    const total = countResult.rows[0].total;
+    res.json({
+      success: true,
+      date,
+      users: usersResult.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+        hasMore: offset + usersResult.rows.length < total,
+      },
+    });
+  } catch (error) {
+    console.error('New user registrations list error:', error);
+    res.status(500).json({ error: 'Erro ao consultar usuarios novos' });
+  }
+});
+
+
 // GET /api/admin/withdrawals/report - Relatorio de saques por periodo.
 // Query params:
 //   from / to     - intervalo de datas (YYYY-MM-DD, inclusive; default: ultimos 30 dias)
@@ -3081,3 +3164,4 @@ router.get('/users/:id/ads-diagnostics', authenticateAdmin, async (req, res) => 
 module.exports = router;
 
 // deploy-refresh
+
